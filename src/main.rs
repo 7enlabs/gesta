@@ -22,6 +22,8 @@ mod ops;
 mod remote;
 mod rebase;
 mod repo;
+mod s3;
+mod sigv4;
 mod sparse;
 mod stash;
 mod subrepo;

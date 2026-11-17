@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
-use rusqlite::OptionalExtension;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::auth;
 use crate::http;
@@ -112,6 +112,10 @@ pub fn cmd_push(remote_name: &str, branch: &str) -> ZResult<()> {
     let (root, conn) = open_repo()?;
     let url = remote_url(&conn, remote_name)?;
 
+    if url.starts_with("s3://") {
+        return push_s3(&conn, &url, branch);
+    }
+
     if http::is_http_url(&url) {
         return push_http(&conn, root.as_path(), remote_name, &url, branch);
     }
@@ -160,9 +164,77 @@ pub fn cmd_push(remote_name: &str, branch: &str) -> ZResult<()> {
     Ok(())
 }
 
+/// Push a branch to an S3 compatible bucket.
+///
+/// The object is the same bundle the filesystem and HTTP remotes use, so the wire
+/// format keeps one definition. What changes is the transport: one PUT of the whole
+/// bundle, signed with SigV4.
+fn push_s3(conn: &Connection, url: &str, branch: &str) -> ZResult<()> {
+    let (cfg, prefix) = crate::s3::S3Config::from_url(url)?;
+    let key = crate::s3::key_for(&prefix, branch);
+
+    // What the bucket already holds decides what goes in the bundle. Without this
+    // every push would upload the whole history again, which is the reason a delta
+    // push is worth having.
+    let have: HashSet<String> = match cfg.get(&key)? {
+        Some(bytes) => {
+            let b = remote::Bundle::decode(&bytes)?;
+            match b.head.as_deref() {
+                Some(h) if b.branch == branch => crate::store::ancestors_bfs(conn, h)?
+                    .into_iter()
+                    .collect(),
+                // A bundle for a different branch says nothing about this one.
+                _ => HashSet::new(),
+            }
+        }
+        None => HashSet::new(),
+    };
+
+    let bundle = remote::build_bundle(conn, branch, &have)?;
+    let n = bundle.changesets.len();
+    if n == 0 {
+        println!("nothing to push, the bucket already has this branch");
+        return Ok(());
+    }
+    let wire = bundle.encode()?;
+    cfg.put(&key, &wire)?;
+    println!(
+        "pushed {} changesets to s3://{}/{} ({} bytes)",
+        n,
+        cfg.bucket,
+        key,
+        wire.len()
+    );
+    Ok(())
+}
+
+/// Pull a branch from an S3 compatible bucket.
+fn pull_s3(conn: &mut Connection, url: &str, branch: &str, author: &str) -> ZResult<()> {
+    let (cfg, prefix) = crate::s3::S3Config::from_url(url)?;
+    let key = crate::s3::key_for(&prefix, branch);
+    let bytes = cfg
+        .get(&key)?
+        .ok_or_else(|| crate::bad(format!("the bucket has no object at {}", key)))?;
+    let bundle = remote::Bundle::decode(&bytes)?;
+    let n = bundle.changesets.len();
+    let applied = remote::apply_bundle(conn, &bundle)?;
+    let head = branch_head(conn, branch)?.unwrap_or_else(|| "(none)".to_string());
+    println!(
+        "pulled {} changesets from s3://{}/{} ({} applied, branch now {})",
+        n, cfg.bucket, key, applied, head
+    );
+    let _ = author;
+    Ok(())
+}
+
 pub fn cmd_pull(remote_name: &str, branch: &str, author: &str) -> ZResult<()> {
     let (root, conn) = open_repo()?;
     let url = remote_url(&conn, remote_name)?;
+
+    if url.starts_with("s3://") {
+        let mut conn = conn;
+        return pull_s3(&mut conn, &url, branch, author);
+    }
 
     if http::is_http_url(&url) {
         return pull_http(&conn, &root, remote_name, &url, branch, author);
@@ -193,6 +265,10 @@ pub fn cmd_clone(url: &str, dir: &str, token: Option<&str>, pin: Option<&str>) -
         return Err(bad(format!("{} already contains a repository", dir)));
     }
     fs::create_dir_all(target)?;
+
+    if url.starts_with("s3://") {
+        return clone_s3(url, target, pin);
+    }
 
     if http::is_http_url(url) {
         return clone_http(url, target, token, pin);
@@ -231,6 +307,54 @@ pub fn cmd_clone(url: &str, dir: &str, token: Option<&str>, pin: Option<&str>) -
         url,
         dir,
         received.changesets.len(),
+        written
+    );
+    Ok(())
+}
+
+/// Clone a branch from an S3 compatible bucket into an empty directory.
+///
+/// A bucket holds one bundle per branch and the name has no wildcard, so a clone
+/// needs a branch. `main` is the default because every repository starts there.
+fn clone_s3(url: &str, target: &Path, pin: Option<&str>) -> ZResult<()> {
+    let (cfg, prefix) = crate::s3::S3Config::from_url(url)?;
+
+    // Find the branch by asking for the default first, then falling back to the
+    // object listing would need a second signed request type. Requiring `main` is
+    // honest: it is the branch every repository has.
+    let branch = pin.unwrap_or("main").to_string();
+    let key = crate::s3::key_for(&prefix, &branch);
+    let bytes = cfg.get(&key)?.ok_or_else(|| {
+        crate::bad(format!(
+            "no object at s3://{}/{} (a clone needs the branch name, try --pin <branch>)",
+            cfg.bucket, key
+        ))
+    })?;
+    let bundle = remote::Bundle::decode(&bytes)?;
+
+    let zf = repo_dir(target);
+    fs::create_dir_all(&zf)?;
+    let conn = open_db(target)?;
+    init_schema(&conn)?;
+    remote::apply_bundle(&conn, &bundle)?;
+    let branch = if bundle.branch.is_empty() {
+        branch
+    } else {
+        bundle.branch.clone()
+    };
+    set_state(&conn, "current_branch", &branch)?;
+    conn.execute(
+        "INSERT INTO remotes(name, url, pin) VALUES('origin', ?1, ?2)
+         ON CONFLICT(name) DO UPDATE SET url = excluded.url, pin = excluded.pin",
+        rusqlite::params![url, pin],
+    )?;
+
+    let (written, _removed) = repo::restore_worktree(&conn, target, &branch)?;
+    println!(
+        "cloned {} into {} ({} changeset(s), {} file(s) on disk)",
+        url,
+        target.display(),
+        bundle.changesets.len(),
         written
     );
     Ok(())

@@ -993,6 +993,96 @@ pub fn bundle_url(base: &str, branch: &str, have: &[String]) -> String {
     url
 }
 
+/// Perform one request with caller supplied headers, over TLS or plain.
+///
+/// S3 needs its own Authorization and x-amz-* headers, which the bearer token form
+/// cannot express. The request line, framing and response parsing are the same, so
+/// this shares them instead of growing a second HTTP implementation.
+pub fn request_with_headers(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+) -> ZResult<(u16, Vec<u8>)> {
+    let u = parse_http_url(url)?;
+    let timeout = Duration::from_secs(300);
+    let mut head = format!(
+        "{} {} HTTP/1.1\r\nConnection: close\r\n",
+        method,
+        if u.base_path.is_empty() { "/".to_string() } else { u.base_path.clone() }
+    );
+    // A caller that signs Content-Length has to send the same value, so it is
+    // passed in and not added again here. Two of them make nginx answer 400 with
+    // no hint that framing was the problem.
+    let caller_sets_length = headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("content-length"));
+    for (k, v) in headers {
+        head.push_str(k);
+        head.push_str(": ");
+        head.push_str(v);
+        head.push_str("\r\n");
+    }
+    if let Some(b) = body {
+        if !caller_sets_length {
+            head.push_str(&format!("Content-Length: {}\r\n", b.len()));
+        }
+    }
+    head.push_str("\r\n");
+
+    let mut raw: Vec<u8> = Vec::new();
+    if u.tls {
+        #[cfg(not(feature = "tls"))]
+        return Err(bad(
+            "this build has no TLS support: rebuild with --features tls".to_string(),
+        ));
+        #[cfg(feature = "tls")]
+        {
+            let mut stream = crate::tls::connect(&u.host, u.port, None, timeout)?;
+            stream.write_all(head.as_bytes())?;
+            if let Some(b) = body {
+                stream.write_all(b)?;
+            }
+            stream.flush()?;
+            if let Err(e) = stream.read_to_end(&mut raw) {
+                let complete = find_subslice(&raw, b"\r\n\r\n").is_some();
+                if !(complete && is_eof_error(&e)) {
+                    return Err(bad(format!("reading the response failed: {}", e)));
+                }
+            }
+        }
+    } else {
+        let mut stream = TcpStream::connect((u.host.as_str(), u.port))
+            .map_err(|e| bad(format!("cannot connect to {}:{}: {}", u.host, u.port, e)))?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
+        stream.write_all(head.as_bytes())?;
+        if let Some(b) = body {
+            stream.write_all(b)?;
+        }
+        stream.flush()?;
+        stream
+            .read_to_end(&mut raw)
+            .map_err(|e| bad(format!("reading the response failed: {}", e)))?;
+    }
+    let (status, body) = parse_response(&raw)?;
+    Ok((status, body))
+}
+
+/// Split an HTTP response into its status code and body.
+fn parse_response(raw: &[u8]) -> ZResult<(u16, Vec<u8>)> {
+    let split = find_subslice(raw, b"\r\n\r\n")
+        .ok_or_else(|| bad("response has no header terminator".to_string()))?;
+    let head = String::from_utf8_lossy(&raw[..split]).to_string();
+    let status = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse::<u16>().ok())
+        .ok_or_else(|| bad(format!("cannot read status from {}", head)))?;
+    Ok((status, raw[split + 4..].to_vec()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

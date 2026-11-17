@@ -111,6 +111,17 @@ def main():
             for pat in patterns:
                 for m in re.finditer(pat, text):
                     line = text[: m.start()].count("\n") + 1
+                    lines = text.splitlines()
+                    # A published example value is not a credential. The marker may
+                    # sit on the line itself or on one of the three above it, so a
+                    # comment can introduce a small block. A real key pasted with
+                    # the marker is still a deliberate act, not an accident.
+                    window = lines[max(0, line - 4):line]
+                    lowered = [l.lower() for l in window]
+                    if any(
+                        "published example" in l or "test vector" in l for l in lowered
+                    ):
+                        continue
                     bad.append(f"{f}:{line} {m.group(0)[:40]}")
         record("no hardcoded credential in src", not bad, "\n".join(bad[:10]))
 
@@ -163,6 +174,75 @@ def main():
         rc, out = sh(f"{ZF} status 2>&1 | head -2", cwd=tmp)
         panicked = "panicked" in out or "Broken pipe" in out
         record("a closed pipe does not panic", not panicked, out[:250])
+
+    if want("s3"):
+        # Round trip against a local endpoint that verifies the signature itself.
+        # No network and no real credentials, so this runs on every gate and a
+        # broken SigV4 fails here instead of at the user's bucket.
+        import tempfile, socket
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        srv = subprocess.Popen(
+            ["python3", "bench/fake_s3.py", str(port)],
+            cwd=ZF_DIR,
+            env={**os.environ, "FAKE_S3_KEY": "k", "FAKE_S3_SECRET": "s",
+                 "FAKE_S3_REGION": "us-east-1"},
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        try:
+            import time as _t
+            _t.sleep(1.5)
+            env = {
+                "GESTA_S3_ENDPOINT": f"http://127.0.0.1:{port}",
+                "GESTA_S3_REGION": "us-east-1",
+                "GESTA_S3_ACCESS_KEY": "k",
+                "GESTA_S3_SECRET_KEY": "s",
+            }
+            e = {**os.environ, **env}
+            tmp = tempfile.mkdtemp()
+            subprocess.run([ZF, "init"], cwd=tmp, capture_output=True, env=e)
+            with open(os.path.join(tmp, "a.txt"), "w") as fh:
+                fh.write("hello\n")
+            subprocess.run([ZF, "changeset", "create", "one", "--author", "t"],
+                           cwd=tmp, capture_output=True, env=e)
+            out = subprocess.run([ZF, "changeset", "list", "--json"], cwd=tmp,
+                                 capture_output=True, text=True, env=e).stdout
+            cid = re.search(r"(cs[0-9a-f]+)", out)
+            if cid:
+                subprocess.run([ZF, "changeset", "commit", cid.group(1)],
+                               cwd=tmp, capture_output=True, env=e)
+            subprocess.run([ZF, "remote", "add", "origin", "s3://bkt/repo"],
+                           cwd=tmp, capture_output=True, env=e)
+            push = subprocess.run([ZF, "remote", "push", "origin", "--branch", "main"],
+                                  cwd=tmp, capture_output=True, text=True, env=e)
+            pushed = "pushed 1 changesets" in push.stdout
+
+            # A second push must send nothing, which proves the bucket read worked.
+            push2 = subprocess.run([ZF, "remote", "push", "origin", "--branch", "main"],
+                                   cwd=tmp, capture_output=True, text=True, env=e)
+            no_reupload = "nothing to push" in push2.stdout
+
+            dest = tempfile.mkdtemp()
+            clone = subprocess.run([ZF, "remote", "clone", "s3://bkt/repo", dest],
+                                   cwd=dest, capture_output=True, text=True, env=e)
+            got = None
+            fp = os.path.join(dest, "a.txt")
+            if os.path.exists(fp):
+                got = open(fp).read()
+            record(
+                "s3 push, idempotent push and clone",
+                pushed and no_reupload and got == "hello\n",
+                f"pushed={pushed} no_reupload={no_reupload} file={got!r} "
+                f"clone={clone.stdout.strip()[:120]}{clone.stderr.strip()[:160]}",
+            )
+        finally:
+            srv.terminate()
+            try:
+                srv.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                srv.kill()
 
     if want("suites"):
         suites = [

@@ -157,6 +157,21 @@ pub fn end_of_day(s: &str) -> Option<i64> {
     parse_date(s).map(|d| d + 86_399)
 }
 
+    /// `YYYYMMDDTHHMMSSZ`, the form S3 signatures use for x-amz-date.
+    pub fn format_amz_date(timestamp: i64) -> String {
+        let (days, secs) = split(timestamp);
+        let (y, m, d) = civil_from_days(days);
+        format!(
+            "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+            y,
+            m,
+            d,
+            secs / 3600,
+            (secs % 3600) / 60,
+            secs % 60
+        )
+    }
+
 #[cfg(test)]
 mod tests {
     use super::*;
