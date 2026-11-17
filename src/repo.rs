@@ -106,8 +106,14 @@ pub fn diff_worktree(conn: &Connection, root: &Path, branch: &str) -> ZResult<Wo
     // deletion: reporting it as one would let a commit wipe the whole repo.
     let mut tracked: Vec<String> = committed.keys().cloned().collect();
     tracked.sort();
+    // A subrepository whose checkout is missing is not a deletion. Reporting it
+    // as one would let a single commit remove the pointer to the child.
+    let subs = crate::subrepo::excluded_paths(conn);
     for path in tracked {
         if !scope.contains(&path) {
+            continue;
+        }
+        if crate::subrepo::is_inside_sub(&path, &subs) {
             continue;
         }
         if !seen.contains(&path) && !root.join(&path).exists() {

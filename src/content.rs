@@ -98,7 +98,7 @@ pub fn changeset_from_content(
     let committed = effective_tree(conn, branch)?;
 
     let id = new_changeset_id(conn, message, author)?;
-    let now = chrono::Utc::now().timestamp();
+    let now = crate::clock::unix_now();
 
     let tx = conn.unchecked_transaction()?;
     tx.execute(

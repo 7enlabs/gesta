@@ -285,9 +285,15 @@ pub const DEFAULT_IGNORES: &[&str] = &[
 /// Callers that need size or mtime used to stat every file a second time after
 /// a path-only walk. On a 2000 file repository that is 2000 extra syscalls for
 /// information the directory entry already carried.
-pub fn scan_files_with_meta(
+///
+/// A subrepository checkout holds another repository's files. Walking into it
+/// would record those files as this repository's own, which is how a nested
+/// repository turns into a commit that swallows its child. The paths are skipped
+/// before descending, so the child tree is never read at all.
+pub fn scan_files_excluding(
     root: &Path,
     rules: &IgnoreRules,
+    exclude: &[String],
 ) -> std::io::Result<Vec<(PathBuf, fs::Metadata)>> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -313,6 +319,9 @@ pub fn scan_files_with_meta(
             let rel = rel_path(root, &path);
             if ft.is_dir() {
                 if rules.is_ignored(&rel, true) {
+                    continue;
+                }
+                if crate::subrepo::is_inside_sub(&rel, exclude) {
                     continue;
                 }
                 stack.push(path);
@@ -479,7 +488,7 @@ mod tests {
             "secret/".to_string(),
             ".env".to_string(),
         ]);
-        let got: Vec<String> = scan_files_with_meta(&tmp, &r)
+        let got: Vec<String> = scan_files_excluding(&tmp, &r, &[])
             .unwrap()
             .iter()
             .map(|(p, _)| rel_path(&tmp, p))

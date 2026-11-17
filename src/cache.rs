@@ -13,7 +13,7 @@ use rusqlite::params;
 use rusqlite::Connection;
 
 use crate::store::hash_content;
-use crate::worktree::{read_file, rel_path, scan_files_with_meta, IgnoreRules, ReadOutcome};
+use crate::worktree::{read_file, rel_path, IgnoreRules, ReadOutcome};
 use crate::ZResult;
 
 /// Files whose mtime is younger than this are re-read rather than trusted.
@@ -70,7 +70,10 @@ pub fn scan_with_cache(
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0);
 
-    for (path, meta) in scan_files_with_meta(root, rules)? {
+    // Subrepository checkouts are excluded before the walk, so their files are
+    // never recorded in this repository's cache either.
+    let excluded = crate::subrepo::excluded_paths(conn);
+    for (path, meta) in crate::worktree::scan_files_excluding(root, rules, &excluded)? {
         let rel = rel_path(root, &path);
         // Nanoseconds, not seconds. Two writes inside one second with the same
         // size are indistinguishable at second resolution, and the cache would

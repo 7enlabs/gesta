@@ -239,15 +239,18 @@ pub fn parse_expiry(s: &str) -> Option<i64> {
     if let Ok(n) = s.parse::<i64>() {
         return Some(if n > 1_000_000_000_000 { n / 1000 } else { n });
     }
-    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        return Some(d.and_hms_opt(23, 59, 59)?.and_utc().timestamp());
+    // A bare date expires at the last second of that day; a full timestamp is
+    // taken as written. Both are UTC, which is what the stored value is.
+    if s.len() == 10 {
+        return crate::clock::end_of_day(s);
     }
-    for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"] {
-        if let Ok(d) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
-            return Some(d.and_utc().timestamp());
-        }
-    }
-    None
+    crate::clock::parse_minute(s).or_else(|| {
+        // A timestamp with seconds, such as 2027-03-01T12:00:00.
+        let base = crate::clock::parse_minute(&s[..16.min(s.len())])?;
+        let rest = s.get(16..)?;
+        let secs: i64 = rest.trim_start_matches(':').parse().ok()?;
+        Some(base + secs)
+    })
 }
 
 fn parse_scope(s: &str) -> Vec<String> {
@@ -435,9 +438,9 @@ mod tests {
         // A person writing 2027-03-01 means "through that day", not "until
         // midnight at the start of it".
         let ts = parse_expiry("2027-03-01").unwrap();
-        let d = chrono::DateTime::from_timestamp(ts, 0).unwrap().naive_utc();
-        assert_eq!(d.date().to_string(), "2027-03-01");
-        assert_eq!(d.time().to_string(), "23:59:59");
+        // Stated as the formatted text, so the assertion reads the same way the
+        // value is shown to a person.
+        assert_eq!(crate::clock::format_rfc3339(ts), "2027-03-01T23:59:59Z");
     }
 
     #[test]

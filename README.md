@@ -49,6 +49,10 @@ gesta blame src/main.rs
 | `show [<rev>:]<file>` | File content at a changeset or branch |
 | `checkout <file \| .> [--changeset <id>]` | Materialise files from history |
 | `restore <file \| .>` | Discard uncommitted changes |
+| `sub add <path> <remote>` | Record a path as a subrepository |
+| `sub list [--json]` | Pointers, what each is pinned to, and whether the checkout is present |
+| `sub pin <path>` | Pin the child at its current head |
+| `sub remove <path>` | Stop tracking the path as a subrepository |
 | `stash save [--message M]` | Save the working tree aside and reset to the head |
 | `stash list` | Saved stashes, newest first |
 | `stash pop [--id N]` | Write a stash back, refusing over local changes |
@@ -78,6 +82,20 @@ gesta blame src/main.rs
 | `fsck [--prune]` | Verify integrity, optionally drop orphan objects |
 | `stats` | Object counts and compression ratio |
 | `ignore add/list/remove` | Ignore patterns |
+
+### Subrepositories
+
+`sub add` records a path that points at another repository. The pointer holds the
+remote and the changeset the child is pinned to; the working tree holds a real
+checkout there.
+
+The tree scan skips a subrepository before descending, so the child's files are
+never recorded as the parent's own. That is the failure that makes nested
+repositories dangerous, and it is covered by a test that asserts nothing under the
+child is scanned while a sibling directory still is.
+
+A missing child checkout is reported as `missing` and is not a deletion. Treating
+it as one would let a single commit remove the pointer.
 
 ### Rebase
 

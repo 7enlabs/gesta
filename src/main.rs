@@ -6,6 +6,7 @@
 mod auth;
 mod bisect;
 mod cache;
+mod clock;
 mod cli;
 mod cli_remote;
 mod conflict;
@@ -23,6 +24,7 @@ mod rebase;
 mod repo;
 mod sparse;
 mod stash;
+mod subrepo;
 mod store;
 #[cfg(feature = "tls")]
 mod tls;
@@ -93,13 +95,11 @@ pub fn bad(msg: impl Into<String>) -> Box<dyn Error> {
 }
 
 pub fn now() -> i64 {
-    chrono::Utc::now().timestamp()
+    clock::unix_now()
 }
 
 fn fmt_ts(ts: i64) -> String {
-    chrono::DateTime::from_timestamp(ts, 0)
-        .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
-        .unwrap_or_else(|| ts.to_string())
+    clock::format_minute(ts)
 }
 
 pub fn normalise(file: &str) -> String {
@@ -228,6 +228,11 @@ enum Cmd {
         #[command(subcommand)]
         sub: BisectCmd,
     },
+    /// Manage paths that point at other repositories
+    Sub {
+        #[command(subcommand)]
+        sub: SubCmd,
+    },
     /// Save the working tree aside and reset it to the head
     Stash {
         #[command(subcommand)]
@@ -339,6 +344,22 @@ enum BisectCmd {
     Status,
     /// Abandon the search and put the working tree back
     Cancel,
+}
+
+#[derive(Subcommand)]
+enum SubCmd {
+    /// Record a path as a subrepository
+    Add {
+        path: String,
+        /// Where the child repository lives
+        remote: String,
+    },
+    /// Show the subrepositories and what each is pinned to
+    List,
+    /// Pin a subrepository to the child's current head
+    Pin { path: String },
+    /// Stop tracking a path as a subrepository
+    Remove { path: String },
 }
 
 #[derive(Subcommand)]
@@ -552,6 +573,7 @@ fn run() -> ZResult<()> {
         }
         Cmd::CherryPick { source, onto, author } => cli::cmd_cherry_pick(&source, onto.as_deref(), &author),
         Cmd::Bisect { sub } => cli::cmd_bisect(sub),
+        Cmd::Sub { sub } => cli::cmd_sub(sub, json),
         Cmd::Stash { sub } => cli::cmd_stash(sub, json),
         Cmd::Hook { sub } => cli::cmd_hook(sub),
         Cmd::Init { bare } => cli::cmd_init(bare),

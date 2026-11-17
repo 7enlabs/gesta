@@ -601,7 +601,7 @@ pub fn route(root: &Path, req: &Request, auth: &Auth) -> Response {
                         .and_then(decode_basic_token)
                         .map(|s| Box::leak(s.into_boxed_str()) as &str)
                 });
-            let now = chrono::Utc::now().timestamp();
+            let now = crate::clock::unix_now();
             match presented.map(|p| auth.authenticate_now(p, now)) {
                 Some(crate::auth::AuthOutcome::Granted(g)) if Auth::allows(g.role, needed) => {
                     who = g.name.clone();
@@ -971,7 +971,7 @@ pub fn log_access(root: &Path, who: &str, action: &str, branch: &str, detail: &s
     let path = crate::repo_dir(root).join("access.log");
     let line = format!(
         "{}\t{}\t{}\t{}\t{}\n",
-        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        crate::clock::format_rfc3339(crate::clock::unix_now()),
         who,
         action,
         branch,

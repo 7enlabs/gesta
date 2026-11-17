@@ -413,10 +413,75 @@ def main():
     log = sh(f"{GESTA} log --limit 1", cwd=rbd).stdout
     check("the resolution was recorded", "rebase" in log, log)
 
-    # 14. Things a daily user will look for and not find.
-    for missing in ("submodule",):
-        r = sh(f"{GESTA} {missing} --help", cwd=repo)
-        check(f"{missing} is absent (known gap)", r.returncode != 0)
+    # 14. A subrepository points at another repository without absorbing it.
+    sub_root = os.path.join(ROOT, "subs")
+    os.makedirs(sub_root)
+    child = os.path.join(sub_root, "child")
+    os.makedirs(child)
+    sh(f"{GESTA} init", cwd=child)
+    with open(os.path.join(child, "lib.txt"), "w") as fh:
+        fh.write("child code\n")
+    r = sh(f"{GESTA} changeset create c1 --author bench", cwd=child)
+    m = re.search(r"\b(cs[0-9a-f]{6,})\b", r.stdout)
+    child_head = m.group(1) if m else None
+    if child_head:
+        sh(f"{GESTA} changeset commit {child_head}", cwd=child)
+
+    parent = os.path.join(sub_root, "parent")
+    os.makedirs(parent)
+    sh(f"{GESTA} init", cwd=parent)
+    with open(os.path.join(parent, "own.txt"), "w") as fh:
+        fh.write("parent code\n")
+    r = sh(f"{GESTA} sub add vendor/lib {child}", cwd=parent)
+    check("sub add records the pointer", r.returncode == 0, r.stdout + r.stderr)
+
+    out = sh(f"{GESTA} sub list", cwd=parent).stdout
+    check("sub list reports it missing before a checkout", "missing" in out, out)
+
+    shutil.copytree(child, os.path.join(parent, "vendor", "lib"))
+    out = sh(f"{GESTA} sub list", cwd=parent).stdout
+    check("sub list reports it present", "present" in out, out)
+
+    # The child's files must not appear as the parent's own.
+    out = sh(f"{GESTA} status", cwd=parent).stdout
+    check(
+        "the parent does not see the child's files",
+        "lib.txt" not in out,
+        out,
+    )
+    check("the parent still sees its own file", "own.txt" in out, out)
+
+    r = sh(f"{GESTA} changeset create p1 --author bench", cwd=parent)
+    m = re.search(r"\b(cs[0-9a-f]{6,})\b", r.stdout)
+    if m:
+        sh(f"{GESTA} changeset commit {m.group(1)}", cwd=parent)
+        diff = sh(f"{GESTA} changeset diff {m.group(1)}", cwd=parent).stdout
+        check(
+            "the parent commit holds only its own file",
+            "own.txt" in diff and "lib.txt" not in diff,
+            diff,
+        )
+
+    if child_head:
+        r = sh(f"{GESTA} sub pin vendor/lib", cwd=parent)
+        check("sub pin records the child head", child_head in r.stdout, r.stdout + r.stderr)
+
+    # A missing checkout must not read as a deletion.
+    shutil.rmtree(os.path.join(parent, "vendor", "lib"))
+    out = sh(f"{GESTA} status", cwd=parent).stdout
+    check("a missing child is not reported as deleted", "clean" in out.lower(), out)
+    out = sh(f"{GESTA} sub list", cwd=parent).stdout
+    check("the pointer survives the missing checkout", "vendor/lib" in out, out)
+
+    r = sh(f"{GESTA} sub remove vendor/lib", cwd=parent)
+    check("sub remove clears the pointer", r.returncode == 0, r.stdout + r.stderr)
+
+    # 15. Every gap from the original review is closed.
+    # Every gap from the original review is now closed. The list is kept so a
+    # future regression that removes one of them is caught here.
+    for present in ("bisect", "rebase", "cherry-pick", "stash", "sub"):
+        r = sh(f"{GESTA} {present} --help", cwd=repo)
+        check(f"{present} is available", r.returncode == 0, r.stdout + r.stderr)
 
     print()
     passed = sum(1 for _, ok, _ in results if ok)

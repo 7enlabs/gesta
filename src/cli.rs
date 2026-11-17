@@ -1467,3 +1467,79 @@ fn report_rebase(p: crate::rebase::Progress) {
         }
     }
 }
+
+pub fn cmd_sub(sub: crate::SubCmd, json: bool) -> ZResult<()> {
+    use crate::SubCmd;
+    match sub {
+        SubCmd::Add { path, remote } => {
+            let (_root, conn) = open_repo()?;
+            let s = crate::subrepo::add(&conn, &path, &remote)?;
+            println!("added subrepository {} -> {}", s.path, s.remote);
+            println!("next: place a checkout there, then `gesta sub pin {}`", s.path);
+            Ok(())
+        }
+        SubCmd::List => {
+            let (root, conn) = open_repo()?;
+            let all = crate::subrepo::list(&conn)?;
+            if json {
+                let parts: Vec<String> = all
+                    .iter()
+                    .map(|s| {
+                        format!(
+                            "{{\"path\":\"{}\",\"remote\":\"{}\",\"pinned\":\"{}\",\"present\":{}}}",
+                            s.path,
+                            s.remote,
+                            s.pinned,
+                            crate::subrepo::is_present(&root, s)
+                        )
+                    })
+                    .collect();
+                println!("[{}]", parts.join(","));
+                return Ok(());
+            }
+            if all.is_empty() {
+                println!("no subrepositories");
+                return Ok(());
+            }
+            for s in &all {
+                // A missing checkout is stated, not hidden: a caller that acts on
+                // the pin needs to know the directory is not there.
+                let state = if crate::subrepo::is_present(&root, s) {
+                    "present"
+                } else {
+                    "missing"
+                };
+                let pin = if s.pinned.is_empty() {
+                    "unpinned".to_string()
+                } else {
+                    s.pinned.clone()
+                };
+                println!("{}  {}  {}  {}", s.path, pin, state, s.remote);
+            }
+            Ok(())
+        }
+        SubCmd::Pin { path } => {
+            let (root, conn) = open_repo()?;
+            let s = crate::subrepo::get(&conn, &path)?
+                .ok_or_else(|| bad(format!("{} is not a subrepository", path)))?;
+            let head = crate::subrepo::child_head(&root, &s).ok_or_else(|| {
+                bad(format!(
+                    "{} has no repository checkout, so there is nothing to pin",
+                    s.path
+                ))
+            })?;
+            let s = crate::subrepo::pin(&conn, &path, &head)?;
+            println!("pinned {} at {}", s.path, s.pinned);
+            Ok(())
+        }
+        SubCmd::Remove { path } => {
+            let (_root, conn) = open_repo()?;
+            if crate::subrepo::remove(&conn, &path)? {
+                println!("removed subrepository {}", path);
+            } else {
+                println!("{} was not a subrepository", path);
+            }
+            Ok(())
+        }
+    }
+}
