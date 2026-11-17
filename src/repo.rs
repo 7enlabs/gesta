@@ -2,6 +2,7 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 use std::fs;
+use std::collections::HashSet;
 use std::path::Path;
 
 use crate::merge::{diff_hunks, merge3, MergeResult};
@@ -1162,6 +1163,40 @@ pub fn materialise(conn: &Connection, root: &Path, branch: &str) -> ZResult<usiz
         None => return Ok(0),
     };
     let files = tree_at(conn, &head)?;
+
+    // A path that the tree no longer names has to leave the disk, or the working tree keeps
+    // a file the head says was deleted. Redo showed this: the head moved forward past a
+    // deletion and the file stayed, and `status` then reported it as a new file, which looks
+    // like the deletion never happened.
+    //
+    // Only files the repository knows about are removed. Anything else on disk is the
+    // user's, including ignored build output, and deleting it would be far worse than the
+    // untidiness this avoids.
+    let wanted: HashSet<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+    let known: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT path FROM file_versions
+             UNION SELECT DISTINCT path FROM changeset_files",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for path in known {
+        if wanted.contains(path.as_str()) {
+            continue;
+        }
+        let target = root.join(&path);
+        if target.is_file() {
+            let _ = fs::remove_file(&target);
+        }
+        // An empty directory left behind by the removal is noise, not data.
+        if let Some(dir) = target.parent() {
+            if dir != root {
+                let _ = fs::remove_dir(dir);
+            }
+        }
+    }
+
     for (path, hash) in &files {
         let content = get_object(conn, hash)?;
         let target = root.join(path);

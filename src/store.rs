@@ -154,7 +154,11 @@ pub fn init_schema(conn: &Connection) -> ZResult<()> {
             target     TEXT,
             detail     TEXT,
             snapshot   TEXT NOT NULL,
-            created_at INTEGER NOT NULL
+            created_at INTEGER NOT NULL,
+            -- Set when the operation has been undone. Keeping the row instead of deleting
+            -- it is what makes undo reversible: a second undo walks further back, and a
+            -- redo can step forward again.
+            undone     INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS remotes (
             name  TEXT PRIMARY KEY,
@@ -295,6 +299,17 @@ pub fn migrate(conn: &Connection) -> ZResult<bool> {
             conn.execute_batch(ddl)?;
             changed = true;
         }
+    }
+
+    // The operations table gained a flag for undone rows, so undo can be walked in both
+    // directions. A repository created before it needs the column added.
+    if !table_columns(conn, "operations")?.is_empty()
+        && !table_columns(conn, "operations")?
+            .iter()
+            .any(|c| c == "undone")
+    {
+        conn.execute_batch("ALTER TABLE operations ADD COLUMN undone INTEGER NOT NULL DEFAULT 0")?;
+        changed = true;
     }
 
     // Provenance columns, for a repository created before they existed.

@@ -395,6 +395,9 @@ pub fn cmd_changeset_commit(id: &str) -> ZResult<()> {
     } else {
         let branch = current_branch(&conn)?;
         println!("committed {} on branch {} ({} file(s))", id, branch, n);
+        // Recorded after the fact with the state it produced, because undo restores an
+        // operation's own snapshot and a commit has no earlier hook here. The important
+        // part is that `undo` and this agree on the meaning; see `ops::record`.
         ops::record(&conn, "commit", Some(id), None)?;
     }
     Ok(())
@@ -692,8 +695,16 @@ pub fn cmd_restore(file: &str) -> ZResult<()> {
 }
 
 pub fn cmd_undo() -> ZResult<()> {
-    let (_root, conn) = open_repo()?;
-    let msg = ops::undo(&conn)?;
+    let (root, conn) = open_repo()?;
+    let msg = ops::undo(&conn, &root)?;
+    println!("{}", msg);
+    Ok(())
+}
+
+/// `gesta redo`: put back the most recently undone operation.
+pub fn cmd_redo() -> ZResult<()> {
+    let (root, conn) = open_repo()?;
+    let msg = ops::redo(&conn, &root)?;
     println!("{}", msg);
     Ok(())
 }

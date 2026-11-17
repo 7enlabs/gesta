@@ -254,6 +254,8 @@ enum Cmd {
     },
     /// Undo the last operation (like git reset but reversible both ways)
     Undo,
+    /// Put back the most recently undone operation
+    Redo,
     /// Undo the effect of one changeset by recording a new one
     Revert {
         id: String,
@@ -698,6 +700,7 @@ fn run() -> ZResult<()> {
         Cmd::Checkout { file, changeset } => cli::cmd_checkout(&file, changeset.as_deref()),
         Cmd::Restore { file } => cli::cmd_restore(&file),
         Cmd::Undo => cli::cmd_undo(),
+        Cmd::Redo => cli::cmd_redo(),
         Cmd::Revert { id, reason, author } => {
             cli::cmd_revert(&id, reason.as_deref(), &author)
         }
