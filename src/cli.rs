@@ -112,6 +112,50 @@ pub fn print_renames(conn: &rusqlite::Connection, id: &str) -> ZResult<()> {
     Ok(())
 }
 
+/// Pending changesets whose recorded content no longer matches the working tree.
+///
+/// This is what a lost update looks like from the outside: two writers snapshot the same
+/// base, one commits, and the other's snapshot now describes a file that has moved on. The
+/// commit itself is not wrong at the database level, which is why nothing complained.
+fn pending_out_of_date(
+    conn: &rusqlite::Connection,
+    root: &std::path::Path,
+    _total: i64,
+) -> ZResult<Vec<(String, Vec<String>)>> {
+    let pending: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT cf.changeset_id, cf.path
+             FROM changesets c JOIN changeset_files cf ON cf.changeset_id = c.id
+             WHERE c.status = 'pending' ORDER BY cf.changeset_id, cf.path",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let mut stale: Vec<(String, Vec<String>)> = Vec::new();
+    for (id, path) in pending {
+        let recorded: Option<String> = conn
+            .query_row(
+                "SELECT new_hash FROM changeset_files WHERE changeset_id = ?1 AND path = ?2",
+                rusqlite::params![id, path],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        let on_disk = match std::fs::read(root.join(&path)) {
+            Ok(bytes) => Some(crate::store::hash_content(&String::from_utf8_lossy(&bytes))),
+            Err(_) => None,
+        };
+        if recorded != on_disk {
+            match stale.iter_mut().find(|(sid, _)| sid == &id) {
+                Some((_, paths)) => paths.push(path),
+                None => stale.push((id, vec![path])),
+            }
+        }
+    }
+    Ok(stale)
+}
+
 pub fn cmd_status() -> ZResult<()> {
     let (root, conn) = open_repo()?;
     let branch = current_branch(&conn)?;
@@ -129,6 +173,24 @@ pub fn cmd_status() -> ZResult<()> {
         |r| r.get(0),
     )?;
     println!("changesets: {} total, {} pending", total, pending);
+
+    // A pending changeset is a snapshot of an earlier moment. If the file it recorded has
+    // changed since, or another writer produced a changeset against the same base, committing
+    // it stores content that no longer describes what is on disk. Saying so is the difference
+    // between a confusing history and an explainable one.
+    if pending > 0 {
+        let stale = pending_out_of_date(&conn, &root, total)?;
+        if !stale.is_empty() {
+            println!(
+                "\nwarning: {} pending changeset(s) no longer match the working tree:",
+                stale.len()
+            );
+            for (id, paths) in stale.iter().take(5) {
+                println!("  {} ({})", &id[..id.len().min(14)], paths.join(", "));
+            }
+            println!("Commit or discard them before snapshotting again.");
+        }
+    }
 
     let d = repo::diff_worktree(&conn, &root, &branch)?;
 
@@ -1926,4 +1988,53 @@ pub fn cmd_land(source: &str, onto: &str, expect: Option<&str>, author: &str) ->
         }
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod pending_tests {
+    use super::*;
+
+    /// A pending changeset is a snapshot of an earlier moment. If the file moved on before it
+    /// was committed, committing it stores content that does not describe the disk, and
+    /// nothing else would say so.
+    #[test]
+    fn a_pending_changeset_that_no_longer_matches_the_disk_is_reported() {
+        let conn = crate::store::tests::mem_db();
+        let dir = std::env::temp_dir().join(format!("gesta-pending-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(dir.join("f.txt"), "v1\n").unwrap();
+        crate::repo::tests::commit_files(&conn, "p1", "base", &[("f.txt", "v1\n")]);
+        crate::store::set_branch_head(&conn, "main", "p1").unwrap();
+        crate::store::set_state(&conn, "current_branch", "main").unwrap();
+
+        // Snapshot a change without committing it.
+        std::fs::write(dir.join("f.txt"), "v2\n").unwrap();
+        let cs = crate::repo::create_changeset(&conn, &dir, "snapshot", "a")
+            .unwrap()
+            .expect("there is a change to snapshot");
+
+        // Matching the disk, so nothing is stale yet.
+        let clean = pending_out_of_date(&conn, &dir, 0).unwrap();
+        assert!(
+            clean.is_empty(),
+            "a fresh snapshot must not be reported: {:?}",
+            clean
+        );
+
+        // The file moves on before the commit.
+        std::fs::write(dir.join("f.txt"), "v3\n").unwrap();
+        let stale = pending_out_of_date(&conn, &dir, 0).unwrap();
+        assert_eq!(stale.len(), 1, "the stale snapshot was not found");
+        assert_eq!(stale[0].0, cs.id);
+        assert_eq!(stale[0].1, vec!["f.txt".to_string()]);
+
+        // Deleting the file is also a mismatch.
+        std::fs::remove_file(dir.join("f.txt")).unwrap();
+        let gone = pending_out_of_date(&conn, &dir, 0).unwrap();
+        assert_eq!(gone.len(), 1, "a file removed after the snapshot was not reported");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

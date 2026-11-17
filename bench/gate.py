@@ -125,6 +125,70 @@ def main():
                     bad.append(f"{f}:{line} {m.group(0)[:40]}")
         record("no hardcoded credential in src", not bad, "\n".join(bad[:10]))
 
+    if want("concurrent"):
+        # Two processes writing one repository must not lose anything. A stale pending snapshot
+        # is the failure that leaves no trace: the commit succeeds and stores content that does
+        # not describe the disk.
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        sh(f"{ZF} init", cwd=tmp)
+        with open(os.path.join(tmp, "base.txt"), "w") as fh:
+            fh.write("base\n")
+        sh(f"{ZF} changeset create seed --author t", cwd=tmp)
+        out = sh(f"{ZF} changeset list --json", cwd=tmp)[1]
+        cid = re.search(r"(cs[0-9a-f]+)", out)
+        if cid:
+            sh(f"{ZF} changeset commit {cid.group(1)}", cwd=tmp)
+
+        # Twenty writers at once, each adding its own file.
+        procs = []
+        for i in range(20):
+            path = os.path.join(tmp, f"w{i}.txt")
+            with open(path, "w") as fh:
+                fh.write(f"writer {i}\n")
+            procs.append(
+                subprocess.Popen(
+                    ["bash", "-lc",
+                     f"{ZF} changeset create w{i} --author p{i} >/dev/null 2>&1; "
+                     f"c=$({ZF} changeset list --json 2>/dev/null | grep -oE 'cs[0-9a-f]+' | head -1); "
+                     f"[ -n \"$c\" ] && {ZF} changeset commit $c >/dev/null 2>&1; true"],
+                    cwd=tmp,
+                )
+            )
+        for p_ in procs:
+            p_.wait(timeout=120)
+
+        total = sh(f"{ZF} log --limit 100 --oneline", cwd=tmp)[1].count("cs")
+        fs = sh(f"{ZF} fsck", cwd=tmp)
+        on_disk = len([f for f in os.listdir(tmp) if f.endswith(".txt")])
+        record(
+            "twenty concurrent writers lose nothing",
+            total == 21 and fs[0] == 0 and on_disk == 21,
+            f"changesets={total} files={on_disk} fsck={fs[1].strip()[:120]}",
+        )
+
+        # A pending snapshot that no longer matches the disk must be reported.
+        stale_dir = tempfile.mkdtemp()
+        sh(f"{ZF} init", cwd=stale_dir)
+        with open(os.path.join(stale_dir, "f.txt"), "w") as fh:
+            fh.write("v1\n")
+        sh(f"{ZF} changeset create base --author t", cwd=stale_dir)
+        out = sh(f"{ZF} changeset list --json", cwd=stale_dir)[1]
+        cid = re.search(r"(cs[0-9a-f]+)", out)
+        if cid:
+            sh(f"{ZF} changeset commit {cid.group(1)}", cwd=stale_dir)
+        with open(os.path.join(stale_dir, "f.txt"), "w") as fh:
+            fh.write("v2\n")
+        sh(f"{ZF} changeset create snapshot --author t", cwd=stale_dir)
+        with open(os.path.join(stale_dir, "f.txt"), "w") as fh:
+            fh.write("v3\n")
+        st = sh(f"{ZF} status", cwd=stale_dir)
+        record(
+            "a pending snapshot that no longer matches the disk is reported",
+            "no longer match" in st[1],
+            st[1][:200],
+        )
+
     if want("worktree"):
         # An integrity check that compares tables cannot see the disk, and the worst defect
         # this tool had was a working tree that disagreed with the head while every check
