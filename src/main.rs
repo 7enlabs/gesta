@@ -290,6 +290,19 @@ enum Cmd {
         #[command(subcommand)]
         sub: SecretCmd,
     },
+    /// Land a branch onto a target, refusing if the target moved since it was read
+    Land {
+        /// Branch whose changes are being landed
+        source: String,
+        /// Branch being landed onto
+        #[arg(long, default_value = "main")]
+        onto: String,
+        /// The head read before the merge, which the write must still find
+        #[arg(long)]
+        expect: Option<String>,
+        #[arg(long, default_value = "agent")]
+        author: String,
+    },
     /// Show a stack of changesets step by step, with a risk read on each
     Review {
         /// Start after this revision; everything after it is shown
@@ -705,6 +718,9 @@ fn run() -> ZResult<()> {
             }
         },
         Cmd::Secret { sub } => cli::cmd_secret(sub),
+        Cmd::Land { source, onto, expect, author } => {
+            cli::cmd_land(&source, &onto, expect.as_deref(), &author)
+        }
         Cmd::Review { from, to, min_risk } => cli::cmd_review(from.as_deref(), to.as_deref(), min_risk.as_deref()),
         Cmd::Mcp => cli::cmd_mcp(),
         Cmd::Serve { bind, port, tls, key } => {

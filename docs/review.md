@@ -37,6 +37,18 @@ Bands: 0 to 3 low, 4 to 8 medium, 9 and above high.
 Every point names the rule that awarded it. A score whose reason cannot be stated is
 not usable for routing, because a wrong routing decision becomes unauditable.
 
+## What the score learns from
+
+The rules are a guess, so the score is adjusted by evidence the repository already holds:
+a revert in the operation log. If a change matches the shape of something this repository
+has taken back before, it gets up to three extra points, and the reason names the count.
+
+The adjustment only ever raises a score. A rule that can quietly lower one would be able
+to hide a change a person should have seen, and that is the wrong direction to be wrong in.
+
+The match is coarse on purpose: a size band, whether a test was touched. A finer match
+finds nothing in a small repository and would claim to know more than the data supports.
+
 ## What this is not
 
 It is not a prediction. The rules encode a guess about what deserves attention, not a

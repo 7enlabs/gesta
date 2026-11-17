@@ -65,6 +65,7 @@ gesta blame src/main.rs
 | `rebase --abort` | Put the branch back where the rebase started |
 | `diff --from A --to B` | Compare two revisions, for reviewing a step |
 | `review [--from A] [--min-risk B]` | Read a stack step by step, with a risk read on each |
+| `land <branch> --onto main --expect H` | Merge only if the target still has head H |
 | `cherry-pick <id> [--onto B]` | Apply one changeset's change onto a branch |
 | `bisect start <good> <bad>` | Begin a search for the changeset that introduced a fault |
 | `bisect good \| bad` | Answer about the changeset under test |

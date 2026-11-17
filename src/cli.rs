@@ -1776,3 +1776,68 @@ pub fn cmd_review(from: Option<&str>, to: Option<&str>, min_risk: Option<&str>) 
     );
     Ok(())
 }
+
+/// `gesta land`: merge one branch into another, but only if the target has not moved.
+///
+/// Without the check, two people landing at the same time both read the same head, both
+/// merge against it, and the second overwrites the first with no error anywhere. A
+/// compare-and-swap turns that into a refusal, which is the whole point of a queue.
+pub fn cmd_land(source: &str, onto: &str, expect: Option<&str>, author: &str) -> ZResult<()> {
+    let (root, conn) = open_repo()?;
+    let before = store::branch_head(&conn, onto)?;
+    if let Some(e) = expect {
+        if before.as_deref() != Some(e) {
+            return Err(bad(format!(
+                "{} moved: expected {}, found {}. Re-read the head and prepare again.",
+                onto,
+                e,
+                before.as_deref().unwrap_or("(none)")
+            )));
+        }
+    }
+
+    let out = crate::repo::land_branch(&conn, &root, source, onto, before.as_deref(), author)?;
+    if !out.conflicts.is_empty() {
+        eprintln!(
+            "{} change(s) conflict when landing {} onto {}:",
+            out.conflicts.len(),
+            source,
+            onto
+        );
+        for c in &out.conflicts {
+            eprintln!("  {} (their version saved as {}.theirs)", c, c);
+        }
+        return Err(bad(
+            "landing needs a manual merge; the target was not moved".to_string(),
+        ));
+    }
+    if out.applied.is_empty() {
+        println!("{} has nothing that {} does not already have", source, onto);
+        return Ok(());
+    }
+    let after = store::branch_head(&conn, onto)?;
+
+    // Landing moved the target head, so the working tree has to follow when the target is
+    // the branch in front of the user. Without this the file the merge added exists in
+    // history and is reported as deleted on disk, which looks like data loss.
+    let current = current_branch(&conn)?;
+    let refreshed = if current == onto {
+        Some(repo::materialise(&conn, &root, onto)?)
+    } else {
+        None
+    };
+
+    ops::record(&conn, "land", after.as_deref(), Some(source))?;
+    println!(
+        "landed {} onto {} ({} change(s), head now {}{})",
+        source,
+        onto,
+        out.applied.len(),
+        after.as_deref().unwrap_or("(none)"),
+        match refreshed {
+            Some(n) => format!(", {} file(s) written", n),
+            None => String::new(),
+        }
+    );
+    Ok(())
+}

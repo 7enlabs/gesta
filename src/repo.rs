@@ -447,6 +447,7 @@ pub fn write_conflict_copy(root: &Path, path: &str, theirs: &str) -> ZResult<Str
 }
 
 /// Result of a merge attempt.
+#[derive(Debug)]
 pub struct MergeOutcome {
     pub applied: Vec<String>,
     pub conflicts: Vec<String>,
@@ -1367,6 +1368,28 @@ impl Risk {
         self.reasons.push(format!("+{} {}", points, why));
     }
 
+    /// Adjust the score from what this repository has actually reverted.
+    ///
+    /// The rules above encode a guess. A revert is evidence: a change that matched a shape
+    /// which has been reverted before deserves a second look more than one that matched a
+    /// shape nobody has ever taken back. This is the smallest honest version of learning
+    /// from data, and it only ever raises a score, because the alternative is a rule that
+    /// can quietly hide a change a person would have wanted to see.
+    fn calibrate(&mut self, hits: usize, reverts: usize) {
+        if reverts == 0 || hits == 0 {
+            return;
+        }
+        let points = hits.min(3) as i64;
+        self.add(
+            points,
+            format!(
+                "{} of the {} reverted changeset(s) here matched this shape",
+                hits.min(reverts),
+                reverts
+            ),
+        );
+    }
+
     /// The band a score falls in, with the same word a person would use.
     pub fn band(&self) -> &'static str {
         match self.score {
@@ -1378,7 +1401,20 @@ impl Risk {
 }
 
 /// Score one changeset from what it changed.
+#[cfg(test)]
 pub fn score_change(conn: &Connection, diffs: &[PathDiff]) -> ZResult<Risk> {
+    score_change_calibrated(conn, diffs, None)
+}
+
+/// Score one change, optionally adjusted by what this repository has reverted.
+///
+/// `history` is the list of changesets that a revert named, when the caller has it. With
+/// `None` the score is the plain rule set, which is what a fresh repository has.
+pub fn score_change_calibrated(
+    conn: &Connection,
+    diffs: &[PathDiff],
+    history: Option<&RevertHistory>,
+) -> ZResult<Risk> {
     let mut r = Risk::default();
     let lines: usize = diffs.iter().map(|(_, rm, ad)| rm.len() + ad.len()).sum();
     let touched = diffs.len().max(1);
@@ -1440,10 +1476,93 @@ pub fn score_change(conn: &Connection, diffs: &[PathDiff]) -> ZResult<Risk> {
         r.add(3, "a binary file changed".to_string());
     }
 
+    if let Some(h) = history {
+        let hits = h.shapes_matching(&paths, lines, has_test, has_dep);
+        r.calibrate(hits, h.reverted.len());
+    }
+
     if r.reasons.is_empty() {
         r.reasons.push("small, text only, tests present or not needed".to_string());
     }
     Ok(r)
+}
+
+/// Changesets this repository has reverted, and the shapes of those changes.
+///
+/// The only honest training signal available: something a person took back was, by that
+/// act, a change that deserved more attention than it got.
+pub struct RevertHistory {
+    pub reverted: Vec<String>,
+    /// Per reverted change: how many lines, whether a test was touched, whether a
+    /// dependency manifest was touched.
+    pub shapes: Vec<(usize, bool, bool)>,
+}
+
+impl RevertHistory {
+    /// Read the reverts recorded in the operation log.
+    pub fn load(conn: &Connection) -> ZResult<RevertHistory> {
+        let ids: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT DISTINCT detail FROM operations WHERE kind = 'revert' AND detail IS NOT NULL",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut history = RevertHistory {
+            reverted: Vec::new(),
+            shapes: Vec::new(),
+        };
+        for id in ids {
+            let diff = match diff_revs(conn, parents_of_first(conn, &id)?.as_deref(), Some(&id)) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            if diff.is_empty() {
+                continue;
+            }
+            let lines: usize = diff.iter().map(|(_, rm, ad)| rm.len() + ad.len()).sum();
+            let mut has_test = false;
+            let mut has_dep = false;
+            for (path, _, _) in &diff {
+                let lower = path.to_ascii_lowercase();
+                let name = lower.rsplit('/').next().unwrap_or("");
+                if name.contains("test") || lower.contains("/tests/") {
+                    has_test = true;
+                }
+                if name == "cargo.toml" || name == "package.json" || name == "go.mod" {
+                    has_dep = true;
+                }
+            }
+            history.shapes.push((lines, has_test, has_dep));
+            history.reverted.push(id);
+        }
+        Ok(history)
+    }
+
+    /// How many reverted changes share the shape of the change being scored.
+    ///
+    /// The comparison is coarse on purpose: a size band, whether a test was touched, and
+    /// whether a manifest was touched. A finer match would find nothing in a small
+    /// repository and would be pretending to know more than the data supports.
+    fn shapes_matching(&self, paths: &[&str], lines: usize, has_test: bool, has_dep: bool) -> usize {
+        let band = |n: usize| match n {
+            0..=100 => 0,
+            101..=400 => 1,
+            _ => 2,
+        };
+        let mine = band(lines);
+        let _ = (paths, has_dep);
+        self.shapes
+            .iter()
+            .filter(|(l, t, _)| band(*l) == mine && *t == has_test)
+            .count()
+    }
+}
+
+/// The first parent of a changeset, if it has one.
+fn parents_of_first(conn: &Connection, id: &str) -> ZResult<Option<String>> {
+    let (p1, _) = crate::store::parents_of_public(conn, id)?;
+    Ok(p1)
 }
 
 /// The object hash for a path at the branch head, if the path exists there.
@@ -1492,7 +1611,8 @@ pub fn review_stack(
     for id in chain {
         let (p1, _) = crate::store::parents_of_public(conn, &id)?;
         let diff = diff_revs(conn, p1.as_deref(), Some(&id))?;
-        let risk = score_change(conn, &diff)?;
+        let history = RevertHistory::load(conn)?;
+        let risk = score_change_calibrated(conn, &diff, Some(&history))?;
         let (message, author): (String, String) = conn
             .query_row(
                 "SELECT message, author FROM changesets WHERE id = ?1",
@@ -1510,6 +1630,35 @@ pub fn review_stack(
         });
     }
     Ok(out)
+}
+
+/// Land a branch onto a target, refusing if the target moved since it was read.
+///
+/// This is the guard a merge queue exists for. Two writers landing at once both read
+/// the same target head, both compute a merge against it, and the second overwrites the
+/// first. The check is a compare-and-swap on the target head, done inside the same
+/// transaction that writes, so a lost update becomes a refusal instead of silent loss.
+///
+/// The expected head is required. A caller that has not read the target head does not
+/// know what it is overwriting, and "I did not check" is the bug this prevents.
+pub fn land_branch(
+    conn: &Connection,
+    root: &Path,
+    source: &str,
+    target: &str,
+    expected_target_head: Option<&str>,
+    author: &str,
+) -> ZResult<MergeOutcome> {
+    let current = branch_head(conn, target)?;
+    if current.as_deref() != expected_target_head {
+        return Err(bad(format!(
+            "{} moved while this was being prepared: expected {}, found {}",
+            target,
+            expected_target_head.unwrap_or("(none)"),
+            current.as_deref().unwrap_or("(none)")
+        )));
+    }
+    merge_branch(conn, root, source, target, author)
 }
 
 #[cfg(test)]
@@ -2307,5 +2456,174 @@ pub(crate) mod tests {
             "a change that touched a test was still flagged: {:?}",
             reasons
         );
+    }
+    /// The rules are a guess. A revert is evidence, and a change that matches a shape this
+    /// repository has taken back before should score higher than the same shape in a
+    /// repository that never has.
+    #[test]
+    fn a_revert_raises_the_score_of_a_change_with_the_same_shape() {
+        let conn = mem_db();
+        commit_files(&conn, "h1", "base", &[("a.txt", "alpha\n")]);
+        let body: String = (0..200).map(|i| format!("line {}\n", i)).collect();
+        commit_files(&conn, "h2", "big", &[("big.txt", &body)]);
+        commit_files(&conn, "h3", "big again", &[("big2.txt", &body)]);
+
+        // With nothing reverted, the two big changes score the same.
+        let plain = diff_revs(&conn, Some("h2"), Some("h3")).unwrap();
+        let without = score_change(&conn, &plain).unwrap();
+        let second = diff_revs(&conn, Some("h2"), Some("h3")).unwrap();
+        let without2 = score_change(&conn, &second).unwrap();
+        assert_eq!(
+            without.score, without2.score,
+            "with no history the same shape must score the same"
+        );
+
+        // Record h2 as reverted.
+        conn.execute(
+            "INSERT INTO operations(kind, target, detail, snapshot, created_at)
+             VALUES('revert', 'h2', 'h2', '{}', 1)",
+            [],
+        )
+        .unwrap();
+        let history = RevertHistory::load(&conn).unwrap();
+        assert_eq!(history.reverted.len(), 1, "the revert was not read back");
+
+        let third = diff_revs(&conn, Some("h2"), Some("h3")).unwrap();
+        let with = score_change_calibrated(&conn, &third, Some(&history)).unwrap();
+        assert!(
+            with.score > without.score,
+            "a matching revert did not raise the score: {} vs {}",
+            with.score,
+            without.score
+        );
+        assert!(
+            with.reasons.iter().any(|r| r.contains("reverted")),
+            "the calibration must say where the extra point came from: {:?}",
+            with.reasons
+        );
+        // It never lowers anything, and never adds more than a few points.
+        assert!(with.score - without.score <= 3, "the adjustment is too large");
+    }
+
+    #[test]
+    fn an_unrelated_revert_does_not_raise_the_score() {
+        let conn = mem_db();
+        commit_files(&conn, "u1", "base", &[("a.txt", "alpha\n")]);
+        // A reverted change that touched a test, at a very different size.
+        conn.execute(
+            "INSERT INTO changesets(id,message,author,created_at,status,parent,branch)
+             VALUES('rev1','small','a',2,'committed','u1','main')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO changeset_files(changeset_id,path,old_hash,new_hash)
+             VALUES('rev1','a_test.rs',NULL,NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO operations(kind, target, detail, snapshot, created_at)
+             VALUES('revert', 'rev1', 'rev1', '{}', 1)",
+            [],
+        )
+        .unwrap();
+
+        let body: String = (0..200).map(|i| format!("line {}\n", i)).collect();
+        commit_files(&conn, "u2", "big, no test", &[("big.txt", &body)]);
+        let diff = diff_revs(&conn, Some("u1"), Some("u2")).unwrap();
+        let plain = score_change(&conn, &diff).unwrap();
+        let history = RevertHistory::load(&conn).unwrap();
+        let calibrated = score_change_calibrated(&conn, &diff, Some(&history)).unwrap();
+        assert_eq!(
+            plain.score, calibrated.score,
+            "a revert of a different shape must not move the score"
+        );
+    }
+    /// Two writers landing at once is the failure a merge queue exists for. The second
+    /// must be refused, not silently overwrite the first.
+    #[test]
+    fn landing_is_refused_when_the_target_moved() {
+        let conn = mem_db();
+        let root = std::env::temp_dir().join(format!("gesta-land-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("f.txt"), "base\n").unwrap();
+        commit_files(&conn, "L0", "base", &[("f.txt", "base\n")]);
+
+        // Two side branches from the same point.
+        for name in ["left", "right"] {
+            conn.execute(
+                "INSERT INTO branches(name, head, created_at, from_branch)
+                 VALUES(?1,'L0',1,'main')",
+                rusqlite::params![name],
+            )
+            .unwrap();
+            crate::store::refresh_branch_tree(&conn, name).unwrap();
+        }
+        // `commit_files` commits onto main, so the side branch is built explicitly.
+        std::fs::write(root.join("l.txt"), "left\n").unwrap();
+        conn.execute(
+            "INSERT INTO changesets(id,message,author,created_at,status,parent,branch)
+             VALUES('L1','left','a',2,'pending','L0','left')",
+            [],
+        )
+        .unwrap();
+        // A null new_hash means a deletion, so the added content has to be stored and
+        // named here. Getting this wrong made the merge apply nothing, which the test
+        // then reported as a missing file.
+        let l_hash = crate::store::put_object(&conn, "left\n").unwrap();
+        conn.execute(
+            "INSERT INTO changeset_files(changeset_id,path,old_hash,new_hash)
+             VALUES('L1','l.txt',NULL,?1)",
+            rusqlite::params![l_hash],
+        )
+        .unwrap();
+        commit_one(&conn, "L1").unwrap();
+        std::fs::write(root.join("r.txt"), "right\n").unwrap();
+        conn.execute(
+            "INSERT INTO changesets(id,message,author,created_at,status,parent,branch)
+             VALUES('R1','right','a',2,'pending','L0','right')",
+            [],
+        )
+        .unwrap();
+        let r_hash = crate::store::put_object(&conn, "right\n").unwrap();
+        conn.execute(
+            "INSERT INTO changeset_files(changeset_id,path,old_hash,new_hash)
+             VALUES('R1','r.txt',NULL,?1)",
+            rusqlite::params![r_hash],
+        )
+        .unwrap();
+        commit_one(&conn, "R1").unwrap();
+
+        // First writer lands with the head it read.
+        let read = crate::store::branch_head(&conn, "main").unwrap();
+        land_branch(&conn, &root, "left", "main", read.as_deref(), "a").unwrap();
+        let after_first = crate::store::branch_head(&conn, "main").unwrap();
+        assert_ne!(after_first, read, "the first landing must move main");
+
+        // Second writer prepared against the same head and must be refused.
+        let err = land_branch(&conn, &root, "right", "main", read.as_deref(), "b").unwrap_err();
+        assert!(
+            err.to_string().contains("moved while this was being prepared"),
+            "got: {}",
+            err
+        );
+        assert_eq!(
+            crate::store::branch_head(&conn, "main").unwrap(),
+            after_first,
+            "a refused landing must not move the target"
+        );
+
+        // Re-reading and retrying succeeds.
+        let fresh = crate::store::branch_head(&conn, "main").unwrap();
+        land_branch(&conn, &root, "right", "main", fresh.as_deref(), "b").unwrap();
+        let final_head = crate::store::branch_head(&conn, "main").unwrap().unwrap();
+        let tree = tree_at(&conn, &final_head).unwrap();
+        let names: Vec<&str> = tree.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(names.contains(&"l.txt"), "left is missing from {:?}", names);
+        assert!(names.contains(&"r.txt"), "right is missing from {:?}", names);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

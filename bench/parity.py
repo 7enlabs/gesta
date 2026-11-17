@@ -322,6 +322,49 @@ def main():
             r.stdout + r.stderr,
         )
 
+    # Landing with a compare-and-swap: two writers at once must not lose one silently.
+    lq = os.path.join(ROOT, "land")
+    os.makedirs(lq)
+    sh(f"{GESTA} init", cwd=lq)
+    with open(os.path.join(lq, "f.txt"), "w") as fh:
+        fh.write("base\n")
+    commit(lq, "base")
+    head0 = sh(f"{GESTA} branch info main --json", cwd=lq).stdout
+    head0 = re.search(r"(cs[0-9a-f]+)", head0)
+    head0 = head0.group(1) if head0 else None
+    for name in ("one", "two"):
+        sh(f"{GESTA} branch create {name}", cwd=lq)
+        sh(f"{GESTA} branch switch {name}", cwd=lq)
+        with open(os.path.join(lq, f"{name}.txt"), "w") as fh:
+            fh.write(f"{name}\n")
+        commit(lq, name)
+    sh(f"{GESTA} branch switch main", cwd=lq)
+    if head0:
+        r1 = sh(f"{GESTA} land one --onto main --expect {head0}", cwd=lq)
+        check("land moves the target when the head matches", r1.returncode == 0, r1.stdout + r1.stderr)
+        r2 = sh(f"{GESTA} land two --onto main --expect {head0}", cwd=lq)
+        check(
+            "a second landing on a stale head is refused",
+            r2.returncode != 0 and "moved" in (r2.stdout + r2.stderr),
+            r2.stdout + r2.stderr,
+        )
+        now = re.search(r"(cs[0-9a-f]+)", sh(f"{GESTA} branch info main --json", cwd=lq).stdout)
+        now = now.group(1) if now else None
+        r3 = sh(f"{GESTA} land two --onto main --expect {now}", cwd=lq) if now else None
+        check(
+            "re-reading the head lets the landing through",
+            r3 is not None and r3.returncode == 0,
+            (r3.stdout + r3.stderr) if r3 else "no head",
+        )
+        files = sorted(os.listdir(lq))
+        check(
+            "both writers' files are present after landing",
+            "one.txt" in files and "two.txt" in files,
+            str(files),
+        )
+    else:
+        check("land could not read the branch head", False, "no changeset id")
+
     # Reviewing a stack: each step separately, oldest first, with a risk read.
     r = sh(f"{GESTA} review", cwd=cp)
     check(
