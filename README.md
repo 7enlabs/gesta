@@ -117,7 +117,7 @@ A push that would move the server's branch to a head not containing its current 
 ## Verification
 
 ```bash
-cargo test --release              # 67 unit tests
+cargo test --release              # 69 unit tests
 python3 bench/replace_git.py      # 20 end to end capability checks
 python3 bench/http_remote.py      # 11 checks over a real socket
 python3 bench/size_compare.py     # disk usage against git
@@ -136,11 +136,15 @@ What the suites cover, and why each check exists:
 
 Measured in the workspace container, release build.
 
-| Operation | 2,000 files |
-|---|---|
-| `changeset create` | 54 ms |
-| `changeset commit` | 95 ms |
-| `status` | 45 ms |
+| Operation | 2,000 files | 5,000 files, 200 changesets |
+|---|---|---|
+| `changeset create` + `commit` | 54 ms | 117 ms |
+| `status` | 45 ms | 54 ms |
+| `blame` (201 versions of one file) | 12 ms | 26 ms |
+| `log --limit 5` | 14 ms | 14 ms |
+| `remote clone` over HTTP | 0.3 s | 0.3 s (5,000 files) |
+
+An earlier version of `status` and `changeset create` asked for the committed hash of each file separately, and each lookup re-walked the whole parent chain. That made both operations quadratic in history depth: on 3,000 files, `status` took 55 ms at one changeset, 878 ms at fifty, and 6.8 s at two hundred. They now fetch the committed tree in one ranked query, so the cost no longer depends on how deep the history is.
 
 Disk usage, 21 versions of a 42 KB file edited one line at a time: 267 KB against git's 101 KB, so 2.63x. Before compression it was 8.9x. A tree of 1,000 tiny files costs 4.32x git, because per-row overhead dominates when each object is a few dozen bytes.
 
@@ -154,7 +158,7 @@ Disk usage, 21 versions of a 42 KB file edited one line at a time: 267 KB agains
 - **Blame is line-sequence based.** A line moved and edited in the same commit loses its original author.
 - **No rebase, cherry-pick, bisect, hooks, submodules, LFS, or `.gitattributes`.**
 - **Conflicts are resolved by editing files**, then committing the result. There is no interactive resolver.
-- **Large histories are unmeasured.** Nothing above a few changesets and 2,000 files has been profiled.
+- **Large histories are still lightly measured.** Behaviour up to 5,000 files and 200 changesets is known. Beyond that, unmeasured.
 
 ## Layout
 

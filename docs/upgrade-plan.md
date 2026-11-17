@@ -229,8 +229,9 @@ These are inferences, with no measurement or source behind them:
 4. **Conflicts are not interactively resolved.** You edit the files and commit.
 5. **Blame is sequence-based.** A line moved and edited in the same commit loses
    its original author.
-6. **No performance data past 3 changesets and 2000 files.** Large-history
-   behaviour is still unmeasured.
+6. **Performance is measured to 5,000 files and 200 changesets.** Beyond that it
+   is unmeasured. The quadratic path in `status` and `changeset create` was found
+   and fixed at this size: 3,166 ms per commit dropped to 117 ms.
 
 ### Judgement
 

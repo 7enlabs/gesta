@@ -66,15 +66,19 @@ pub fn diff_worktree(conn: &Connection, root: &Path, branch: &str) -> ZResult<Wo
     };
     let mut seen = std::collections::HashSet::new();
 
+    // The committed tree is fetched once. Asking per file made this quadratic:
+    // each lookup re-walked the whole parent chain.
+    let committed = committed_tree(conn, branch)?;
+
     for p in scan_files(root, &rules)? {
         let rel = rel_path(root, &p);
         match read_file(&p) {
             ReadOutcome::Text(content) => {
                 seen.insert(rel.clone());
                 let new_hash = hash_content(&content);
-                match latest_hash(conn, &rel, branch)? {
+                match committed.get(&rel) {
                     None => d.added.push(rel),
-                    Some(old) if old != new_hash => d.modified.push(rel),
+                    Some(old) if old != &new_hash => d.modified.push(rel),
                     Some(_) => d.unchanged += 1,
                 }
             }
@@ -86,18 +90,11 @@ pub fn diff_worktree(conn: &Connection, root: &Path, branch: &str) -> ZResult<Wo
     }
 
     // Files tracked on the branch but absent from disk.
-    let head = branch_head(conn, branch)?;
-    if let Some(head) = head {
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT path FROM file_versions WHERE changeset_id = ?1 ORDER BY path",
-        )?;
-        let tracked: Vec<String> = stmt
-            .query_map(params![head], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        for path in tracked {
-            if !seen.contains(&path) && !root.join(&path).exists() {
-                d.deleted.push(path);
-            }
+    let mut tracked: Vec<String> = committed.keys().cloned().collect();
+    tracked.sort();
+    for path in tracked {
+        if !seen.contains(&path) && !root.join(&path).exists() {
+            d.deleted.push(path);
         }
     }
 
@@ -128,13 +125,16 @@ pub fn create_changeset(
     let mut skipped: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
+    // One tree lookup for the whole snapshot, not one per file.
+    let committed = committed_tree(conn, &branch)?;
+
     for p in scan_files(root, &rules)? {
         let rel = rel_path(root, &p);
         match read_file(&p) {
             ReadOutcome::Text(content) => {
                 seen.insert(rel.clone());
                 let new_hash = hash_content(&content);
-                let old_hash = latest_hash(conn, &rel, &branch)?;
+                let old_hash = committed.get(&rel).cloned();
                 if old_hash.as_deref() != Some(new_hash.as_str()) {
                     changes.push((rel, old_hash, new_hash, content));
                 }
@@ -146,17 +146,11 @@ pub fn create_changeset(
         }
     }
 
-    if let Some(head) = branch_head(conn, &branch)? {
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT path FROM file_versions WHERE changeset_id = ?1 ORDER BY path",
-        )?;
-        let tracked: Vec<String> = stmt
-            .query_map(params![head], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        for path in tracked {
-            if !seen.contains(&path) && !root.join(&path).exists() {
-                deleted.push(path);
-            }
+    let mut tracked: Vec<String> = committed.keys().cloned().collect();
+    tracked.sort();
+    for path in tracked {
+        if !seen.contains(&path) && !root.join(&path).exists() {
+            deleted.push(path);
         }
     }
 
@@ -667,8 +661,13 @@ pub fn checkout_file(
     Ok(content.len())
 }
 
-/// The full file tree as of `changeset`: every path reachable from it paired
-/// with its newest version. This is what a checkout materialises.
+/// The full file tree as of `changeset`: for every path reachable from it, the
+/// content decided by the most recent changeset that touched it. A path whose
+/// last touch was a deletion is absent from the result.
+///
+/// `changeset_files` is the authority here, not `file_versions`: it records the
+/// new hash of every touch, including deletions as `new_hash IS NULL`, so one
+/// ranked scan answers the whole tree.
 pub fn tree_at(conn: &Connection, changeset: &str) -> ZResult<Vec<(String, String)>> {
     let reachable = crate::store::ancestors(conn, changeset)?;
     if reachable.is_empty() {
@@ -676,11 +675,16 @@ pub fn tree_at(conn: &Connection, changeset: &str) -> ZResult<Vec<(String, Strin
     }
     let placeholders = vec!["?"; reachable.len()].join(",");
     let sql = format!(
-        "SELECT path, hash FROM (
-            SELECT path, hash, version,
-                   ROW_NUMBER() OVER (PARTITION BY path ORDER BY version DESC) AS rn
-            FROM file_versions WHERE changeset_id IN ({})
-         ) WHERE rn = 1 ORDER BY path",
+        "SELECT path, new_hash FROM (
+            SELECT cf.path AS path, cf.new_hash AS new_hash,
+                   ROW_NUMBER() OVER (
+                     PARTITION BY cf.path
+                     ORDER BY cs.created_at DESC, cs.rowid DESC
+                   ) AS rn
+            FROM changeset_files cf
+            JOIN changesets cs ON cs.id = cf.changeset_id
+            WHERE cf.changeset_id IN ({})
+         ) WHERE rn = 1 AND new_hash IS NOT NULL ORDER BY path",
         placeholders
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -692,6 +696,20 @@ pub fn tree_at(conn: &Connection, changeset: &str) -> ZResult<Vec<(String, Strin
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(files)
+}
+
+/// Every path on `branch` with its committed hash, in one query.
+pub fn committed_tree(
+    conn: &Connection,
+    branch: &str,
+) -> ZResult<std::collections::HashMap<String, String>> {
+    let mut out = std::collections::HashMap::new();
+    if let Some(head) = branch_head(conn, branch)? {
+        for (path, hash) in tree_at(conn, &head)? {
+            out.insert(path, hash);
+        }
+    }
+    Ok(out)
 }
 
 /// Write every file of `branch` to disk. Used after a push and after a clone so
@@ -972,6 +990,44 @@ mod tests {
         assert!(tmp.join("s.txt.theirs").exists(), "theirs must be preserved on disk");
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn tree_at_drops_a_path_that_a_later_changeset_deleted() {
+        let conn = mem_db();
+        commit_files(&conn, "cs1", "two files", &[("gone.txt", "bye\n"), ("stay.txt", "hi\n")]);
+
+        // A deletion is recorded with new_hash = NULL and no file_version row.
+        conn.execute(
+            "INSERT INTO changesets(id,message,author,created_at,status,parent,branch)
+             VALUES('cs2','remove gone','a',2,'pending','cs1','main')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO changeset_files(changeset_id,path,old_hash,new_hash)
+             VALUES('cs2','gone.txt',NULL,NULL)",
+            [],
+        )
+        .unwrap();
+        commit_one(&conn, "cs2").unwrap();
+
+        let tree = tree_at(&conn, "cs2").unwrap();
+        let paths: Vec<&str> = tree.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, vec!["stay.txt"], "a deleted path must leave the tree");
+
+        // The earlier changeset still sees both.
+        let old = tree_at(&conn, "cs1").unwrap();
+        assert_eq!(old.len(), 2, "history keeps the file it had");
+    }
+
+    #[test]
+    fn committed_tree_is_one_lookup_and_matches_tree_at() {
+        let conn = mem_db();
+        commit_files(&conn, "cs1", "two", &[("a.txt", "a\n"), ("b.txt", "b\n")]);
+        let tree = committed_tree(&conn, "main").unwrap();
+        assert_eq!(tree.len(), 2);
+        assert_eq!(tree.get("a.txt"), Some(&hash_content("a\n")));
     }
 
     #[test]
