@@ -442,8 +442,8 @@ fn clone_s3(url: &str, target: &Path, pin: Option<&str>, depth: Option<usize>) -
 
 // fsck / stats / ignore.
 
-pub fn cmd_fsck(prune: bool) -> ZResult<()> {
-    let (_root, conn) = open_repo()?;
+pub fn cmd_fsck(prune: bool, worktree: bool) -> ZResult<()> {
+    let (root, conn) = open_repo()?;
     let mut problems = 0usize;
 
     // Every changeset_file must point at objects that exist.
@@ -575,6 +575,54 @@ pub fn cmd_fsck(prune: bool) -> ZResult<()> {
                 println!("  extra   {} {}", p, &h[..h.len().min(12)]);
             }
             problems += 1;
+        }
+    }
+
+    // The working tree is state too, and this is the check that catches data loss: if the
+    // head names a file the disk does not have, the repository and the folder disagree and
+    // nothing else says so. A broken undo went unnoticed exactly here.
+    if worktree {
+        let current = crate::store::current_branch(&conn)?;
+        let scope = crate::sparse::SparseScope::load(&conn)?;
+        for (name, head) in &branches_with_heads {
+            if name != &current {
+                continue;
+            }
+            let expected = crate::repo::tree_at(&conn, head)?;
+            for (path, hash) in &expected {
+                // A sparse checkout leaves paths out on purpose, so their absence is
+                // correct rather than damage.
+                if !scope.is_empty() && !scope.contains(path) {
+                    continue;
+                }
+                match std::fs::read(root.join(path)) {
+                    Ok(bytes) => {
+                        let content = String::from_utf8_lossy(&bytes);
+                        let got = crate::store::hash_content(&content);
+                        if got != *hash {
+                            println!(
+                                "WORKTREE {} differs from the head (disk {}..., history {}...)",
+                                path,
+                                &got[..got.len().min(12)],
+                                &hash[..hash.len().min(12)]
+                            );
+                            problems += 1;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        println!("WORKTREE {} is in the head but missing from disk", path);
+                        problems += 1;
+                    }
+                    Err(e) => {
+                        println!("WORKTREE {} cannot be read: {}", path, e);
+                        problems += 1;
+                    }
+                }
+            }
+
+            // A path the repository has tracked before and that the head still names is
+            // caught above. A path the head does not name but which lingers on disk is left
+            // alone, because an untracked file belongs to the user.
         }
     }
 

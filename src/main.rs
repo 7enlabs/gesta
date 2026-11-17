@@ -344,6 +344,10 @@ enum Cmd {
         /// Delete objects nothing references
         #[arg(long)]
         prune: bool,
+        /// Also compare the working tree with the head. Off by default because it reads
+        /// every tracked file.
+        #[arg(long)]
+        worktree: bool,
     },
     /// Report storage statistics
     Stats,
@@ -744,7 +748,7 @@ fn run() -> ZResult<()> {
         Cmd::Serve { bind, port, tls, key } => {
             cli_remote::cmd_serve(&bind, port, tls.as_deref(), key.as_deref())
         }
-        Cmd::Fsck { prune } => cli_remote::cmd_fsck(prune),
+        Cmd::Fsck { prune, worktree } => cli_remote::cmd_fsck(prune, worktree),
         Cmd::Stats => cli_remote::cmd_stats(),
         Cmd::Ignore { sub } => match sub {
             IgnoreCmd::Add { pattern } => cli_remote::cmd_ignore_add(&pattern),

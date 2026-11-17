@@ -125,6 +125,51 @@ def main():
                     bad.append(f"{f}:{line} {m.group(0)[:40]}")
         record("no hardcoded credential in src", not bad, "\n".join(bad[:10]))
 
+    if want("worktree"):
+        # An integrity check that compares tables cannot see the disk, and the worst defect
+        # this tool had was a working tree that disagreed with the head while every check
+        # said the repository was consistent. This step runs the check that looks.
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        sh(f"{ZF} init", cwd=tmp)
+        os.makedirs(os.path.join(tmp, "src"))
+        with open(os.path.join(tmp, "src", "main.rs"), "w") as fh:
+            fh.write("fn main() {}\n")
+        with open(os.path.join(tmp, "a.txt"), "w") as fh:
+            fh.write("a\n")
+        sh(f"{ZF} changeset create seed --author t", cwd=tmp)
+        out = sh(f"{ZF} changeset list --json", cwd=tmp)[1]
+        cid = re.search(r"(cs[0-9a-f]+)", out)
+        if cid:
+            sh(f"{ZF} changeset commit {cid.group(1)}", cwd=tmp)
+
+        clean = sh(f"{ZF} fsck --worktree", cwd=tmp)
+        clean_ok = clean[0] == 0
+
+        # Delete a tracked file behind the tool's back.
+        os.remove(os.path.join(tmp, "src", "main.rs"))
+        missing = sh(f"{ZF} fsck --worktree", cwd=tmp)
+        caught_missing = missing[0] != 0 and "missing from disk" in missing[1]
+
+        # A user's own file is not a problem.
+        with open(os.path.join(tmp, "mine.txt"), "w") as fh:
+            fh.write("user data\n")
+        user_file = sh(f"{ZF} fsck --worktree", cwd=tmp)
+        user_ok = "mine.txt" not in user_file[1]
+
+        # Editing a tracked file is caught.
+        sh(f"{ZF} restore .", cwd=tmp)
+        with open(os.path.join(tmp, "a.txt"), "w") as fh:
+            fh.write("changed\n")
+        edited = sh(f"{ZF} fsck --worktree", cwd=tmp)
+        caught_edit = edited[0] != 0 and "differs from the head" in edited[1]
+
+        record(
+            "fsck --worktree sees the disk",
+            clean_ok and caught_missing and user_ok and caught_edit,
+            f"clean={clean_ok} missing={caught_missing} user={user_ok} edited={caught_edit}",
+        )
+
     if want("paths"):
         # Every path that arrives from a client must be refused when it escapes
         # the repository: this is the one defect that turns a remote write into

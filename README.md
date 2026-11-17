@@ -85,7 +85,7 @@ gesta blame src/main.rs
 | `mcp` | MCP server on stdio, exposing the repository as tools |
 | `branch conflicts <source>` | Report merge conflicts as JSON without touching anything |
 | `sparse set/list/clear` | Limit the working tree to a set of paths |
-| `fsck [--prune]` | Verify integrity, optionally drop orphan objects |
+| `fsck [--prune] [--worktree]` | Verify integrity, optionally drop orphan objects; `--worktree` also compares the files on disk with the head |
 | `stats` | Object counts and compression ratio |
 | `ignore add/list/remove` | Ignore patterns |
 
