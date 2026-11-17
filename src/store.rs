@@ -176,6 +176,21 @@ pub fn init_schema(conn: &Connection) -> ZResult<()> {
             size  INTEGER NOT NULL,
             hash  TEXT NOT NULL
         );
+        -- Changesets whose parent was deliberately left out of a shallow clone. A
+        -- row here turns "missing parent" into "boundary", which is the difference
+        -- between a partial history and a damaged one.
+        CREATE TABLE IF NOT EXISTS shallow_roots (
+            changeset_id TEXT PRIMARY KEY,
+            branch       TEXT NOT NULL,
+            created_at   INTEGER NOT NULL
+        );
+        -- The head tree a shallow clone was given, so an object the working tree needs
+        -- is not mistaken for an orphan. Without this, `fsck --prune` would delete
+        -- files that are on disk and correct.
+        CREATE TABLE IF NOT EXISTS snapshot_objects (
+            path TEXT PRIMARY KEY,
+            hash TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS repo_state (
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL

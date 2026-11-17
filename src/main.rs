@@ -525,6 +525,9 @@ enum RemoteCmd {
         /// SHA-256 fingerprint of the server certificate, for a self-signed one.
         #[arg(long)]
         pin: Option<String>,
+        /// Take only the newest N changesets, for a history too long to download whole
+        #[arg(long)]
+        depth: Option<usize>,
     },
 }
 
@@ -679,8 +682,8 @@ fn run() -> ZResult<()> {
             RemoteCmd::Ls { remote } => cli_remote::cmd_remote_ls(&remote),
             RemoteCmd::Push { remote, branch } => cli_remote::cmd_push(&remote, &branch),
             RemoteCmd::Pull { remote, branch, author } => cli_remote::cmd_pull(&remote, &branch, &author),
-            RemoteCmd::Clone { url, dir, token, pin } => {
-                cli_remote::cmd_clone(&url, &dir, token.as_deref(), pin.as_deref())
+            RemoteCmd::Clone { url, dir, token, pin, depth } => {
+                cli_remote::cmd_clone(&url, &dir, token.as_deref(), pin.as_deref(), depth)
             }
         },
         Cmd::Secret { sub } => cli::cmd_secret(sub),

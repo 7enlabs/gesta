@@ -31,6 +31,22 @@ pub struct Bundle {
     /// changeset_files rows.
     pub files: Vec<(String, String, Option<String>, Option<String>)>,
     pub hashes: Vec<String>,
+    /// When set, this bundle is a prefix of the history and the oldest changesets it
+    /// carries have a parent that is deliberately not included.
+    ///
+    /// A shallow bundle is not a damaged one, and a receiver has to record that
+    /// boundary or every later check reports a missing parent. The value is the
+    /// changeset whose parent was cut off.
+    pub shallow_root: Option<String>,
+    /// The full tree at the head, as `(path, hash)`.
+    ///
+    /// A shallow bundle cannot rely on the changeset chain to describe the working
+    /// tree: cutting the chain removes the changesets that created the older files,
+    /// and a tree rebuilt by walking what remains came back with 5 files out of 200.
+    /// Sending the head tree explicitly makes a shallow clone complete.
+    ///
+    /// Empty for a normal bundle, where the chain already says everything.
+    pub snapshot: Vec<(String, String)>,
     /// Objects sent as a delta against another object in the same bundle.
     ///
     /// Sending every version whole made a bundle eight times the size of the content
@@ -64,6 +80,9 @@ impl Bundle {
         s.push_str("gesta-bundle 1\n");
         s.push_str(&format!("branch\t{}\n", self.branch));
         s.push_str(&format!("head\t{}\n", self.head.clone().unwrap_or_else(|| "-".into())));
+        if let Some(root) = &self.shallow_root {
+            s.push_str(&format!("shallow\t{}\n", root));
+        }
         for c in &self.changesets {
             s.push_str(&format!(
                 "cs\t{}\t{}\t{}\t{}\t{}\t{}\n",
@@ -86,6 +105,9 @@ impl Bundle {
                 old.clone().unwrap_or_else(|| "-".into()),
                 new.clone().unwrap_or_else(|| "-".into())
             ));
+        }
+        for (path, hash) in &self.snapshot {
+            s.push_str(&format!("sn\t{}\t{}\n", enc(path), hash));
         }
         for (hash, content) in &self.objects {
             s.push_str(&format!("ob\t{}\t{}\n", hash, enc_base64(content.as_bytes())));
@@ -123,6 +145,8 @@ impl Bundle {
             versions: Vec::new(),
             files: Vec::new(),
             hashes: Vec::new(),
+            shallow_root: None,
+            snapshot: Vec::new(),
             deltas: Vec::new(),
         };
 
@@ -131,6 +155,7 @@ impl Bundle {
             match f.as_slice() {
                 ["branch", name] => b.branch = name.to_string(),
                 ["head", h] => b.head = if *h == "-" { None } else { Some(h.to_string()) },
+                ["shallow", root] => b.shallow_root = Some(root.to_string()),
                 ["cs", id, ts, author, message, p1, p2] => b.changesets.push(ChangesetRow {
                     id: id.to_string(),
                     message: dec_str(message),
@@ -152,6 +177,7 @@ impl Bundle {
                     if *old == "-" { None } else { Some(old.to_string()) },
                     if *new == "-" { None } else { Some(new.to_string()) },
                 )),
+                ["sn", path, hash] => b.snapshot.push((dec_str(path), hash.to_string())),
                 ["dl", hash, base, ops] => {
                     let raw = dec_base64(ops)
                         .ok_or_else(|| bad(format!("delta for {} is not valid base64", hash)))?;
@@ -318,6 +344,8 @@ fn stored_delta(
     Ok(Some((base, ops)))
 }
 
+
+
 pub fn build_bundle(conn: &Connection, branch: &str, have: &HashSet<String>) -> ZResult<Bundle> {
     let head = branch_head(conn, branch)?;
     let mut b = Bundle {
@@ -328,6 +356,8 @@ pub fn build_bundle(conn: &Connection, branch: &str, have: &HashSet<String>) -> 
         versions: Vec::new(),
         files: Vec::new(),
         hashes: Vec::new(),
+        shallow_root: None,
+        snapshot: Vec::new(),
         deltas: Vec::new(),
     };
     let Some(head) = head else { return Ok(b) };
@@ -526,6 +556,25 @@ pub fn apply_bundle_opts(conn: &Connection, b: &Bundle, move_branch: bool) -> ZR
         )?;
     }
 
+    // Record where a shallow bundle was cut. Without this every later check reports
+    // the boundary as a missing parent, which is the difference between a deliberate
+    // shallow history and a damaged one.
+    if let Some(root) = &b.shallow_root {
+        tx.execute(
+            "INSERT OR IGNORE INTO shallow_roots(changeset_id, branch, created_at)
+             VALUES(?1, ?2, ?3)",
+            params![root, b.branch, now()],
+        )?;
+    }
+    // The head tree is a reference in its own right. Recording it keeps an integrity
+    // check from treating the objects behind the working tree as garbage.
+    for (path, hash) in &b.snapshot {
+        tx.execute(
+            "INSERT OR REPLACE INTO snapshot_objects(path, hash) VALUES(?1, ?2)",
+            params![path, hash],
+        )?;
+    }
+
     tx.execute(
         "INSERT INTO branches(name, head, created_at, from_branch) VALUES(?1, NULL, ?2, NULL)
          ON CONFLICT(name) DO NOTHING",
@@ -572,10 +621,100 @@ pub fn decode_base64_str(s: &str) -> Option<Vec<u8>> {
     dec_base64(s)
 }
 
+/// Keep only the newest `depth` changesets of an already built bundle.
+///
+/// A bucket holds one object for the whole branch, so a shallow clone cuts what it
+/// received rather than asking for less. Two things have to survive the cut:
+///
+/// The head snapshot, because the changesets that created the older files are exactly
+/// what is being removed, and without it the working tree comes back with 5 files out
+/// of 200.
+///
+/// Every delta base, because a delta whose base is gone cannot be resolved. The set of
+/// wanted objects is grown until it stops growing, since a base can itself be a delta.
+pub fn truncate_bundle(b: &Bundle, depth: usize) -> ZResult<Bundle> {
+    if depth == 0 || b.changesets.len() <= depth {
+        return Ok(b.clone());
+    }
+    let mut out = b.clone();
+    let cut = out.changesets.len() - depth;
+    let root = out.changesets[cut].id.clone();
+    let keep: HashSet<String> = out.changesets[cut..].iter().map(|c| c.id.clone()).collect();
+    out.changesets = out.changesets.split_off(cut);
+    out.versions.retain(|(_, _, _, cs, _)| keep.contains(cs));
+    out.files.retain(|(cs, _, _, _)| keep.contains(cs));
+
+    // Seeds: what the surviving rows name, plus the whole head snapshot.
+    let mut wanted: HashSet<String> = HashSet::new();
+    for (_, _, hash, _, _) in &out.versions {
+        wanted.insert(hash.clone());
+    }
+    for (_, _, _, new) in &out.files {
+        if let Some(h) = new {
+            wanted.insert(h.clone());
+        }
+    }
+    let snap_hashes: HashSet<String> = out.snapshot.iter().map(|(_, h)| h.clone()).collect();
+    wanted.extend(snap_hashes.iter().cloned());
+
+    // Keep only the deltas worth keeping, then walk the bases they depend on. A base can
+    // itself be a delta, so the walk repeats until nothing new is pulled in. Leaving this
+    // out produced a bundle whose delta pointed at an object the cut had removed.
+    out.deltas
+        .retain(|(h, _, _)| wanted.contains(h) || snap_hashes.contains(h));
+    loop {
+        let mut add: Vec<String> = Vec::new();
+        for (h, base, _) in &out.deltas {
+            if wanted.contains(h) {
+                add.push(base.clone());
+            }
+        }
+        let mut grew = false;
+        for a in add {
+            if wanted.insert(a.clone()) {
+                grew = true;
+                // A newly wanted object may exist as a delta; bring it back in.
+                for (h2, _, _) in &b.deltas {
+                    if h2 == &a && !out.deltas.iter().any(|(x, _, _)| x == h2) {
+                        if let Some(d) = b.deltas.iter().find(|(x, _, _)| x == h2) {
+                            out.deltas.push(d.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+
+    out.objects.retain(|(h, _)| wanted.contains(h));
+    out.hashes = wanted.iter().cloned().collect();
+    out.hashes.sort();
+
+    let carried: HashSet<String> = out
+        .objects
+        .iter()
+        .map(|(h, _)| h.clone())
+        .chain(out.deltas.iter().map(|(h, _, _)| h.clone()))
+        .collect();
+    let missing: Vec<&String> = snap_hashes.difference(&carried).collect();
+    if !missing.is_empty() {
+        return Err(bad(format!(
+            "a shallow cut needs {} object(s) the bundle did not carry, so this remote cannot be cloned shallow",
+            missing.len()
+        )));
+    }
+
+    out.shallow_root = Some(root);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::repo::commit_one;
+    use crate::repo::tests::commit_files;
     use crate::store::tests::mem_db;
 
     #[test]
@@ -705,6 +844,8 @@ mod tests {
             versions: Vec::new(),
             files: Vec::new(),
             hashes: Vec::new(),
+            shallow_root: None,
+            snapshot: Vec::new(),
             deltas: Vec::new(),
         };
         b.hashes.push("0".repeat(64));
@@ -902,5 +1043,117 @@ mod tests {
         // The newest version must be readable and correct on the receiving side.
         let newest = crate::store::get_object(&dest, &crate::store::hash_content(&body(9))).unwrap();
         assert_eq!(newest, body(9));
+    }
+    /// A shallow cut has to keep two things alive: the head snapshot, and every object a
+    /// surviving delta needs to be resolved. Losing either makes the clone fail, and the
+    /// first two attempts at this failed on exactly those two points.
+    #[test]
+    fn a_shallow_cut_keeps_the_snapshot_and_every_delta_base() {
+        let conn = mem_db();
+        let body = |n: usize| {
+            let mut s = String::new();
+            for i in 0..4000 {
+                if i % 400 == n % 400 {
+                    s.push_str(&format!("line {} rewritten at version {}\n", i, n));
+                } else {
+                    s.push_str(&format!("line {} stable text that does not change\n", i));
+                }
+            }
+            s
+        };
+        let mut prev_hash: Option<String> = None;
+        for v in 0..12 {
+            let content = body(v);
+            let hash =
+                crate::store::put_object_against(&conn, &content, prev_hash.as_deref()).unwrap();
+            let id = format!("csh{:02}", v);
+            let parent = if v == 0 { None } else { Some(format!("csh{:02}", v - 1)) };
+            conn.execute(
+                "INSERT INTO changesets(id,message,author,created_at,status,parent,branch)
+                 VALUES(?1,?2,'a',?3,'committed',?4,'main')",
+                params![id, format!("v{}", v), v as i64, parent],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_versions(path,version,hash,changeset_id,created_at)
+                 VALUES('f.txt',?1,?2,?3,?4)",
+                params![v as i64, hash, format!("csh{:02}", v), v as i64],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO changeset_files(changeset_id,path,old_hash,new_hash)
+                 VALUES(?1,'f.txt',?2,?3)",
+                params![format!("csh{:02}", v), prev_hash, hash],
+            )
+            .unwrap();
+            prev_hash = Some(hash);
+        }
+        crate::store::set_branch_head(&conn, "main", "csh11").unwrap();
+
+        let full = build_bundle(&conn, "main", &HashSet::new()).unwrap();
+        // A snapshot is what makes a shallow clone able to restore the working tree.
+        let head_tree = crate::repo::tree_at(&conn, "csh11").unwrap();
+        let mut with_snapshot = full.clone();
+        with_snapshot.snapshot = head_tree.clone();
+        let carried: HashSet<String> = with_snapshot
+            .objects
+            .iter()
+            .map(|(h, _)| h.clone())
+            .chain(with_snapshot.deltas.iter().map(|(h, _, _)| h.clone()))
+            .collect();
+        for (path, hash) in &head_tree {
+            if !carried.contains(hash) {
+                let content = crate::store::get_object(&conn, hash).unwrap();
+                with_snapshot.objects.push((hash.to_string(), content));
+                let _ = path;
+            }
+        }
+
+        let cut = truncate_bundle(&with_snapshot, 3).unwrap();
+        assert_eq!(cut.changesets.len(), 3);
+        assert!(cut.shallow_root.is_some(), "the cut has to be recorded");
+        assert_eq!(
+            cut.snapshot.len(),
+            head_tree.len(),
+            "the snapshot must survive the cut"
+        );
+
+        // Every surviving delta must be resolvable: its base is present as a whole
+        // object or as another delta in the same bundle.
+        let present: HashSet<String> = cut
+            .objects
+            .iter()
+            .map(|(h, _)| h.clone())
+            .chain(cut.deltas.iter().map(|(h, _, _)| h.clone()))
+            .collect();
+        for (hash, base, _) in &cut.deltas {
+            assert!(
+                present.contains(base),
+                "delta {} points at base {} which the cut removed",
+                hash,
+                base
+            );
+        }
+        // And it must apply cleanly on a fresh repository.
+        let wire = cut.encode().unwrap();
+        let decoded = Bundle::decode(&wire).unwrap();
+        let dest = mem_db();
+        apply_bundle(&dest, &decoded).unwrap();
+        for (_, hash) in &head_tree {
+            let got = crate::store::get_object(&dest, hash).unwrap();
+            let expect = crate::store::get_object(&conn, hash).unwrap();
+            assert_eq!(got, expect, "an object from the snapshot differs after the cut");
+        }
+    }
+
+    #[test]
+    fn a_depth_larger_than_the_history_changes_nothing() {
+        let conn = mem_db();
+        commit_files(&conn, "a1", "one", &[("a.txt", "alpha\n")]);
+        commit_files(&conn, "a2", "two", &[("a.txt", "beta\n")]);
+        let full = build_bundle(&conn, "main", &HashSet::new()).unwrap();
+        let same = truncate_bundle(&full, 99).unwrap();
+        assert_eq!(same.changesets.len(), full.changesets.len());
+        assert!(same.shallow_root.is_none(), "nothing was cut, so nothing is shallow");
     }
 }

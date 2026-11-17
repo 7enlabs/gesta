@@ -183,12 +183,27 @@ fn push_s3(conn: &Connection, url: &str, branch: &str) -> ZResult<()> {
     //
     // So what the bucket holds decides only whether there is anything to do, never
     // what goes into the upload.
-    let (remote_head, remote_count) = match cfg.get(&key)? {
+    // A bundle without a snapshot cannot serve a shallow clone, so its presence is
+    // part of what makes the remote complete.
+    let (remote_head, remote_count, remote_has_snapshot) = match cfg.get(&key)? {
         Some(bytes) => {
             let b = remote::Bundle::decode(&bytes)?;
-            (b.head, b.changesets.len() as i64)
+            // Complete means the object can serve a shallow clone: it needs a
+            // snapshot and every object that snapshot names. A snapshot whose
+            // objects were never carried is as broken as no snapshot at all.
+            let snap_ok = !b.snapshot.is_empty()
+                && {
+                    let carried: HashSet<&str> = b
+                        .objects
+                        .iter()
+                        .map(|(h, _)| h.as_str())
+                        .chain(b.deltas.iter().map(|(h, _, _)| h.as_str()))
+                        .collect();
+                    b.snapshot.iter().all(|(_, h)| carried.contains(h.as_str()))
+                };
+            (b.head, b.changesets.len() as i64, snap_ok)
         }
-        None => (None, 0),
+        None => (None, 0, false),
     };
     let local_head = branch_head(conn, branch)?;
 
@@ -200,12 +215,36 @@ fn push_s3(conn: &Connection, url: &str, branch: &str) -> ZResult<()> {
         Some(h) => crate::store::ancestors_bfs(conn, h)?.len() as i64 == remote_count,
         None => false,
     };
-    if local_head.is_some() && local_head == remote_head && complete {
+    if local_head.is_some() && local_head == remote_head && complete && remote_has_snapshot {
         println!("nothing to push, the bucket already has this branch");
         return Ok(());
     }
 
-    let bundle = remote::build_bundle(conn, branch, &HashSet::new())?;
+    let mut bundle = remote::build_bundle(conn, branch, &HashSet::new())?;
+    // A bucket serves shallow clones, so the object always carries the head tree.
+    // Without it a shallow clone cannot rebuild the working tree, because the
+    // changesets that created the older files are exactly what a shallow cut removes.
+    if let Some(head) = bundle.head.clone() {
+        bundle.snapshot = repo::tree_at(conn, &head)?;
+        // Every object the head tree names has to travel, even when no changeset in
+        // the bundle mentions it. Those are exactly the objects a shallow cut would
+        // otherwise leave behind.
+        let mut carried: HashSet<String> = bundle
+            .objects
+            .iter()
+            .map(|(h, _)| h.clone())
+            .chain(bundle.deltas.iter().map(|(h, _, _)| h.clone()))
+            .collect();
+        for (path, hash) in &bundle.snapshot {
+            if !carried.contains(hash) {
+                let content = crate::store::get_object(conn, hash)
+                    .map_err(|_| bad(format!("cannot bundle {} for {}", hash, path)))?;
+                bundle.objects.push((hash.clone(), content));
+                bundle.hashes.push(hash.clone());
+                carried.insert(hash.clone());
+            }
+        }
+    }
     let n = bundle.changesets.len();
     let wire = bundle.encode()?;
     cfg.put(&key, &wire)?;
@@ -270,7 +309,13 @@ pub fn cmd_pull(remote_name: &str, branch: &str, author: &str) -> ZResult<()> {
     Ok(())
 }
 
-pub fn cmd_clone(url: &str, dir: &str, token: Option<&str>, pin: Option<&str>) -> ZResult<()> {
+pub fn cmd_clone(
+    url: &str,
+    dir: &str,
+    token: Option<&str>,
+    pin: Option<&str>,
+    depth: Option<usize>,
+) -> ZResult<()> {
     let target = Path::new(dir);
     if crate::repo_dir(target).is_dir() {
         return Err(bad(format!("{} already contains a repository", dir)));
@@ -278,7 +323,7 @@ pub fn cmd_clone(url: &str, dir: &str, token: Option<&str>, pin: Option<&str>) -
     fs::create_dir_all(target)?;
 
     if url.starts_with("s3://") {
-        return clone_s3(url, target, pin);
+        return clone_s3(url, target, pin, depth);
     }
 
     if http::is_http_url(url) {
@@ -312,7 +357,13 @@ pub fn cmd_clone(url: &str, dir: &str, token: Option<&str>, pin: Option<&str>) -
         rusqlite::params![url, pin],
     )?;
 
-    let (written, _removed) = repo::restore_worktree(&conn, target, &branch)?;
+    // A shallow clone restores from the snapshot the bundle carried, because the
+    // chain does not describe the tree any more.
+    let written = if bundle.snapshot.is_empty() {
+        repo::restore_worktree(&conn, target, &branch)?.0
+    } else {
+        restore_from_snapshot(&conn, target, &bundle.snapshot)?
+    };
     println!(
         "cloned {} into {} ({} changeset(s), {} file(s) on disk)",
         url,
@@ -327,7 +378,7 @@ pub fn cmd_clone(url: &str, dir: &str, token: Option<&str>, pin: Option<&str>) -
 ///
 /// A bucket holds one bundle per branch and the name has no wildcard, so a clone
 /// needs a branch. `main` is the default because every repository starts there.
-fn clone_s3(url: &str, target: &Path, pin: Option<&str>) -> ZResult<()> {
+fn clone_s3(url: &str, target: &Path, pin: Option<&str>, depth: Option<usize>) -> ZResult<()> {
     let (cfg, prefix) = crate::s3::S3Config::from_url(url)?;
 
     // Find the branch by asking for the default first, then falling back to the
@@ -341,7 +392,13 @@ fn clone_s3(url: &str, target: &Path, pin: Option<&str>) -> ZResult<()> {
             cfg.bucket, key
         ))
     })?;
-    let bundle = remote::Bundle::decode(&bytes)?;
+    let mut bundle = remote::Bundle::decode(&bytes)?;
+
+    // A shallow clone keeps only the newest part of what the bucket holds. The
+    // cut is recorded in the bundle so the receiver can tell a boundary from damage.
+    if let Some(d) = depth {
+        bundle = remote::truncate_bundle(&bundle, d)?;
+    }
 
     let zf = repo_dir(target);
     fs::create_dir_all(&zf)?;
@@ -360,13 +417,25 @@ fn clone_s3(url: &str, target: &Path, pin: Option<&str>) -> ZResult<()> {
         rusqlite::params![url, pin],
     )?;
 
-    let (written, _removed) = repo::restore_worktree(&conn, target, &branch)?;
+    // A shallow clone restores from the snapshot the bundle carried, because cutting
+    // the chain removed the changesets that created the older files. Walking what
+    // remains produced 5 files out of 200, which is why the snapshot exists.
+    let written = if bundle.snapshot.is_empty() {
+        repo::restore_worktree(&conn, target, &branch)?.0
+    } else {
+        restore_from_snapshot(&conn, target, &bundle.snapshot)?
+    };
     println!(
-        "cloned {} into {} ({} changeset(s), {} file(s) on disk)",
+        "cloned {} into {} ({} changeset(s), {} file(s) on disk{})",
         url,
         target.display(),
         bundle.changesets.len(),
-        written
+        written,
+        if bundle.shallow_root.is_some() {
+            format!(", shallow at {}", bundle.changesets.first().map(|c| c.id.as_str()).unwrap_or("-"))
+        } else {
+            String::new()
+        }
     );
     Ok(())
 }
@@ -413,16 +482,34 @@ pub fn cmd_fsck(prune: bool) -> ZResult<()> {
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
+    // A shallow clone deliberately lacks the parent of its oldest changeset. Those
+    // rows are boundaries, not damage, so they are counted and reported separately
+    // instead of inflating the problem count.
+    let boundaries: std::collections::HashSet<String> = {
+        let mut stmt = conn.prepare("SELECT changeset_id FROM shallow_roots")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<std::collections::HashSet<_>>>()?
+    };
+
     for (id, p1, p2) in &parents {
         for p in [p1, p2].into_iter().flatten() {
             let exists: Option<i64> = conn
                 .query_row("SELECT 1 FROM changesets WHERE id = ?1", rusqlite::params![p], |r| r.get(0))
                 .optional()?;
             if exists.is_none() {
+                if boundaries.contains(id) {
+                    continue;
+                }
                 println!("MISSING parent {} referenced by {}", p, id);
                 problems += 1;
             }
         }
+    }
+    if !boundaries.is_empty() {
+        println!(
+            "shallow: {} changeset(s) sit at a history boundary",
+            boundaries.len()
+        );
     }
 
     // Every branch head must exist.
@@ -492,11 +579,15 @@ pub fn cmd_fsck(prune: bool) -> ZResult<()> {
     }
 
     // Objects nothing references.
+    // An object named by a shallow clone's snapshot is reachable: it is the working
+    // tree. Counting it as an orphan would let `--prune` delete a file that is on disk.
     let orphans: i64 = conn.query_row(
         "SELECT COUNT(*) FROM objects o WHERE NOT EXISTS (
             SELECT 1 FROM changeset_files cf WHERE cf.new_hash = o.hash OR cf.old_hash = o.hash
          ) AND NOT EXISTS (
             SELECT 1 FROM file_versions fv WHERE fv.hash = o.hash
+         ) AND NOT EXISTS (
+            SELECT 1 FROM snapshot_objects so WHERE so.hash = o.hash
          )",
         [],
         |r| r.get(0),
@@ -515,6 +606,8 @@ pub fn cmd_fsck(prune: bool) -> ZResult<()> {
                     SELECT 1 FROM changeset_files cf WHERE cf.new_hash = o.hash OR cf.old_hash = o.hash
                 ) AND NOT EXISTS (
                     SELECT 1 FROM file_versions fv WHERE fv.hash = o.hash
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM snapshot_objects so WHERE so.hash = o.hash
                 ))",
             [],
         )?;
@@ -1090,4 +1183,33 @@ pub fn cmd_remote_ls(remote_name: &str) -> ZResult<()> {
     Err(bad(
         "listing is only supported for s3:// remotes".to_string(),
     ))
+}
+
+/// Write the files named by a snapshot to disk.
+///
+/// Used for a shallow clone, where the changeset chain no longer describes the tree.
+/// Every path is written, and a path already on disk that the snapshot does not name is
+/// left alone rather than deleted: this runs into an empty directory in the normal case,
+/// so a deletion here would only ever be wrong.
+fn restore_from_snapshot(
+    conn: &Connection,
+    root: &Path,
+    snapshot: &[(String, String)],
+) -> ZResult<usize> {
+    let mut written = 0usize;
+    for (path, hash) in snapshot {
+        // The same guard the remote write path uses: a path from a bundle is not
+        // trusted, and `..` in one would write outside the repository.
+        if path.split(['/', '\\']).any(|seg| seg == "..") {
+            return Err(bad(format!("unsafe path in a bundle snapshot: {}", path)));
+        }
+        let content = crate::store::get_object(conn, hash)?;
+        let target = root.join(path);
+        if let Some(dir) = target.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        fs::write(&target, content)?;
+        written += 1;
+    }
+    Ok(written)
 }

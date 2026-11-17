@@ -260,12 +260,42 @@ def main():
                                 capture_output=True, text=True, env=e)
             listed = "main" in ls.stdout
 
+            # A shallow clone must restore the whole working tree even though it carries
+            # only the newest changesets. Cutting the chain removes the changesets that
+            # created the older files, so the head snapshot has to travel with it.
+            shallow = tempfile.mkdtemp()
+            sc = subprocess.run([ZF, "remote", "clone", "s3://bkt/repo", shallow,
+                                 "--depth", "1"], cwd=shallow, capture_output=True,
+                                text=True, env=e)
+            s_a = os.path.join(shallow, "a.txt")
+            s_b = os.path.join(shallow, "b.txt")
+            shallow_ok = (
+                sc.returncode == 0
+                and os.path.exists(s_a)
+                and os.path.exists(s_b)
+                and open(s_a).read() == "hello\n"
+                and open(s_b).read() == "second\n"
+            )
+            s_hist = subprocess.run([ZF, "log", "--limit", "50"], cwd=shallow,
+                                    capture_output=True, text=True, env=e).stdout
+            shallow_n = s_hist.count("changeset ")
+            # And its integrity check must accept the boundary instead of calling it damage.
+            s_fsck = subprocess.run([ZF, "fsck"], cwd=shallow, capture_output=True,
+                                    text=True, env=e)
+            shallow_ok = shallow_ok and shallow_n == 1 and s_fsck.returncode == 0
+            # Pruning must never delete an object the working tree needs.
+            subprocess.run([ZF, "fsck", "--prune"], cwd=shallow, capture_output=True,
+                           text=True, env=e)
+            shallow_ok = shallow_ok and os.path.exists(s_a) and open(s_a).read() == "hello\n"
+
+
             record(
-                "s3 push, idempotent push and clone",
-                listed and
+                "s3 push, idempotent push, shallow clone and listing",
+                listed and shallow_ok and
                 pushed and no_reupload and got == "hello\n" and got2 == "second\n" and n_cs == 2,
                 f"pushed={pushed} no_reupload={no_reupload} a={got!r} b={got2!r} "
-                f"changesets={n_cs} listed={listed} push3={push3.stdout.strip()[:60]} "
+                f"changesets={n_cs} listed={listed} shallow={shallow_ok} "
+                f"(files={os.path.exists(s_a)},{os.path.exists(s_b)} cs={shallow_n}) "
                 f"clone={clone.stdout.strip()[:100]}{clone.stderr.strip()[:140]}",
             )
         finally:
