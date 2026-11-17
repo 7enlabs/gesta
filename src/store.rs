@@ -546,6 +546,21 @@ pub fn merge_base(conn: &Connection, a: &str, b: &str) -> ZResult<Option<String>
     Ok(best.map(|(id, _)| id))
 }
 
+/// Build the `IN (?, ?, ...)` placeholder list for `n` bound values.
+///
+/// The only reason any query in this program is assembled with `format!` is that
+/// SQLite has no placeholder for "a list". Nothing from a caller is ever
+/// interpolated: this returns question marks and nothing else, and every value
+/// travels through `params!`. Keeping it in one function means an audit has one
+/// place to look instead of a regex over the whole crate.
+pub fn in_placeholders(n: usize) -> String {
+    if n == 0 {
+        // `IN ()` is a syntax error, so an empty list must match nothing.
+        return "NULL".to_string();
+    }
+    vec!["?"; n].join(",")
+}
+
 /// Resolve a revision name to a changeset id.
 ///
 /// A person writes `main:file.txt`, an agent sends `{"rev":"main"}`, and both
@@ -584,7 +599,7 @@ pub fn hash_at_point(conn: &Connection, path: &str, changeset: &str) -> ZResult<
     if reachable.is_empty() {
         return Ok(None);
     }
-    let placeholders = vec!["?"; reachable.len()].join(",");
+    let placeholders = in_placeholders(reachable.len());
     let sql = format!(
         "SELECT cf.new_hash FROM changeset_files cf
          JOIN changesets cs ON cs.id = cf.changeset_id
@@ -952,5 +967,51 @@ pub(crate) mod tests {
     fn resolve_rev_reports_an_unknown_name() {
         let conn = mem_db();
         assert_eq!(resolve_rev(&conn, "nowhere").unwrap(), None);
+    }
+
+    #[test]
+    fn placeholders_are_question_marks_only() {
+        assert_eq!(in_placeholders(1), "?");
+        assert_eq!(in_placeholders(3), "?,?,?");
+        // No value can be hidden in this string, which is the point: it is the
+        // only place SQL is assembled.
+        assert!(!in_placeholders(5).contains('\''));
+        assert!(!in_placeholders(5).contains("--"));
+        assert!(!in_placeholders(5).contains(';'));
+    }
+
+    #[test]
+    fn an_empty_list_matches_nothing_rather_than_failing() {
+        // `IN ()` is a syntax error in SQLite, so an empty reachable set has to
+        // become NULL and match nothing.
+        assert_eq!(in_placeholders(0), "NULL");
+    }
+
+    #[test]
+    fn a_query_built_with_the_helper_runs() {
+        let conn = mem_db();
+        let h = put_object(&conn, "x\n").unwrap();
+        conn.execute(
+            "INSERT INTO changesets(id,message,author,created_at,status,parent,branch)
+             VALUES('cs1','m','a',1,'committed',NULL,'main')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO changeset_files(changeset_id,path,old_hash,new_hash)
+             VALUES('cs1','p.txt',NULL,?1)",
+            params![h],
+        )
+        .unwrap();
+
+        let ids = ["cs1".to_string()];
+        let sql = format!(
+            "SELECT COUNT(*) FROM changeset_files WHERE changeset_id IN ({})",
+            in_placeholders(ids.len())
+        );
+        let n: i64 = conn
+            .query_row(&sql, params![ids[0]], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
     }
 }

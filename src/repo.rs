@@ -785,7 +785,7 @@ pub fn tree_at(conn: &Connection, changeset: &str) -> ZResult<Vec<(String, Strin
     if reachable.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = vec!["?"; reachable.len()].join(",");
+    let placeholders = crate::store::in_placeholders(reachable.len());
     let sql = format!(
         "SELECT path, new_hash FROM (
             SELECT cf.path AS path, cf.new_hash AS new_hash,
