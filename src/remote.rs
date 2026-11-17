@@ -194,7 +194,7 @@ fn enc_base64(bytes: &[u8]) -> String {
     out
 }
 
-fn dec_base64(s: &str) -> Option<Vec<u8>> {
+pub fn dec_base64(s: &str) -> Option<Vec<u8>> {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut lut = [255u8; 256];
     for (i, c) in T.iter().enumerate() {
@@ -413,6 +413,11 @@ pub fn init_bare(path: &Path, branch: &str) -> ZResult<()> {
         params![branch, now()],
     )?;
     Ok(())
+}
+
+/// Public base64 decode, used by HTTP Basic auth parsing.
+pub fn decode_base64_str(s: &str) -> Option<Vec<u8>> {
+    dec_base64(s)
 }
 
 #[cfg(test)]

@@ -96,8 +96,9 @@ pub fn init_schema(conn: &Connection) -> ZResult<()> {
             created_at INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS remotes (
-            name TEXT PRIMARY KEY,
-            url  TEXT NOT NULL
+            name  TEXT PRIMARY KEY,
+            url   TEXT NOT NULL,
+            token TEXT
         );
         CREATE TABLE IF NOT EXISTS remote_refs (
             remote       TEXT NOT NULL,

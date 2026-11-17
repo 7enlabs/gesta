@@ -6,6 +6,7 @@ use std::path::Path;
 
 use rusqlite::OptionalExtension;
 
+use crate::auth;
 use crate::http;
 use crate::ops;
 use crate::remote;
@@ -19,14 +20,18 @@ use crate::{bad, now, open_repo, ZResult, ZF_DIR};
 
 // remotes.
 
-pub fn cmd_remote_add(name: &str, url: &str) -> ZResult<()> {
+pub fn cmd_remote_add(name: &str, url: &str, token: Option<&str>) -> ZResult<()> {
     let (_root, conn) = open_repo()?;
     conn.execute(
-        "INSERT INTO remotes(name, url) VALUES(?1, ?2)
-         ON CONFLICT(name) DO UPDATE SET url = excluded.url",
-        rusqlite::params![name, url],
+        "INSERT INTO remotes(name, url, token) VALUES(?1, ?2, ?3)
+         ON CONFLICT(name) DO UPDATE SET url = excluded.url,
+                                         token = COALESCE(excluded.token, remotes.token)",
+        rusqlite::params![name, url, token],
     )?;
     println!("remote {} -> {}", name, url);
+    if token.is_some() {
+        println!("token stored in the repository database");
+    }
     Ok(())
 }
 
@@ -52,6 +57,17 @@ fn remote_url(conn: &rusqlite::Connection, name: &str) -> ZResult<String> {
     })
     .optional()?
     .ok_or_else(|| bad(format!("no such remote: {}", name)))
+}
+
+/// Token saved for this remote, if any. Kept in the repository database so a
+/// later push does not need the secret retyped.
+fn remote_token(conn: &rusqlite::Connection, name: &str) -> ZResult<Option<String>> {
+    Ok(conn
+        .query_row("SELECT token FROM remotes WHERE name = ?1", rusqlite::params![name], |r| {
+            r.get::<_, Option<String>>(0)
+        })
+        .optional()?
+        .flatten())
 }
 
 pub fn cmd_push(remote_name: &str, branch: &str) -> ZResult<()> {
@@ -133,7 +149,7 @@ pub fn cmd_pull(remote_name: &str, branch: &str, author: &str) -> ZResult<()> {
     Ok(())
 }
 
-pub fn cmd_clone(url: &str, dir: &str) -> ZResult<()> {
+pub fn cmd_clone(url: &str, dir: &str, token: Option<&str>) -> ZResult<()> {
     let target = Path::new(dir);
     if target.join(ZF_DIR).is_dir() {
         return Err(bad(format!("{} already contains a zenforge repository", dir)));
@@ -141,7 +157,7 @@ pub fn cmd_clone(url: &str, dir: &str) -> ZResult<()> {
     fs::create_dir_all(target)?;
 
     if http::is_http_url(url) {
-        return clone_http(url, target);
+        return clone_http(url, target, token);
     }
 
     let remote_path = remote::resolve_remote(url);
@@ -422,10 +438,20 @@ fn push_http(
     branch: &str,
 ) -> ZResult<()> {
     let base = url.trim_end_matches('/');
+    let token = remote_token(conn, remote_name)?;
 
     // What does the remote already have? Asking first keeps the upload small;
     // the server also refuses a bundle that would move its branch backwards.
-    let (status, body) = http::request("GET", &format!("{}/v1/branches", base), None)?;
+    let (status, body) =
+        http::request_with_token("GET", &format!("{}/v1/branches", base), None, token.as_deref())?;
+    if status == 401 || status == 403 {
+        return Err(bad(format!(
+            "remote {} rejected the token ({}): {}",
+            remote_name,
+            status,
+            String::from_utf8_lossy(&body).trim()
+        )));
+    }
     if status != 200 {
         return Err(bad(format!(
             "remote {} answered {}: {}",
@@ -457,7 +483,7 @@ fn push_http(
     let changeset_count = bundle.changesets.len();
 
     let target = format!("{}/v1/bundle?branch={}", base, branch);
-    let (status, body) = http::request("POST", &target, Some(&wire))?;
+    let (status, body) = http::request_with_token("POST", &target, Some(&wire), token.as_deref())?;
     if status != 200 {
         return Err(bad(format!(
             "push rejected by {} ({}): {}",
@@ -495,6 +521,7 @@ fn pull_http(
     author: &str,
 ) -> ZResult<()> {
     let base = url.trim_end_matches('/');
+    let token = remote_token(conn, remote_name)?;
     let have: Vec<String> = ancestors(
         conn,
         &branch_head(conn, branch)?.unwrap_or_else(|| "none".into()),
@@ -503,7 +530,7 @@ fn pull_http(
     let have: Vec<String> = if have == vec!["none".to_string()] { Vec::new() } else { have };
 
     let target = http::bundle_url(base, branch, &have);
-    let (status, body) = http::request("GET", &target, None)?;
+    let (status, body) = http::request_with_token("GET", &target, None, token.as_deref())?;
     if status != 200 {
         return Err(bad(format!(
             "cannot fetch branch {} from {} ({}): {}",
@@ -534,10 +561,11 @@ fn pull_http(
 }
 
 /// Clone over HTTP: ask for the branch list, fetch the first branch.
-fn clone_http(url: &str, target: &Path) -> ZResult<()> {
+fn clone_http(url: &str, target: &Path, token: Option<&str>) -> ZResult<()> {
     let base = url.trim_end_matches('/');
 
-    let (status, body) = http::request("GET", &format!("{}/v1/branches", base), None)?;
+    let (status, body) =
+        http::request_with_token("GET", &format!("{}/v1/branches", base), None, token)?;
     if status != 200 {
         return Err(bad(format!(
             "cannot list branches at {} ({}): {}",
@@ -552,7 +580,8 @@ fn clone_http(url: &str, target: &Path) -> ZResult<()> {
         .find_map(|l| l.split('\t').next().filter(|s| !s.is_empty()).map(|s| s.to_string()))
         .ok_or_else(|| bad(format!("{} has no branches", base)))?;
 
-    let (status, body) = http::request("GET", &http::bundle_url(base, &branch, &[]), None)?;
+    let (status, body) =
+        http::request_with_token("GET", &http::bundle_url(base, &branch, &[]), None, token)?;
     if status != 200 {
         return Err(bad(format!(
             "cannot fetch {} from {} ({}): {}",
@@ -571,9 +600,9 @@ fn clone_http(url: &str, target: &Path) -> ZResult<()> {
     remote::apply_bundle(&conn, &bundle)?;
     set_state(&conn, "current_branch", &branch)?;
     conn.execute(
-        "INSERT INTO remotes(name, url) VALUES('origin', ?1)
-         ON CONFLICT(name) DO UPDATE SET url = excluded.url",
-        rusqlite::params![url],
+        "INSERT INTO remotes(name, url, token) VALUES('origin', ?1, ?2)
+         ON CONFLICT(name) DO UPDATE SET url = excluded.url, token = excluded.token",
+        rusqlite::params![url, token],
     )?;
     let (written, _removed) = repo::restore_worktree(&conn, target, &branch)?;
     println!(
@@ -588,7 +617,97 @@ fn clone_http(url: &str, target: &Path) -> ZResult<()> {
 }
 
 /// Serve this repository over HTTP.
+///
+/// Tokens come from `.zenforge/auth`, one `token:role:name` per line. Without
+/// that file the server only binds to loopback, so an open port with no
+/// password is never the accidental default.
 pub fn cmd_serve(bind: &str, port: u16) -> ZResult<()> {
     let (root, _conn) = open_repo()?;
-    http::serve(root, bind.to_string(), port)
+    let auth = auth::Auth::from_entries(&read_auth_file(&root)?);
+    http::serve(root, bind.to_string(), port, auth)
+}
+
+fn read_auth_file(root: &Path) -> ZResult<Vec<String>> {
+    let path = root.join(ZF_DIR).join("auth");
+    match fs::read_to_string(&path) {
+        Ok(text) => Ok(text.lines().map(|l| l.to_string()).collect()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(bad(format!("cannot read {}: {}", path.display(), e))),
+    }
+}
+
+/// Add a token to `.zenforge/auth`. The token is generated, never typed by the
+/// user, and printed once.
+pub fn cmd_token_add(role: &str, name: &str, hashed: bool) -> ZResult<()> {
+    let (root, _conn) = open_repo()?;
+    let role = match role.to_ascii_lowercase().as_str() {
+        "write" => "write",
+        "read" => "read",
+        other => return Err(bad(format!("unknown role {:?}: use read or write", other))),
+    };
+    if name.trim().is_empty() || name.contains(':') {
+        return Err(bad("token name must be non-empty and must not contain ':'"));
+    }
+    let token = auth::generate_token(32)?;
+    let path = root.join(ZF_DIR).join("auth");
+    let mut existing = read_auth_file(&root)?;
+
+    // `--hashed` writes only the digest: the file then cannot be replayed as a
+    // credential if it leaks, at the cost of not being able to read the token
+    // back from disk.
+    let entry = if hashed {
+        format!("sha256:{}:{}:{}", auth::digest(&token), role, name.trim())
+    } else {
+        format!("{}:{}:{}", token, role, name.trim())
+    };
+    existing.push(entry);
+    fs::write(&path, existing.join("\n") + "\n")?;
+
+    println!("created {} token for {:?}", role, name.trim());
+    println!("{}", token);
+    if hashed {
+        println!("\nStored as a SHA-256 digest: this token cannot be recovered from the file.");
+    } else {
+        println!("\nStored in clear in .zenforge/auth, which is never tracked by zenforge.");
+    }
+    println!("Give it to the client once. `token list` shows only the last four characters.");
+    Ok(())
+}
+
+/// List configured tokens without revealing them.
+pub fn cmd_token_list() -> ZResult<()> {
+    let (root, _conn) = open_repo()?;
+    let entries = read_auth_file(&root)?;
+    let mut shown = 0;
+    for line in entries {
+        let l = line.trim();
+        if l.is_empty() || l.starts_with('#') {
+            continue;
+        }
+        let (role, name, id) = if let Some(rest) = l.strip_prefix("sha256:") {
+            let mut parts = rest.splitn(3, ':');
+            let digest = parts.next().unwrap_or("");
+            (
+                parts.next().unwrap_or("read").to_string(),
+                parts.next().unwrap_or("unnamed").to_string(),
+                digest.to_string(),
+            )
+        } else {
+            let mut parts = l.splitn(3, ':');
+            let token = parts.next().unwrap_or("").to_string();
+            (
+                parts.next().unwrap_or("read").to_string(),
+                parts.next().unwrap_or("unnamed").to_string(),
+                token,
+            )
+        };
+        let tail: String = id.chars().rev().take(4).collect::<String>().chars().rev().collect();
+        let kind = if l.starts_with("sha256:") { "hashed" } else { "clear" };
+        println!("{:<10} {:<18} {:<7} ...{}", role, name, kind, tail);
+        shown += 1;
+    }
+    if shown == 0 {
+        println!("no tokens configured; the server only binds to loopback");
+    }
+    Ok(())
 }

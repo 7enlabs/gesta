@@ -3,6 +3,7 @@
 //! Server-side changesets, content-addressed compressed objects, derived blame
 //! and history, three-way merge, remote sync, and an operation log for undo.
 
+mod auth;
 mod cli;
 mod cli_remote;
 mod http;
@@ -215,8 +216,19 @@ enum BranchCmd {
 
 #[derive(Subcommand)]
 enum RemoteCmd {
-    Add { name: String, url: String },
+    Add {
+        name: String,
+        url: String,
+        /// Token the server requires, stored with the remote.
+        #[arg(long)]
+        token: Option<String>,
+    },
     List,
+    /// Manage access tokens for serving over HTTP
+    Token {
+        #[command(subcommand)]
+        sub: TokenCmd,
+    },
     /// Send this repository's branch to a remote
     Push {
         #[arg(default_value = "origin")]
@@ -234,7 +246,29 @@ enum RemoteCmd {
         author: String,
     },
     /// Copy a remote repository into a new directory
-    Clone { url: String, dir: String },
+    Clone {
+        url: String,
+        dir: String,
+        #[arg(long)]
+        token: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum TokenCmd {
+    /// Generate a token and write it to .zenforge/auth
+    Add {
+        /// read or write
+        #[arg(default_value = "write")]
+        role: String,
+        /// Label shown in `token list`
+        name: String,
+        /// Store only the digest, so a leaked auth file cannot be replayed
+        #[arg(long)]
+        hashed: bool,
+    },
+    /// List configured tokens without revealing them
+    List,
 }
 
 #[derive(Subcommand)]
@@ -286,11 +320,19 @@ fn run() -> ZResult<()> {
             BranchCmd::Info { name } => cli::cmd_branch_info(&name),
         },
         Cmd::Remote { sub } => match sub {
-            RemoteCmd::Add { name, url } => cli_remote::cmd_remote_add(&name, &url),
+            RemoteCmd::Add { name, url, token } => {
+                cli_remote::cmd_remote_add(&name, &url, token.as_deref())
+            }
             RemoteCmd::List => cli_remote::cmd_remote_list(),
+            RemoteCmd::Token { sub } => match sub {
+                TokenCmd::Add { role, name, hashed } => cli_remote::cmd_token_add(&role, &name, hashed),
+                TokenCmd::List => cli_remote::cmd_token_list(),
+            },
             RemoteCmd::Push { remote, branch } => cli_remote::cmd_push(&remote, &branch),
             RemoteCmd::Pull { remote, branch, author } => cli_remote::cmd_pull(&remote, &branch, &author),
-            RemoteCmd::Clone { url, dir } => cli_remote::cmd_clone(&url, &dir),
+            RemoteCmd::Clone { url, dir, token } => {
+                cli_remote::cmd_clone(&url, &dir, token.as_deref())
+            }
         },
         Cmd::Serve { bind, port } => cli_remote::cmd_serve(&bind, port),
         Cmd::Fsck { prune } => cli_remote::cmd_fsck(prune),

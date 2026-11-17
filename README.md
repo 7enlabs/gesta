@@ -56,6 +56,8 @@ zenforge blame src/main.rs
 | `tag <name> [--list]` | Named pointer to a changeset |
 | `branch create/list/switch/delete/merge/info` | Branch operations |
 | `remote add/list/push/pull/clone` | Remote sync, filesystem path or `http://` |
+| `remote token add <role> <name> [--hashed]` | Generate an access token for serving |
+| `remote token list` | Show configured tokens, last four characters only |
 | `serve [--bind ADDR] [--port N]` | Serve this repository over HTTP |
 | `fsck [--prune]` | Verify integrity, optionally drop orphan objects |
 | `stats` | Object counts and compression ratio |
@@ -114,12 +116,40 @@ Endpoints: `GET /v1/health`, `GET /v1/branches`, `GET /v1/bundle?branch=X&have=.
 
 A push that would move the server's branch to a head not containing its current head gets a 409 and the branch stays where it was. `https://` is refused with an explanation: terminate TLS in a proxy in front of it.
 
+## Access control
+
+The server has two roles. A read token may clone and pull. A write token may also push. `/v1/health` is open so a monitor can check liveness without a credential.
+
+```bash
+# on the serving machine
+zenforge remote token add write alice --hashed
+# prints the token once; only its digest is stored
+
+# on a client
+zenforge remote clone http://server:8787 project --token <token>
+zenforge remote add origin http://server:8787 --token <token>
+```
+
+Tokens live in `.zenforge/auth`, one entry per line, in either form:
+
+```text
+<token>:<role>:<name>              token in clear, hashed when loaded
+sha256:<digest>:<role>:<name>      only the digest on disk
+```
+
+`--hashed` writes the second form. A leaked file then cannot be replayed, because presenting the digest does not authenticate; only its preimage does. A test pins that, and another pins that a malformed digest line never matches anything.
+
+`.zenforge/` is never tracked by ZenForge, so tokens cannot reach a changeset.
+
+With no tokens configured the server refuses to bind to a non-loopback address. `0.0.0.0` without tokens exits with an error instead of serving an open port. A failed authentication waits 200 ms before answering, which blunts online guessing.
+
 ## Verification
 
 ```bash
-cargo test --release              # 69 unit tests
+cargo test --release              # 82 unit tests
 python3 bench/replace_git.py      # 20 end to end capability checks
 python3 bench/http_remote.py      # 11 checks over a real socket
+python3 bench/http_auth.py        # 18 checks on tokens and roles
 python3 bench/size_compare.py     # disk usage against git
 python3 bench/bench.py            # speed baseline
 ```
@@ -131,6 +161,7 @@ What the suites cover, and why each check exists:
 | unit | hashing, compressed object store, id allocation under concurrency, graph reachability across both parents of a merge, merge base, blame by sequence, glob matching, bundle serialisation, HTTP parsing, undo |
 | `replace_git.py` | commit, diff, restore, show, deletion tracking, gitignore, disjoint merge, conflicted merge, branch switch, undo, tag, clone, push, fsck, compression, duplicate line blame, empty commit, binary reporting, large history, 8 concurrent snapshots |
 | `http_remote.py` | server health, branch listing, clone, ignored files, push, landing on disk, refused rewind, pull with merge, second clone, 404 on unknown branch, https refusal |
+| `http_auth.py` | token generation, hashed storage, anonymous refusal, read token cannot push, write token pushes, public bind without tokens refused |
 
 ## Performance
 
@@ -152,7 +183,8 @@ Disk usage, 21 versions of a 42 KB file edited one line at a time: 267 KB agains
 
 ## Limitations
 
-- **No TLS and no authentication.** Plain HTTP. Anyone who can reach the port can push. Put it behind a proxy and a firewall.
+- **No TLS.** Plain HTTP. Put a TLS terminating proxy in front of it before sending credentials over an untrusted network.
+- **Tokens are all or nothing per role.** There is no per-branch or per-path permission, and no expiry.
 - **No SSH transport.**
 - **Small files cost more than git.** 4.32x for a tree of tiny files. Fixing it means packing several objects per row, which is a schema change.
 - **Blame is line-sequence based.** A line moved and edited in the same commit loses its original author.

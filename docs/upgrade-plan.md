@@ -221,7 +221,8 @@ These are inferences, with no measurement or source behind them:
    repository over HTTP and `clone`/`push`/`pull` speak it. Eleven checks in
    `bench/http_remote.py` drive a real socket, including a refused rewind, a
    merge across two clones, and a second clone seeing the pushed history.
-   Still missing on top of it: TLS and authentication.
+   Access control landed in v0.4.0: read and write tokens, hashed storage
+   option, refusal to serve a public address without tokens. Still missing: TLS.
 2. **Small-file overhead.** 4.32x git for a tree of 1000 tiny files. The cause is
    per-row SQLite and index overhead, not content. Fixing it needs packing
    several small objects into one row, which is a schema change.
@@ -301,3 +302,46 @@ Each of these worked locally and broke as soon as two repositories talked:
 A three-machine scenario (server, clone B, clone C, then D cloning late) was run
 by hand: all four ended with the same file content, clean working trees, and the
 full changeset history including the merge commit.
+
+
+## 9. v0.4.0: access control
+
+### What was built
+
+`src/auth.rs` holds a token store and two roles. `remote token add <role> <name>`
+generates 32 random bytes from the OS entropy source and writes the entry to
+`.zenforge/auth`. Without a token file the server refuses to bind anywhere except
+loopback, so an open port is never the accidental default.
+
+### The design choice that mattered
+
+Storing tokens in clear in the auth file is convenient and wrong: whoever reads
+the file gets working credentials. The first version did exactly that, and a test
+proved it by presenting the file's contents and getting a 200.
+
+The file now accepts a second form, `sha256:<digest>:<role>:<name>`, written by
+`--hashed`. Verifying it is the same comparison the clear form already needed,
+since entries are hashed at load either way. The difference is that a leaked file
+contains no usable credential: presenting the digest itself is rejected, and only
+the preimage authenticates. Two tests pin this, one on the happy path and one that
+the digest cannot be used as a token.
+
+### Verification
+
+| Check | Result |
+|---|---|
+| `bench/http_auth.py` over a real socket | 18/18 |
+| `bench/http_remote.py` | 11/11 |
+| `bench/replace_git.py` | 20/20 |
+| Unit tests | 82 |
+| clippy, aislop | clean |
+
+The auth suite covers anonymous refusal, a wrong token, a read token cloning but
+not pushing, a write token pushing and the file landing on disk, a public bind
+without tokens being refused, and a loopback bind without tokens still working.
+
+### Still missing
+
+TLS. Credentials travel in clear over plain HTTP, so the proxy is not optional
+beyond a trusted network. Beyond that: no per-branch permissions, no token
+expiry, no revocation command, and no audit log of who pushed what.

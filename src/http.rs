@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 
+use crate::auth::{is_loopback, Auth, Role};
 use crate::remote::{self, Bundle};
 use crate::store::{ancestors, branch_head, init_schema, open_db};
 use crate::{bad, ZResult};
@@ -33,6 +34,8 @@ pub struct Request {
     pub path: String,
     pub query: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// Raw `Authorization` header value, if the client sent one.
+    pub authorization: Option<String>,
 }
 
 impl Request {
@@ -91,8 +94,23 @@ impl Response {
     }
 }
 
-/// Parsed request line: method, path, query, and bytes of header consumed.
-pub type RequestHead = (String, String, Vec<(String, String)>, usize);
+/// Parsed request line: method, path, query, headers, and bytes consumed.
+pub struct RequestHead {
+    pub method: String,
+    pub path: String,
+    pub query: Vec<(String, String)>,
+    pub headers: Vec<(String, String)>,
+    pub consumed: usize,
+}
+
+impl RequestHead {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
 
 /// Parse the request line and headers from a raw buffer.
 ///
@@ -113,12 +131,19 @@ pub fn parse_head(buf: &[u8]) -> ZResult<RequestHead> {
         return Err(bad("request line too long"));
     }
 
+    let mut headers = Vec::new();
+    for line in lines {
+        if let Some((k, v)) = line.split_once(':') {
+            headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+        }
+    }
+
     let (path, query) = match target.split_once('?') {
         Some((p, q)) => (p.to_string(), parse_query(q)),
         None => (target, Vec::new()),
     };
 
-    Ok((method, path, query, end + 4))
+    Ok(RequestHead { method, path, query, headers, consumed: end + 4 })
 }
 
 pub fn parse_query(q: &str) -> Vec<(String, String)> {
@@ -227,8 +252,13 @@ pub fn is_http_url(url: &str) -> bool {
     url.starts_with("http://") || url.starts_with("https://")
 }
 
-/// Perform one HTTP request and return `(status, body)`.
-pub fn request(method: &str, url: &str, body: Option<&[u8]>) -> ZResult<(u16, Vec<u8>)> {
+/// Perform one HTTP request with an optional bearer token.
+pub fn request_with_token(
+    method: &str,
+    url: &str,
+    body: Option<&[u8]>,
+    token: Option<&str>,
+) -> ZResult<(u16, Vec<u8>)> {
     let u = parse_http_url(url)?;
     let mut stream = TcpStream::connect((u.host.as_str(), u.port))
         .map_err(|e| bad(format!("cannot connect to {}:{}: {}", u.host, u.port, e)))?;
@@ -241,6 +271,9 @@ pub fn request(method: &str, url: &str, body: Option<&[u8]>) -> ZResult<(u16, Ve
         if u.base_path.is_empty() { "/".to_string() } else { u.base_path.clone() },
         u.host
     );
+    if let Some(tok) = token {
+        head.push_str(&format!("Authorization: Bearer {}\r\n", tok));
+    }
     if let Some(b) = body {
         head.push_str(&format!(
             "Content-Type: application/octet-stream\r\nContent-Length: {}\r\n",
@@ -286,34 +319,46 @@ pub fn request(method: &str, url: &str, body: Option<&[u8]>) -> ZResult<(u16, Ve
 }
 
 /// Serve `root` over HTTP until the process is killed.
-pub fn serve(root: PathBuf, bind: String, port: u16) -> ZResult<()> {
+pub fn serve(root: PathBuf, bind: String, port: u16, auth: Auth) -> ZResult<()> {
     let listener = TcpListener::bind((bind.as_str(), port))
         .map_err(|e| bad(format!("cannot bind {}:{}: {}", bind, port, e)))?;
     let local = listener.local_addr()?;
     println!("zenforge listening on http://{}", local);
     println!("repository: {}", root.display());
+    if auth.required {
+        println!("access: {} token(s) configured", auth.token_count());
+    } else if is_loopback(&bind) {
+        println!("access: open, loopback only");
+    } else {
+        return Err(bad(format!(
+            "refusing to serve {} without tokens: add entries to .zenforge/auth, or bind 127.0.0.1",
+            bind
+        )));
+    }
     println!("press Ctrl-C to stop");
 
     // The repository is opened per request: SQLite in WAL mode handles
     // concurrent readers, and a long-lived Connection would need a mutex.
     let root = Arc::new(root);
+    let auth = Arc::new(auth);
     for incoming in listener.incoming() {
         let stream = match incoming {
             Ok(s) => s,
             Err(_) => continue,
         };
         let root = Arc::clone(&root);
+        let auth = Arc::clone(&auth);
         std::thread::spawn(move || {
-            let _ = handle_connection(stream, &root);
+            let _ = handle_connection(stream, &root, &auth);
         });
     }
     Ok(())
 }
 
-fn handle_connection(mut stream: TcpStream, root: &Path) -> ZResult<()> {
+fn handle_connection(mut stream: TcpStream, root: &Path, auth: &Auth) -> ZResult<()> {
     stream.set_read_timeout(Some(Duration::from_secs(60)))?;
     let resp = match read_request(&mut stream) {
-        Ok(req) => route(root, &req),
+        Ok(req) => route(root, &req, auth),
         Err(e) => Response::error(400, "Bad Request", e.to_string()),
     };
     stream.write_all(&resp.to_bytes())?;
@@ -340,7 +385,12 @@ fn read_request(stream: &mut TcpStream) -> ZResult<Request> {
         buf.extend_from_slice(&chunk[..n]);
     };
 
-    let (method, path, query, _consumed) = parse_head(&buf[..head_end])?;
+    let head = parse_head(&buf[..head_end])?;
+    debug_assert_eq!(head.consumed, head_end, "header parser and reader disagree");
+    let authorization = head.header("authorization").map(|s| s.to_string());
+    let method = head.method;
+    let path = head.path;
+    let query = head.query;
 
     let head_text = std::str::from_utf8(&buf[..head_end]).map_err(|_| bad("headers are not UTF-8"))?;
     let want: usize = head_text
@@ -363,13 +413,59 @@ fn read_request(stream: &mut TcpStream) -> ZResult<Request> {
     }
     body.truncate(want);
 
-    Ok(Request { method, path, query, body })
+    Ok(Request { method, path, query, body, authorization })
 }
 
-/// Dispatch one request to a handler. Kept separate from socket code so the
-/// routes can be tested without a network.
-pub fn route(root: &Path, req: &Request) -> Response {
+/// Dispatch one request. Kept separate from socket code so routes and access
+/// control can be tested without a network.
+pub fn route(root: &Path, req: &Request, auth: &Auth) -> Response {
     let path = req.path.trim_end_matches('/');
+
+    // Health is open so a monitor can tell the process is alive without a
+    // credential. Every other route needs one when the server has tokens.
+    let needed = match (req.method.as_str(), path) {
+        ("GET", "/v1/health") => None,
+        (_, p) if p.starts_with("/v1/bundle") && req.method == "POST" => Some(Role::Write),
+        (_, p) if p.starts_with("/v1/") => Some(Role::Read),
+        _ => None,
+    };
+
+    if let Some(needed) = needed {
+        if auth.required {
+            let presented = req
+                .authorization
+                .as_deref()
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .or_else(|| {
+                    req.authorization
+                        .as_deref()
+                        .and_then(|v| v.strip_prefix("Basic "))
+                        .and_then(decode_basic_token)
+                        .map(|s| Box::leak(s.into_boxed_str()) as &str)
+                });
+            match presented.and_then(|p| auth.authenticate(p)) {
+                Some((_, role)) if Auth::allows(role, needed) => {}
+                Some(_) => {
+                    return Response::error(
+                        403,
+                        "Forbidden",
+                        format!("token does not grant {:?} access", needed),
+                    )
+                }
+                None => {
+                    // A short sleep blunts online guessing without needing state
+                    // per client. It costs an attacker 200 ms per attempt.
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    return Response::error(
+                        401,
+                        "Unauthorized",
+                        "missing or invalid token: send Authorization: Bearer <token>",
+                    );
+                }
+            }
+        }
+    }
+
     match (req.method.as_str(), path) {
         ("GET", "/v1/health") => Response::ok_text("ok"),
         ("GET", "/v1/branches") => match list_branches(root) {
@@ -401,6 +497,15 @@ pub fn route(root: &Path, req: &Request) -> Response {
         }
         (m, p) => Response::error(405, "Method Not Allowed", format!("{} {}", m, p)),
     }
+}
+
+/// Decode `Basic base64(user:token)` and return the token part.
+fn decode_basic_token(value: &str) -> Option<String> {
+    use crate::remote::decode_base64_str;
+    let raw = decode_base64_str(value)?;
+    let text = String::from_utf8(raw).ok()?;
+    let (_user, token) = text.split_once(':')?;
+    Some(token.to_string())
 }
 
 fn list_branches(root: &Path) -> ZResult<String> {
@@ -502,13 +607,13 @@ mod tests {
     #[test]
     fn parses_a_request_line_with_query() {
         let raw = b"GET /v1/bundle?branch=dev&have=cs1,cs2 HTTP/1.1\r\nHost: x\r\n\r\n";
-        let (method, path, query, consumed) = parse_head(raw).unwrap();
-        assert_eq!(method, "GET");
-        assert_eq!(path, "/v1/bundle");
-        assert_eq!(query.len(), 2);
-        assert_eq!(query[0], ("branch".to_string(), "dev".to_string()));
-        assert_eq!(query[1], ("have".to_string(), "cs1,cs2".to_string()));
-        assert_eq!(consumed, raw.len());
+        let head = parse_head(raw).unwrap();
+        assert_eq!(head.method, "GET");
+        assert_eq!(head.path, "/v1/bundle");
+        assert_eq!(head.query.len(), 2);
+        assert_eq!(head.query[0], ("branch".to_string(), "dev".to_string()));
+        assert_eq!(head.query[1], ("have".to_string(), "cs1,cs2".to_string()));
+        assert_eq!(head.consumed, raw.len());
     }
 
     #[test]
@@ -547,8 +652,9 @@ mod tests {
             path: "/v1/nope".into(),
             query: vec![],
             body: vec![],
+            authorization: None,
         };
-        let resp = route(Path::new("/tmp/does-not-matter"), &req);
+        let resp = route(Path::new("/tmp/does-not-matter"), &req, &Auth::from_entries(&[]));
         assert_eq!(resp.status, 405);
     }
 
@@ -559,8 +665,9 @@ mod tests {
             path: "/v1/bundle".into(),
             query: vec![],
             body: vec![],
+            authorization: None,
         };
-        let resp = route(Path::new("/tmp/does-not-matter"), &req);
+        let resp = route(Path::new("/tmp/does-not-matter"), &req, &Auth::from_entries(&[]));
         assert_eq!(resp.status, 405);
     }
 
@@ -571,8 +678,9 @@ mod tests {
             path: "/v1/health".into(),
             query: vec![],
             body: vec![],
+            authorization: None,
         };
-        let resp = route(Path::new("/tmp/does-not-matter"), &req);
+        let resp = route(Path::new("/tmp/does-not-matter"), &req, &Auth::from_entries(&[]));
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, b"ok".to_vec());
     }
