@@ -1,5 +1,7 @@
 # ZenForge
 
+[![repo](https://img.shields.io/badge/github-zencli%2Fzenforge-181717?logo=github)](https://github.com/zencli/zenforge)
+
 Source control for AI agents. Server-side changesets, content-addressed objects, derived blame/history. Rust + SQLite, single binary.
 
 ## Why
