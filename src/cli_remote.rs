@@ -173,29 +173,40 @@ fn push_s3(conn: &Connection, url: &str, branch: &str) -> ZResult<()> {
     let (cfg, prefix) = crate::s3::S3Config::from_url(url)?;
     let key = crate::s3::key_for(&prefix, branch);
 
-    // What the bucket already holds decides what goes in the bundle. Without this
-    // every push would upload the whole history again, which is the reason a delta
-    // push is worth having.
-    let have: HashSet<String> = match cfg.get(&key)? {
+    // The object is the whole branch, not a delta onto something else.
+    //
+    // A filesystem or HTTP remote keeps its own database, so a bundle carrying only
+    // the missing changesets lands on top of what is already there. A bucket does
+    // not: the object is the only state, and writing a delta over it deletes the
+    // history underneath. That was a real defect, found by pushing twice and
+    // cloning: the clone had one changeset and was missing a file.
+    //
+    // So what the bucket holds decides only whether there is anything to do, never
+    // what goes into the upload.
+    let (remote_head, remote_count) = match cfg.get(&key)? {
         Some(bytes) => {
             let b = remote::Bundle::decode(&bytes)?;
-            match b.head.as_deref() {
-                Some(h) if b.branch == branch => crate::store::ancestors_bfs(conn, h)?
-                    .into_iter()
-                    .collect(),
-                // A bundle for a different branch says nothing about this one.
-                _ => HashSet::new(),
-            }
+            (b.head, b.changesets.len() as i64)
         }
-        None => HashSet::new(),
+        None => (None, 0),
     };
+    let local_head = branch_head(conn, branch)?;
 
-    let bundle = remote::build_bundle(conn, branch, &have)?;
-    let n = bundle.changesets.len();
-    if n == 0 {
+    // A matching head is not proof the object is complete: an earlier push could
+    // have written a bundle that names this head while carrying only part of the
+    // history. The size check is cheap and turns a silent damaged remote into a
+    // normal upload.
+    let complete = match remote_head.as_deref() {
+        Some(h) => crate::store::ancestors_bfs(conn, h)?.len() as i64 == remote_count,
+        None => false,
+    };
+    if local_head.is_some() && local_head == remote_head && complete {
         println!("nothing to push, the bucket already has this branch");
         return Ok(());
     }
+
+    let bundle = remote::build_bundle(conn, branch, &HashSet::new())?;
+    let n = bundle.changesets.len();
     let wire = bundle.encode()?;
     cfg.put(&key, &wire)?;
     println!(

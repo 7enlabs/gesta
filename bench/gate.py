@@ -224,6 +224,22 @@ def main():
                                    cwd=tmp, capture_output=True, text=True, env=e)
             no_reupload = "nothing to push" in push2.stdout
 
+            # A second commit, then a push. The object on the bucket is the only
+            # state there, so the second push must carry the whole history: an
+            # earlier version wrote only the delta and the clone lost a file.
+            with open(os.path.join(tmp, "b.txt"), "w") as fh:
+                fh.write("second\n")
+            subprocess.run([ZF, "changeset", "create", "two", "--author", "t"],
+                           cwd=tmp, capture_output=True, env=e)
+            out = subprocess.run([ZF, "changeset", "list", "--json"], cwd=tmp,
+                                 capture_output=True, text=True, env=e).stdout
+            cid2 = re.findall(r"(cs[0-9a-f]+)", out)
+            if cid2:
+                subprocess.run([ZF, "changeset", "commit", cid2[-1]],
+                               cwd=tmp, capture_output=True, env=e)
+            push3 = subprocess.run([ZF, "remote", "push", "origin", "--branch", "main"],
+                                   cwd=tmp, capture_output=True, text=True, env=e)
+
             dest = tempfile.mkdtemp()
             clone = subprocess.run([ZF, "remote", "clone", "s3://bkt/repo", dest],
                                    cwd=dest, capture_output=True, text=True, env=e)
@@ -231,11 +247,19 @@ def main():
             fp = os.path.join(dest, "a.txt")
             if os.path.exists(fp):
                 got = open(fp).read()
+            got2 = None
+            fp2 = os.path.join(dest, "b.txt")
+            if os.path.exists(fp2):
+                got2 = open(fp2).read()
+            hist = subprocess.run([ZF, "log"], cwd=dest, capture_output=True,
+                                  text=True, env=e).stdout
+            n_cs = hist.count("changeset ")
             record(
                 "s3 push, idempotent push and clone",
-                pushed and no_reupload and got == "hello\n",
-                f"pushed={pushed} no_reupload={no_reupload} file={got!r} "
-                f"clone={clone.stdout.strip()[:120]}{clone.stderr.strip()[:160]}",
+                pushed and no_reupload and got == "hello\n" and got2 == "second\n" and n_cs == 2,
+                f"pushed={pushed} no_reupload={no_reupload} a={got!r} b={got2!r} "
+                f"changesets={n_cs} push3={push3.stdout.strip()[:80]} "
+                f"clone={clone.stdout.strip()[:100]}{clone.stderr.strip()[:140]}",
             )
         finally:
             srv.terminate()

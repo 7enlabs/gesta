@@ -53,11 +53,27 @@ impl S3Config {
                     .to_string(),
             ));
         }
-        let access_key = env("GESTA_S3_ACCESS_KEY");
-        let secret_key = env("GESTA_S3_SECRET_KEY");
+        // Credentials come from the environment first, then from the encrypted
+        // store. The order matters: an environment variable is what a test or a
+        // one-off job sets, and the store is what a person sets once and forgets.
+        let mut access_key = env("GESTA_S3_ACCESS_KEY");
+        let mut secret_key = env("GESTA_S3_SECRET_KEY");
+        if access_key.is_empty() || secret_key.is_empty() {
+            if let Ok(store) = crate::secrets::SecretStore::from_env() {
+                if let Ok(entries) = store.load() {
+                    if access_key.is_empty() {
+                        access_key = entries.get("s3.access_key").cloned().unwrap_or_default();
+                    }
+                    if secret_key.is_empty() {
+                        secret_key = entries.get("s3.secret_key").cloned().unwrap_or_default();
+                    }
+                }
+            }
+        }
         if access_key.is_empty() || secret_key.is_empty() {
             return Err(bad(
-                "set GESTA_S3_ACCESS_KEY and GESTA_S3_SECRET_KEY".to_string(),
+                "no credentials: run `gesta secret set s3.access_key` and `gesta secret set s3.secret_key`, or set GESTA_S3_ACCESS_KEY and GESTA_S3_SECRET_KEY"
+                    .to_string(),
             ));
         }
         let region = {

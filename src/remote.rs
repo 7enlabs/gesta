@@ -14,7 +14,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
 
-use crate::store::{branch_head, get_object, hash_content, put_object, ancestors, open_db, init_schema};
+use crate::store::{branch_head, get_object, hash_content, put_object, open_db, init_schema};
 use crate::{bad, now, repo_dir, ZResult};
 
 /// Everything a peer needs to catch up on one branch.
@@ -229,6 +229,43 @@ pub fn dec_base64(s: &str) -> Option<Vec<u8>> {
 
 /// Collect everything needed to bring a peer up to date on `branch`, given the
 /// set of changeset ids the peer already has.
+/// Order the wanted changesets so every parent comes before its children.
+///
+/// Depth first over the parent links, emitting a node after its parents. The
+/// visited set also breaks any cycle, which a corrupted database could contain and
+/// which must not hang an upload.
+fn topo_order(
+    conn: &Connection,
+    head: &str,
+    wanted: &HashSet<String>,
+) -> ZResult<Vec<String>> {
+    fn visit(
+        conn: &Connection,
+        id: &str,
+        wanted: &HashSet<String>,
+        done: &mut HashSet<String>,
+        out: &mut Vec<String>,
+    ) -> ZResult<()> {
+        if done.contains(id) {
+            return Ok(());
+        }
+        done.insert(id.to_string());
+        let (p1, p2) = crate::store::parents_of_public(conn, id)?;
+        for p in [p1, p2].into_iter().flatten() {
+            visit(conn, &p, wanted, done, out)?;
+        }
+        if wanted.contains(id) {
+            out.push(id.to_string());
+        }
+        Ok(())
+    }
+
+    let mut done = HashSet::new();
+    let mut out = Vec::new();
+    visit(conn, head, wanted, &mut done, &mut out)?;
+    Ok(out)
+}
+
 pub fn build_bundle(conn: &Connection, branch: &str, have: &HashSet<String>) -> ZResult<Bundle> {
     let head = branch_head(conn, branch)?;
     let mut b = Bundle {
@@ -242,10 +279,17 @@ pub fn build_bundle(conn: &Connection, branch: &str, have: &HashSet<String>) -> 
     };
     let Some(head) = head else { return Ok(b) };
 
-    let chain = ancestors(conn, &head)?;
-    let mut needed: Vec<String> = chain.into_iter().filter(|id| !have.contains(id)).collect();
-    // Oldest first so a receiver can apply them in order.
-    needed.reverse();
+    let chain = crate::store::ancestors_bfs(conn, &head)?;
+    let wanted: HashSet<String> = chain
+        .iter()
+        .filter(|id| !have.contains(*id))
+        .cloned()
+        .collect();
+    // Oldest first, and a parent before any child. Reversing a breadth-first walk
+    // is close but not sufficient: across a merge the two sides sit at different
+    // depths, so a reversed walk can put a child before its own parent. A receiver
+    // that applies rows in order would then fail on a parent it has not seen.
+    let needed = topo_order(conn, &head, &wanted)?;
 
     let mut object_hashes: HashSet<String> = HashSet::new();
     for id in &needed {
@@ -425,6 +469,7 @@ pub fn decode_base64_str(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repo::commit_one;
     use crate::store::tests::mem_db;
 
     #[test]
@@ -588,5 +633,82 @@ mod tests {
         assert_eq!(b.changesets.len(), 1, "peer already has cs1");
         assert_eq!(b.changesets[0].id, "cs2");
         assert!(!b.objects.iter().any(|(h, _)| h == &h1), "cs1 content not resent");
+    }
+    /// A bundle must carry every changeset reachable from the head, in an order a
+    /// receiver can apply. A depth-first walk happens to work for two commits and
+    /// starts dropping them for longer histories, so the depth is the point of this
+    /// test rather than an afterthought.
+    #[test]
+    fn a_bundle_carries_the_whole_chain_for_a_long_history() {
+        let conn = mem_db();
+        let mut parent: Option<String> = None;
+        let mut ids = Vec::new();
+        for i in 0..12 {
+            let id = format!("cs{:02}", i);
+            conn.execute(
+                "INSERT INTO changesets(id,message,author,created_at,status,parent,branch)
+                 VALUES(?1,?2,'a',?3,'pending',?4,'main')",
+                params![id, format!("m{}", i), i as i64, parent],
+            )
+            .unwrap();
+            commit_one(&conn, &id).unwrap();
+            parent = Some(id.clone());
+            ids.push(id);
+        }
+
+        let b = build_bundle(&conn, "main", &HashSet::new()).unwrap();
+        assert_eq!(
+            b.changesets.len(),
+            12,
+            "the bundle dropped changesets, it carried {}",
+            b.changesets.len()
+        );
+        // Oldest first, so the receiver applies a parent before its child.
+        assert_eq!(b.changesets.first().map(|c| c.id.clone()), Some(ids[0].clone()));
+        assert_eq!(b.changesets.last().map(|c| c.id.clone()), Some(ids[11].clone()));
+        assert_eq!(b.head.as_deref(), Some(ids[11].as_str()));
+    }
+    /// Across a merge, a parent can sit deeper than a child on the other side, so
+    /// reversing a breadth-first walk can emit a child before its own parent. A
+    /// receiver applying rows in that order fails on a parent it has not seen.
+    #[test]
+    fn the_order_puts_every_parent_before_its_child_across_a_merge() {
+        // A merge row in the shape the store uses: two parents. Building it
+        // directly keeps this about ordering and nothing else.
+        let conn = mem_db();
+        for (id, p1, p2, ts) in [
+            ("base", None, None, 1i64),
+            ("left", Some("base"), None, 2),
+            ("right", Some("base"), None, 3),
+            ("merge", Some("left"), Some("right"), 4),
+        ] {
+            conn.execute(
+                "INSERT INTO changesets(id,message,author,created_at,status,parent,parent2,branch)
+                 VALUES(?1,?2,'a',?3,'committed',?4,?5,'main')",
+                rusqlite::params![id, format!("m-{}", id), ts, p1, p2],
+            )
+            .unwrap();
+        }
+
+        let reachable = crate::store::ancestors_bfs(&conn, "merge").unwrap();
+        assert_eq!(reachable.len(), 4, "expected four changesets, got {:?}", reachable);
+        let wanted: HashSet<String> = reachable.into_iter().collect();
+        let order = topo_order(&conn, "merge", &wanted).unwrap();
+
+        let mut pos = std::collections::HashMap::new();
+        for (i, id) in order.iter().enumerate() {
+            pos.insert(id.clone(), i);
+        }
+        assert_eq!(order.len(), 4, "every reachable changeset must be listed, got {:?}", order);
+        for (i, id) in order.iter().enumerate() {
+            let (p1, p2) = crate::store::parents_of_public(&conn, id).unwrap();
+            for p in [p1, p2].into_iter().flatten() {
+                if let Some(pi) = pos.get(&p) {
+                    assert!(*pi < i, "parent {} of {} came after it in {:?}", p, id, order);
+                }
+            }
+        }
+        // The merge is last: it depends on both sides.
+        assert_eq!(order.last().map(|s| s.as_str()), Some("merge"));
     }
 }

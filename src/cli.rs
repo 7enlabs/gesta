@@ -1553,3 +1553,105 @@ pub fn cmd_sub(sub: crate::SubCmd, json: bool) -> ZResult<()> {
         }
     }
 }
+
+/// Read a line from the terminal without echoing it.
+///
+/// The value is typed, not passed as an argument: an argument is visible in the
+/// process list and lands in shell history, and a secret in either is a secret that
+/// has to be rotated.
+fn read_hidden(prompt: &str) -> ZResult<String> {
+    use std::io::{BufRead, Write};
+
+    print!("{}", prompt);
+    std::io::stdout().flush()?;
+
+    #[cfg(unix)]
+    {
+        // stty is present wherever a terminal is, and turning echo off for one read
+        // is the one thing this needs from it.
+        let _ = std::process::Command::new("stty")
+            .arg("-echo")
+            .stdin(std::process::Stdio::inherit())
+            .status();
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line)?;
+        let _ = std::process::Command::new("stty")
+            .arg("echo")
+            .stdin(std::process::Stdio::inherit())
+            .status();
+        println!();
+        #[allow(clippy::needless_return)] // the other cfg branch returns below
+        return Ok(line.trim_end().to_string());
+    }
+
+    #[cfg(not(unix))]
+    {
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line)?;
+        Ok(line.trim_end().to_string())
+    }
+}
+
+/// Handle `gesta secret`.
+pub fn cmd_secret(sub: crate::SecretCmd) -> ZResult<()> {
+    use crate::SecretCmd;
+
+    match sub {
+        SecretCmd::Init => {
+            let path = match std::env::var("GESTA_SECRETS_FILE") {
+                Ok(p) if !p.is_empty() => std::path::PathBuf::from(p),
+                _ => crate::secrets::default_path()?,
+            };
+            println!("store: {}", path.display());
+            let first = read_hidden("passphrase: ")?;
+            if first.len() < 8 {
+                return Err(bad("a passphrase shorter than 8 characters is not worth the file it protects".to_string()));
+            }
+            let again = read_hidden("repeat: ")?;
+            if first != again {
+                return Err(bad("the two passphrases differ".to_string()));
+            }
+            let store = crate::secrets::SecretStore {
+                path,
+                passphrase: first,
+            };
+            let existing = store.load()?;
+            // Saving an empty map is what creates the file, and keeps what is there.
+            store.save(&existing)?;
+            println!("created {} ({} entries kept)", store.path.display(), existing.len());
+            Ok(())
+        }
+        SecretCmd::Set { name } => {
+            let store = crate::secrets::SecretStore::from_env()?;
+            let value = read_hidden(&format!("value for {}: ", name))?;
+            if value.is_empty() {
+                return Err(bad("an empty value is not stored".to_string()));
+            }
+            store.put(&name, &value)?;
+            println!("stored {} in {}", name, store.path.display());
+            Ok(())
+        }
+        SecretCmd::List => {
+            let store = crate::secrets::SecretStore::from_env()?;
+            let entries = store.load()?;
+            if entries.is_empty() {
+                println!("no entries in {}", store.path.display());
+            } else {
+                println!("{} ({} entries)", store.path.display(), entries.len());
+                for name in entries.keys() {
+                    println!("  {}", name);
+                }
+            }
+            Ok(())
+        }
+        SecretCmd::Remove { name } => {
+            let store = crate::secrets::SecretStore::from_env()?;
+            if store.remove(&name)? {
+                println!("removed {}", name);
+            } else {
+                println!("no entry named {}", name);
+            }
+            Ok(())
+        }
+    }
+}

@@ -23,6 +23,7 @@ mod remote;
 mod rebase;
 mod repo;
 mod s3;
+mod secrets;
 mod sigv4;
 mod sparse;
 mod stash;
@@ -278,6 +279,11 @@ enum Cmd {
         #[command(subcommand)]
         sub: RemoteCmd,
     },
+    /// Manage stored credentials for remotes
+    Secret {
+        #[command(subcommand)]
+        sub: SecretCmd,
+    },
     /// Run an MCP server on stdio, exposing the repository as tools
     Mcp,
     /// Serve this repository over HTTP
@@ -436,6 +442,21 @@ enum BranchCmd {
         #[arg(long, default_value = "main")]
         target: String,
     },
+}
+
+#[derive(Subcommand)]
+enum SecretCmd {
+    /// Ask for a passphrase and create the encrypted store
+    Init,
+    /// Set one entry; the value is read from the terminal, never from an argument
+    Set {
+        /// Entry name, for example s3.e2.access_key
+        name: String,
+    },
+    /// List entry names. Values are never printed.
+    List,
+    /// Remove one entry
+    Remove { name: String },
 }
 
 #[derive(Subcommand)]
@@ -626,6 +647,7 @@ fn run() -> ZResult<()> {
                 cli_remote::cmd_clone(&url, &dir, token.as_deref(), pin.as_deref())
             }
         },
+        Cmd::Secret { sub } => cli::cmd_secret(sub),
         Cmd::Mcp => cli::cmd_mcp(),
         Cmd::Serve { bind, port, tls, key } => {
             cli_remote::cmd_serve(&bind, port, tls.as_deref(), key.as_deref())

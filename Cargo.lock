@@ -238,6 +238,7 @@ dependencies = [
  "flate2",
  "hex",
  "rcgen",
+ "ring",
  "rusqlite",
  "rustls",
  "rustls-pki-types",

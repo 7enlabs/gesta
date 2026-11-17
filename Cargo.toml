@@ -23,6 +23,12 @@ flate2 = "1.0"
 # the commands an agent runs in a loop (status, diff, commit) never touch it.
 # Built with --features tls for `serve --tls` and https:// remotes.
 rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "ring", "tls12", "logging"] }
+# Crypto primitives for stored credentials: ChaCha20-Poly1305 to seal a secret,
+# HMAC-SHA256 as the key derivation, and the system random source. `ring` is
+# already in the tree for TLS and reviewed by people who do this for a living, so
+# it is depended on directly instead of hand writing a cipher. Not optional: the
+# secret store must work in a build without TLS.
+ring = "0.17"
 # rustls-pemfile is unmaintained (RUSTSEC-2025-0134). rustls-pki-types parses PEM
 # itself now, so the separate crate is gone.
 rustls-pki-types = { version = "1", optional = true, features = ["std"] }
