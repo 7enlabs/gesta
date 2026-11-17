@@ -798,11 +798,81 @@ pub fn new_changeset_id(conn: &Connection, message: &str, author: &str) -> ZResu
 /// already committed. One function is the only way to be sure there is no such
 /// writer.
 pub fn set_branch_head(conn: &Connection, branch: &str, changeset: &str) -> ZResult<()> {
+    // The tree is updated from the changeset's own file list, not rebuilt.
+    // Rebuilding reads every path in history, so committing one file cost the
+    // size of the repository: 24 ms in a 500 file repository, 67 ms in an 8000
+    // file one. Applying only what the changeset touched makes the cost follow
+    // the size of the change.
+    //
+    // The common case is a head that moves forward onto a commit whose parent is
+    // the old head. Anything else (a merge, an undo, a remote apply) is not
+    // incremental and falls back to a rebuild, which is correct and rare.
+    let old_head = branch_head(conn, branch)?;
+    let parent = conn
+        .query_row(
+            "SELECT parent FROM changesets WHERE id = ?1",
+            params![changeset],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+
     conn.execute(
         "UPDATE branches SET head = ?1 WHERE name = ?2",
         params![changeset, branch],
     )?;
-    refresh_branch_tree(conn, branch)?;
+
+    // A commit whose parent is the old head is a forward step and can be applied.
+    // The caller may have re-parented the changeset onto the head just before
+    // calling this, which is the same thing and still a forward step: what matters
+    // is that the parent chain contains no other parent, since a merge has two.
+    let parent2 = conn
+        .query_row(
+            "SELECT parent2 FROM changesets WHERE id = ?1",
+            params![changeset],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    let parent_matches = match (&old_head, &parent) {
+        (Some(old), Some(p)) => old == p,
+        // The first commit on an empty branch has no parent and no old head.
+        (None, None) => true,
+        _ => false,
+    };
+    let incremental = parent_matches && parent2.is_none();
+    if incremental {
+        apply_changeset_to_tree(conn, branch, changeset)?;
+    } else {
+        refresh_branch_tree(conn, branch)?;
+    }
+    Ok(())
+}
+
+/// Apply one changeset's file list to a branch's tree.
+///
+/// A path the changeset set to a hash replaces the row; a path it set to no hash
+/// is a deletion and its row goes. Nothing else in the tree is read, which is what
+/// keeps a commit proportional to the change.
+fn apply_changeset_to_tree(conn: &Connection, branch: &str, changeset: &str) -> ZResult<()> {
+    let files: Vec<(String, Option<String>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT path, new_hash FROM changeset_files WHERE changeset_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![changeset], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut put =
+        conn.prepare("INSERT OR REPLACE INTO branch_tree(branch, path, hash) VALUES(?1, ?2, ?3)")?;
+    let mut del = conn.prepare("DELETE FROM branch_tree WHERE branch = ?1 AND path = ?2")?;
+    for (path, hash) in files {
+        match hash {
+            Some(h) => put.execute(params![branch, path, h])?,
+            None => del.execute(params![branch, path])?,
+        };
+    }
     Ok(())
 }
 
@@ -829,6 +899,34 @@ pub fn refresh_branch_tree(conn: &Connection, branch: &str) -> ZResult<()> {
         stmt.execute(params![branch, path, hash])?;
     }
     Ok(())
+}
+
+/// Reachable changesets in breadth-first order: the id itself, then its parents,
+/// then theirs, level by level.
+///
+/// `ancestors` uses a stack, so its order is depth first and the index of an id
+/// says nothing about how close it is to the start. Anything that has to decide
+/// which of two changesets is newer needs this order instead, because the only
+/// other candidate is the clock and commits made in one burst share a timestamp.
+pub fn ancestors_bfs(conn: &Connection, id: &str) -> ZResult<Vec<String>> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(id.to_string());
+    while let Some(cur) = queue.pop_front() {
+        if !seen.insert(cur.clone()) {
+            continue;
+        }
+        out.push(cur.clone());
+        let (p1, p2) = parents_of(conn, &cur)?;
+        if let Some(p) = p1 {
+            queue.push_back(p);
+        }
+        if let Some(p) = p2 {
+            queue.push_back(p);
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

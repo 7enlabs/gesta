@@ -1047,38 +1047,67 @@ pub fn checkout_file(
 /// new hash of every touch, including deletions as `new_hash IS NULL`, so one
 /// ranked scan answers the whole tree.
 pub fn tree_at(conn: &Connection, changeset: &str) -> ZResult<Vec<(String, String)>> {
-    let reachable = crate::store::ancestors(conn, changeset)?;
+    let reachable = crate::store::ancestors_bfs(conn, changeset)?;
     if reachable.is_empty() {
         return Ok(Vec::new());
     }
-    let placeholders = crate::store::in_placeholders(reachable.len());
-    // One pass with a window function. A correlated subquery per path looked
-    // cheaper and measured 4x worse: 9.3 ms against 1.9 ms for 2000 paths,
-    // because the subquery runs once per row instead of once per query.
+
+    // Walk the reachable changesets newest first, taking the first row seen for
+    // each path. The order is the distance from `changeset`, not the clock:
+    // changesets made in one burst share a timestamp to the second, and ordering
+    // by time then picks an arbitrary winner. That produced a wrong tree whenever
+    // a path was deleted and later added back in the same second, which is what a
+    // test caught.
     //
-    // `created_at` can tie when a batch of commits lands in the same second, so
-    // `rowid` breaks the tie.
+    // `ancestors_bfs` returns the id itself first, then its parents level by
+    // level, so the index is the distance from the head.
+    let rank: std::collections::HashMap<&str, usize> = reachable
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.as_str(), i))
+        .collect();
+
+    let placeholders = crate::store::in_placeholders(reachable.len());
     let sql = format!(
-        "SELECT path, new_hash FROM (
-            SELECT cf.path AS path, cf.new_hash AS new_hash,
-                   ROW_NUMBER() OVER (
-                     PARTITION BY cf.path
-                     ORDER BY cs.created_at DESC, cs.rowid DESC
-                   ) AS rn
-            FROM changeset_files cf
-            JOIN changesets cs ON cs.id = cf.changeset_id
-            WHERE cf.changeset_id IN ({})
-         ) WHERE rn = 1 AND new_hash IS NOT NULL ORDER BY path",
+        "SELECT cf.changeset_id, cf.path, cf.new_hash FROM changeset_files cf
+         WHERE cf.changeset_id IN ({})",
         placeholders
     );
     let mut stmt = conn.prepare(&sql)?;
     let params: Vec<&dyn rusqlite::ToSql> =
         reachable.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-    let files = stmt
+    let rows = stmt
         .query_map(params.as_slice(), |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    // Nearest to the head wins. A null hash is a deletion, which also wins over
+    // anything older for that path.
+    let mut seen: std::collections::HashMap<String, (usize, Option<String>)> =
+        std::collections::HashMap::new();
+    for (cs, path, hash) in rows {
+        let d = match rank.get(cs.as_str()) {
+            Some(d) => *d,
+            None => continue,
+        };
+        match seen.get(&path) {
+            Some((best, _)) if *best <= d => {}
+            _ => {
+                seen.insert(path, (d, hash));
+            }
+        }
+    }
+
+    let mut files: Vec<(String, String)> = seen
+        .into_iter()
+        .filter_map(|(p, (_, h))| h.map(|hash| (p, hash)))
+        .collect();
+    files.sort();
     Ok(files)
 }
 
@@ -1194,10 +1223,14 @@ pub(crate) mod tests {
     use crate::store::tests::mem_db;
 
     pub fn commit_files(conn: &Connection, id: &str, msg: &str, files: &[(&str, &str)]) {
+        // The parent is the current head, which is what a real commit does. With
+        // NULL the fixture only ever exercised the rebuild path, so a defect in
+        // the incremental path could not appear in any test.
+        let head = crate::store::branch_head(conn, "main").unwrap();
         conn.execute(
             "INSERT INTO changesets(id,message,author,created_at,status,parent,branch)
-             VALUES(?1,?2,'a',1,'pending',NULL,'main')",
-            params![id, msg],
+             VALUES(?1,?2,'a',1,'pending',?3,'main')",
+            params![id, msg, head],
         )
         .unwrap();
         for (path, content) in files {
@@ -1764,4 +1797,72 @@ pub(crate) mod tests {
         before.restore(&conn).unwrap();
         assert_tree_is_honest(&conn, "main");
     }
+
+    /// The incremental update must match a full rebuild after every kind of
+    /// change. A drift here makes `status` report committed files as new, and
+    /// nothing else in the program would notice.
+    #[test]
+    fn the_incremental_tree_matches_a_rebuild_over_a_long_history() {
+        let conn = mem_db();
+
+        // A history that adds, edits and deletes, so every branch of the
+        // incremental path runs at least once.
+        commit_files(&conn, "c1", "one", &[("a.txt", "a\n"), ("b.txt", "b\n")]);
+        assert_tree_is_honest(&conn, "main");
+
+        commit_files(&conn, "c2", "edit", &[("a.txt", "a2\n")]);
+        assert_tree_is_honest(&conn, "main");
+
+        commit_files(&conn, "c3", "add", &[("c.txt", "c\n")]);
+        assert_tree_is_honest(&conn, "main");
+
+        // A deletion: recorded with a null hash and no file_version row.
+        conn.execute(
+            "INSERT INTO changesets(id,message,author,created_at,status,parent,branch)
+             VALUES('c4','del','a',4,'pending','c3','main')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO changeset_files(changeset_id,path,old_hash,new_hash)
+             VALUES('c4','b.txt',NULL,NULL)",
+            [],
+        )
+        .unwrap();
+        commit_one(&conn, "c4").unwrap();
+        assert_tree_is_honest(&conn, "main");
+
+        // Adding a path back after deleting it.
+        commit_files(&conn, "c5", "readd", &[("b.txt", "b again\n")]);
+        assert_tree_is_honest(&conn, "main");
+    }
+
+    #[test]
+    fn a_merge_rebuilds_the_tree_instead_of_applying_it() {
+        // A merge has two parents, so it is not an incremental step. The fallback
+        // has to produce the same answer as a rebuild, which this asserts.
+        let conn = mem_db();
+        commit_files(&conn, "base", "base", &[("f.txt", "x\n"), ("g.txt", "y\n")]);
+        conn.execute(
+            "INSERT INTO branches(name, head, created_at, from_branch)
+             VALUES('side','base',1,'main')",
+            [],
+        )
+        .unwrap();
+        crate::store::refresh_branch_tree(&conn, "side").unwrap();
+
+        let d = std::env::temp_dir().join(format!("gesta-inc-merge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("f.txt"), "x\n").unwrap();
+        std::fs::write(d.join("g.txt"), "y\n").unwrap();
+
+        let out = cherry_pick(&conn, &d, "base", "side", "t").unwrap();
+        let _ = out;
+        assert_tree_is_honest(&conn, "main");
+        assert_tree_is_honest(&conn, "side");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
 }
