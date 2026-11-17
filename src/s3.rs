@@ -242,6 +242,109 @@ impl S3Config {
         }
         Ok(Some(resp))
     }
+
+    /// List the branch names stored under a prefix.
+    ///
+    /// One request with `list-type=2` and a prefix, which every S3 implementation
+    /// supports. A bucket holds `<prefix>/<branch>.bundle`, so stripping the known
+    /// prefix and suffix leaves the branch.
+    pub fn list_branches(&self, prefix: &str) -> ZResult<Vec<String>> {
+        let now = crate::clock::unix_now();
+        let amz_date = crate::clock::format_amz_date(now);
+        let (host, port, tls) = self.host_port()?;
+        let scheme = if tls { "https" } else { "http" };
+        let authority = if (tls && port == 443) || (!tls && port == 80) {
+            host.clone()
+        } else {
+            format!("{}:{}", host, port)
+        };
+        let path = format!("/{}", self.bucket);
+        let query = vec![
+            ("list-type".to_string(), "2".to_string()),
+            (
+                "prefix".to_string(),
+                if prefix.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}/", prefix)
+                },
+            ),
+            ("max-keys".to_string(), "1000".to_string()),
+        ];
+        let payload_hash = sigv4::sha256_hex(b"");
+        let canon = vec![
+            ("host".to_string(), authority.clone()),
+            ("x-amz-content-sha256".to_string(), payload_hash.clone()),
+            ("x-amz-date".to_string(), amz_date.to_string()),
+        ];
+        let req = Request {
+            method: "GET".to_string(),
+            path: path.clone(),
+            query: query.clone(),
+            headers: canon.clone(),
+            payload_hash,
+        };
+        let (_sig, auth) = req.sign(
+            &self.access_key,
+            &self.secret_key,
+            &self.region,
+            "s3",
+            &amz_date,
+        )?;
+        let mut out: Vec<(String, String)> = canon
+            .into_iter()
+            .map(|(k, v)| {
+                let name = if k == "host" { "Host".to_string() } else { k };
+                (name, v)
+            })
+            .collect();
+        out.push(("Authorization".to_string(), auth));
+
+        let qs = query
+            .iter()
+            .map(|(k, v)| {
+                format!(
+                    "{}={}",
+                    sigv4::uri_encode(k, false),
+                    sigv4::uri_encode(v, false)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+        let url = format!("{}://{}{}?{}", scheme, authority, path, qs);
+
+        let (status, body) = crate::http::request_with_headers("GET", &url, &out, None)?;
+        if !(200..300).contains(&status) {
+            return Err(bad(format!(
+                "listing failed with status {}: {}",
+                status,
+                String::from_utf8_lossy(&body).chars().take(200).collect::<String>()
+            )));
+        }
+        let text = String::from_utf8_lossy(&body);
+        let mut names = Vec::new();
+        let open = "<Key>";
+        let close = "</Key>";
+        let mut rest = text.as_ref();
+        while let Some(s) = rest.find(open) {
+            let after = &rest[s + open.len()..];
+            let Some(e) = after.find(close) else { break };
+            let key = &after[..e];
+            if let Some(branch) = key
+                .strip_prefix(&if prefix.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}/", prefix)
+                })
+                .and_then(|k| k.strip_suffix(".bundle"))
+            {
+                names.push(branch.to_string());
+            }
+            rest = &after[e + close.len()..];
+        }
+        names.sort();
+        Ok(names)
+    }
 }
 
 #[cfg(test)]

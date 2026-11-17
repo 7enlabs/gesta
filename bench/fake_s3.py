@@ -54,8 +54,11 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _object_key(self):
-        path = urllib.parse.urlparse(self.path).path
-        return path.lstrip("/")
+        # The request path is /<bucket>/<key>; the store holds <key> only, so the
+        # bucket segment is dropped. Keeping it made every listing prefix miss.
+        path = urllib.parse.urlparse(self.path).path.lstrip("/")
+        bucket, _, key = path.partition("/")
+        return key if key else bucket
 
     def _verify(self, body):
         auth = self.headers.get("Authorization", "")
@@ -156,6 +159,30 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(403)
             self.send_header("Content-Length", "0")
             self.end_headers()
+            return
+        # A bucket level listing: /bucket?list-type=2&prefix=... The object path
+        # has no trailing key, so this is asked before the object lookup.
+        parsed = urllib.parse.urlparse(self.path)
+        q = urllib.parse.parse_qs(parsed.query)
+        if q.get("list-type") == ["2"]:
+            prefix = q.get("prefix", [""])[0]
+            keys = sorted(k for k in STORE if k.startswith(prefix))
+            parts = [
+                '<?xml version="1.0" encoding="UTF-8"?>',
+                '<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">',
+                "<Name>%s</Name>" % parsed.path.strip("/"),
+                "<Prefix>%s</Prefix>" % prefix,
+                "<KeyCount>%d</KeyCount>" % len(keys),
+            ]
+            for k in keys:
+                parts.append("<Contents><Key>%s</Key><Size>%d</Size></Contents>" % (k, len(STORE[k])))
+            parts.append("</ListBucketResult>")
+            body = "\n".join(parts).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/xml")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
         body = STORE.get(self._object_key())
         if body is None:

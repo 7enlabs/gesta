@@ -254,11 +254,18 @@ def main():
             hist = subprocess.run([ZF, "log"], cwd=dest, capture_output=True,
                                   text=True, env=e).stdout
             n_cs = hist.count("changeset ")
+
+            # Listing is how a clone finds a branch without being told its name.
+            ls = subprocess.run([ZF, "remote", "ls", "origin"], cwd=tmp,
+                                capture_output=True, text=True, env=e)
+            listed = "main" in ls.stdout
+
             record(
                 "s3 push, idempotent push and clone",
+                listed and
                 pushed and no_reupload and got == "hello\n" and got2 == "second\n" and n_cs == 2,
                 f"pushed={pushed} no_reupload={no_reupload} a={got!r} b={got2!r} "
-                f"changesets={n_cs} push3={push3.stdout.strip()[:80]} "
+                f"changesets={n_cs} listed={listed} push3={push3.stdout.strip()[:60]} "
                 f"clone={clone.stdout.strip()[:100]}{clone.stderr.strip()[:140]}",
             )
         finally:

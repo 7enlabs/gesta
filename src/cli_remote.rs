@@ -1063,3 +1063,31 @@ pub fn cmd_token_list() -> ZResult<()> {
     }
     Ok(())
 }
+
+/// List what a remote holds.
+///
+/// Only an object store can be asked: a filesystem remote already answers through
+/// its own database and an HTTP remote would need a listing endpoint that no
+/// deployment is required to expose.
+pub fn cmd_remote_ls(remote_name: &str) -> ZResult<()> {
+    let (_root, conn) = open_repo()?;
+    let url = remote_url(&conn, remote_name)?;
+
+    if url.starts_with("s3://") {
+        let (cfg, prefix) = crate::s3::S3Config::from_url(&url)?;
+        let branches = cfg.list_branches(&prefix)?;
+        if branches.is_empty() {
+            println!("no branches at s3://{}/{}", cfg.bucket, prefix);
+        } else {
+            println!("s3://{}/{} ({} branch(es))", cfg.bucket, prefix, branches.len());
+            for b in branches {
+                println!("  {}", b);
+            }
+        }
+        return Ok(());
+    }
+
+    Err(bad(
+        "listing is only supported for s3:// remotes".to_string(),
+    ))
+}

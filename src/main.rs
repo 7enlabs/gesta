@@ -477,6 +477,11 @@ enum RemoteCmd {
         #[command(subcommand)]
         sub: TokenCmd,
     },
+    /// List the branches a remote holds, for remotes that can be asked
+    Ls {
+        #[arg(default_value = "origin")]
+        remote: String,
+    },
     /// Send this repository's branch to a remote
     Push {
         #[arg(default_value = "origin")]
@@ -641,6 +646,7 @@ fn run() -> ZResult<()> {
                 TokenCmd::List => cli_remote::cmd_token_list(),
                 TokenCmd::Remove { selector } => cli_remote::cmd_token_remove(&selector),
             },
+            RemoteCmd::Ls { remote } => cli_remote::cmd_remote_ls(&remote),
             RemoteCmd::Push { remote, branch } => cli_remote::cmd_push(&remote, &branch),
             RemoteCmd::Pull { remote, branch, author } => cli_remote::cmd_pull(&remote, &branch, &author),
             RemoteCmd::Clone { url, dir, token, pin } => {
