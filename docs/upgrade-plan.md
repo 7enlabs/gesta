@@ -217,11 +217,11 @@ These are inferences, with no measurement or source behind them:
 
 ### Still missing, and why it matters
 
-1. **No network transport.** Push and pull move a bundle through a filesystem
-   path. For two machines you need a shared directory or to copy the bundle by
-   hand. This is the single biggest remaining blocker to replacing git in daily
-   use, and the next thing to build (HTTP first: it makes any server, CI runner,
-   or static host a valid remote).
+1. ~~**No network transport.**~~ **Done in v0.3.1.** `zenforge serve` exposes a
+   repository over HTTP and `clone`/`push`/`pull` speak it. Eleven checks in
+   `bench/http_remote.py` drive a real socket, including a refused rewind, a
+   merge across two clones, and a second clone seeing the pushed history.
+   Still missing on top of it: TLS and authentication.
 2. **Small-file overhead.** 4.32x git for a tree of 1000 tiny files. The cause is
    per-row SQLite and index overhead, not content. Fixing it needs packing
    several small objects into one row, which is a schema change.
@@ -240,3 +240,56 @@ nothing is lost silently. It cannot yet replace git for a team, because there is
 no way to get the repository to another machine over a network. Calling it a git
 replacement today would be wrong; calling it usable for local agent work is
 accurate and now backed by 20 checks.
+
+
+## 8. v0.3.1: HTTP remote
+
+### What was built
+
+`src/http.rs` is a hand-written HTTP/1.1 server and client on `std::net`. No TLS
+stack, no async runtime, no new dependency: the protocol surface is small enough
+to test directly.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /v1/health` | liveness, answers `ok` without touching a repository |
+| `GET /v1/branches` | `name<TAB>head` per line |
+| `GET /v1/bundle?branch=X&have=a,b` | zlib bundle of what the caller lacks |
+| `POST /v1/bundle?branch=X` | receive a bundle; 409 on a rewind |
+
+### Bugs the network exposed
+
+Each of these worked locally and broke as soon as two repositories talked:
+
+1. **Push did not update the working tree.** The served repository had the
+   changeset in its database but not the file on disk, so `status` inside the
+   origin directory reported the pushed file as deleted. Fixed by materialising
+   the tree after both sending and receiving.
+2. **`restore_worktree` only read the head changeset.** A file added by an
+   earlier changeset was never written, so a clone of a two-commit repository
+   produced one file instead of two. Fixed with `tree_at`, which takes the newest
+   version of every path reachable from the head.
+3. **The server checked ancestry before applying the bundle.** The incoming head
+   does not exist in the receiving database until the bundle is applied, so every
+   legitimate push was rejected with "pull first". Fixed by applying first,
+   verifying after, and rolling the branch ref back on rejection.
+4. **Pull overwrote the local branch head.** `apply_bundle` moved the branch to
+   the fetched head, discarding local changesets that had not been pushed, and
+   then the merge compared a branch against itself and did nothing. Fixed by
+   separating data ingestion from ref movement: pull applies objects without
+   touching the branch, points a tracking branch (`origin/main`) at the fetched
+   head, and merges that into the local branch.
+
+### Verification
+
+| Suite | Result |
+|---|---|
+| `bench/http_remote.py` | 11/11 over a real socket |
+| `bench/replace_git.py` | 20/20 |
+| Unit tests | 67 |
+| clippy | 0 warnings |
+| aislop | 100/100 |
+
+A three-machine scenario (server, clone B, clone C, then D cloning late) was run
+by hand: all four ended with the same file content, clean working trees, and the
+full changeset history including the merge commit.

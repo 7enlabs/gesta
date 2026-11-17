@@ -5,6 +5,7 @@
 
 mod cli;
 mod cli_remote;
+mod http;
 mod merge;
 mod ops;
 mod remote;
@@ -150,6 +151,13 @@ enum Cmd {
         #[command(subcommand)]
         sub: RemoteCmd,
     },
+    /// Serve this repository over HTTP
+    Serve {
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+        #[arg(long, default_value_t = 8787)]
+        port: u16,
+    },
     /// Verify repository integrity
     Fsck {
         /// Delete objects nothing references
@@ -284,6 +292,7 @@ fn run() -> ZResult<()> {
             RemoteCmd::Pull { remote, branch, author } => cli_remote::cmd_pull(&remote, &branch, &author),
             RemoteCmd::Clone { url, dir } => cli_remote::cmd_clone(&url, &dir),
         },
+        Cmd::Serve { bind, port } => cli_remote::cmd_serve(&bind, port),
         Cmd::Fsck { prune } => cli_remote::cmd_fsck(prune),
         Cmd::Stats => cli_remote::cmd_stats(),
         Cmd::Ignore { sub } => match sub {

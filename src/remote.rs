@@ -324,7 +324,11 @@ pub fn build_bundle(conn: &Connection, branch: &str, have: &HashSet<String>) -> 
 }
 
 /// Apply a bundle into a repository. Idempotent per changeset.
-pub fn apply_bundle(conn: &Connection, b: &Bundle) -> ZResult<usize> {
+///
+/// The branch head is left alone when `move_branch` is false: a pull must merge
+/// the fetched history into the local branch, not replace it. Overwriting the
+/// head here silently drops the local changesets from the branch.
+pub fn apply_bundle_opts(conn: &Connection, b: &Bundle, move_branch: bool) -> ZResult<usize> {
     let tx = conn.unchecked_transaction()?;
     let mut applied = 0usize;
 
@@ -370,18 +374,24 @@ pub fn apply_bundle(conn: &Connection, b: &Bundle) -> ZResult<usize> {
         )?;
     }
 
-    // Move the branch only forward.
     tx.execute(
         "INSERT INTO branches(name, head, created_at, from_branch) VALUES(?1, NULL, ?2, NULL)
          ON CONFLICT(name) DO NOTHING",
         params![b.branch, now()],
     )?;
-    if let Some(head) = &b.head {
-        tx.execute("UPDATE branches SET head = ?1 WHERE name = ?2", params![head, b.branch])?;
+    if move_branch {
+        if let Some(head) = &b.head {
+            tx.execute("UPDATE branches SET head = ?1 WHERE name = ?2", params![head, b.branch])?;
+        }
     }
 
     tx.commit()?;
     Ok(applied)
+}
+
+/// Apply a bundle and move the branch head to it (clone and server receive).
+pub fn apply_bundle(conn: &Connection, b: &Bundle) -> ZResult<usize> {
+    apply_bundle_opts(conn, b, true)
 }
 
 

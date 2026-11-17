@@ -52,7 +52,8 @@ zenforge blame src/main.rs
 | `ops [--limit N]` | Operation log |
 | `tag <name> [--list]` | Named pointer to a changeset |
 | `branch create/list/switch/delete/merge/info` | Branch operations |
-| `remote add/list/push/pull/clone` | Remote sync |
+| `remote add/list/push/pull/clone` | Remote sync (filesystem path or `http://`) |
+| `serve [--bind ADDR] [--port N]` | Serve this repository over HTTP |
 | `fsck [--prune]` | Verify integrity, optionally drop orphan objects |
 | `stats` | Object counts and compression ratio |
 | `ignore add/list/remove` | Ignore patterns |
@@ -170,7 +171,8 @@ of them failed at some point.
 | Branch switch materialises the target tree | works |
 | `undo` on the operation log | works |
 | Tags | works |
-| `clone` / `push` / `pull` over a bundle format | works |
+| `clone` / `push` / `pull` over a bundle format | works, filesystem path or HTTP |
+| `serve` (HTTP remote) | works, 11 network checks pass |
 | `fsck` (missing objects, dangling parents, orphan objects) | works |
 | Concurrent snapshots from 8 processes | works, unique ids |
 
@@ -178,11 +180,33 @@ Storage, measured on 21 versions of a 42 KB file: **2.63x the disk of git**, dow
 from 8.9x before compression. Small-file-heavy trees are 4.3x, because per-row
 overhead dominates when each object is a few dozen bytes.
 
+### Remote over HTTP
+
+A repository can serve itself, and any other machine can clone, push and pull
+from it over plain HTTP:
+
+```bash
+# on the machine holding the repository
+zenforge serve --bind 0.0.0.0 --port 8787
+
+# on another machine
+zenforge remote clone http://server:8787 path/to/project
+zenforge remote add origin http://server:8787
+zenforge remote push origin
+zenforge remote pull origin
+```
+
+Endpoints: `GET /v1/health`, `GET /v1/branches`, `GET /v1/bundle?branch=X&have=...`,
+`POST /v1/bundle?branch=X`. A push that would move the server's branch to a head
+that does not contain its current head is rejected with 409 and the branch is
+left untouched. `https://` is refused with an explanation: put the server behind
+a TLS-terminating proxy.
+
 ### What still is not git
 
-- **No HTTP or SSH transport.** `clone`/`push`/`pull` work over a filesystem path
-  (or `file://`). Two machines need a shared directory or a manual copy of the
-  bundle. This is the biggest remaining gap for real collaboration.
+- **No SSH transport and no TLS.** Plain HTTP only; wrap it in a reverse proxy
+  for anything beyond a trusted network.
+- **No authentication or authorisation.** Anyone who can reach the port can push.
 - **No `.gitattributes`, hooks, submodules, or LFS.**
 - **Blame is line-sequence based, not line-identity based.** A moved line keeps
   its author; a line edited and moved in the same commit does not.

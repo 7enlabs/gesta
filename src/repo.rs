@@ -667,6 +667,52 @@ pub fn checkout_file(
     Ok(content.len())
 }
 
+/// The full file tree as of `changeset`: every path reachable from it paired
+/// with its newest version. This is what a checkout materialises.
+pub fn tree_at(conn: &Connection, changeset: &str) -> ZResult<Vec<(String, String)>> {
+    let reachable = crate::store::ancestors(conn, changeset)?;
+    if reachable.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = vec!["?"; reachable.len()].join(",");
+    let sql = format!(
+        "SELECT path, hash FROM (
+            SELECT path, hash, version,
+                   ROW_NUMBER() OVER (PARTITION BY path ORDER BY version DESC) AS rn
+            FROM file_versions WHERE changeset_id IN ({})
+         ) WHERE rn = 1 ORDER BY path",
+        placeholders
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> =
+        reachable.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    let files = stmt
+        .query_map(params.as_slice(), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(files)
+}
+
+/// Write every file of `branch` to disk. Used after a push and after a clone so
+/// the working tree never lags behind the branch head.
+pub fn materialise(conn: &Connection, root: &Path, branch: &str) -> ZResult<usize> {
+    let head = match branch_head(conn, branch)? {
+        Some(h) => h,
+        None => return Ok(0),
+    };
+    let files = tree_at(conn, &head)?;
+    for (path, hash) in &files {
+        let content = get_object(conn, hash)?;
+        let target = root.join(path);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&target, content.as_bytes())?;
+    }
+    Ok(files.len())
+}
+
 /// Restore every tracked file of `branch` to its committed content, and remove
 /// tracked files that should not exist. Untracked files are left alone.
 pub fn restore_worktree(conn: &Connection, root: &Path, branch: &str) -> ZResult<(usize, usize)> {
@@ -675,12 +721,10 @@ pub fn restore_worktree(conn: &Connection, root: &Path, branch: &str) -> ZResult
         None => return Ok((0, 0)),
     };
 
-    let mut stmt = conn.prepare(
-        "SELECT path, hash FROM file_versions WHERE changeset_id = ?1 ORDER BY path",
-    )?;
-    let files: Vec<(String, String)> = stmt
-        .query_map(params![head], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    // The tree at `head` is the newest version of every path reachable from it,
+    // not just the paths that `head` itself touched. Reading file_versions for
+    // the head changeset alone loses every file added by an earlier changeset.
+    let files = tree_at(conn, &head)?;
 
     let mut written = 0usize;
     for (path, hash) in &files {

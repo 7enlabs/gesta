@@ -6,6 +6,7 @@ use std::path::Path;
 
 use rusqlite::OptionalExtension;
 
+use crate::http;
 use crate::ops;
 use crate::remote;
 use crate::repo;
@@ -54,8 +55,12 @@ fn remote_url(conn: &rusqlite::Connection, name: &str) -> ZResult<String> {
 }
 
 pub fn cmd_push(remote_name: &str, branch: &str) -> ZResult<()> {
-    let (_root, conn) = open_repo()?;
+    let (root, conn) = open_repo()?;
     let url = remote_url(&conn, remote_name)?;
+
+    if http::is_http_url(&url) {
+        return push_http(&conn, root.as_path(), remote_name, &url, branch);
+    }
     let path = remote::resolve_remote(&url);
 
     // The remote must already exist as a bare repository.
@@ -104,6 +109,10 @@ pub fn cmd_push(remote_name: &str, branch: &str) -> ZResult<()> {
 pub fn cmd_pull(remote_name: &str, branch: &str, author: &str) -> ZResult<()> {
     let (root, conn) = open_repo()?;
     let url = remote_url(&conn, remote_name)?;
+
+    if http::is_http_url(&url) {
+        return pull_http(&conn, &root, remote_name, &url, branch, author);
+    }
     let path = remote::resolve_remote(&url);
 
     let remote_conn = open_db(&path)?;
@@ -112,23 +121,13 @@ pub fn cmd_pull(remote_name: &str, branch: &str, author: &str) -> ZResult<()> {
 
     let bundle = remote::build_bundle(&remote_conn, branch, &HashSet::new())?;
     let received = remote::Bundle::decode(&bundle.encode()?)?;
-    let applied = remote::apply_bundle(&conn, &received)?;
+    let applied = remote::apply_bundle_opts(&conn, &received, false)?;
 
     let current = current_branch(&conn)?;
-    if current == branch {
-        // Merge the fetched history into the current branch properly.
-        let local_head = branch_head(&conn, &current)?;
-        if local_head.as_deref() != Some(remote_head.as_str()) {
-            let out = repo::merge_branch(&conn, &root, branch, &current, author)?;
-            if !out.conflicts.is_empty() {
-                eprintln!("pull fetched {} changeset(s) but merging them conflicted:", applied);
-                for c in &out.conflicts {
-                    eprintln!("  {}", c);
-                }
-                return Err(bad("pull needs a manual merge"));
-            }
-        }
+    if current == branch && branch_head(&conn, &current)?.as_deref() != Some(remote_head.as_str()) {
+        merge_fetched(&conn, &root, remote_name, branch, &remote_head, author)?;
     }
+    repo::materialise(&conn, &root, &current)?;
     ops::record(&conn, "pull", Some(&remote_head), Some(remote_name))?;
     println!("pulled {} changeset(s) from {} into {}", applied, remote_name, branch);
     Ok(())
@@ -140,6 +139,10 @@ pub fn cmd_clone(url: &str, dir: &str) -> ZResult<()> {
         return Err(bad(format!("{} already contains a zenforge repository", dir)));
     }
     fs::create_dir_all(target)?;
+
+    if http::is_http_url(url) {
+        return clone_http(url, target);
+    }
 
     let remote_path = remote::resolve_remote(url);
     if !remote_path.join(ZF_DIR).is_dir() {
@@ -375,3 +378,217 @@ pub fn cmd_ignore_remove(pattern: &str) -> ZResult<()> {
     Ok(())
 }
 
+
+/// Point a remote-tracking branch at `head`. Pull merges this branch into the
+/// current one, which is how a fetched history becomes part of local work
+/// without pretending the remote head is already the local head.
+fn set_tracking_branch(conn: &rusqlite::Connection, name: &str, head: &str) -> ZResult<()> {
+    conn.execute(
+        "INSERT INTO branches(name, head, created_at, from_branch) VALUES(?1, ?2, ?3, 'remote')
+         ON CONFLICT(name) DO UPDATE SET head = excluded.head",
+        rusqlite::params![name, head, now()],
+    )?;
+    Ok(())
+}
+
+/// Merge a fetched head into `branch` through a tracking branch.
+fn merge_fetched(
+    conn: &rusqlite::Connection,
+    root: &Path,
+    remote_name: &str,
+    branch: &str,
+    remote_head: &str,
+    author: &str,
+) -> ZResult<bool> {
+    let tracking = format!("{}/{}", remote_name, branch);
+    set_tracking_branch(conn, &tracking, remote_head)?;
+    let out = repo::merge_branch(conn, root, &tracking, branch, author)?;
+    if !out.conflicts.is_empty() {
+        eprintln!("merge of {} into {} hit {} conflict(s):", tracking, branch, out.conflicts.len());
+        for c in &out.conflicts {
+            eprintln!("  {} (their version saved as {}.theirs)", c, c);
+        }
+        return Err(bad("pull needs a manual merge"));
+    }
+    Ok(!out.applied.is_empty())
+}
+
+/// Push over HTTP: ask the server which changesets it has, send only the rest.
+fn push_http(
+    conn: &rusqlite::Connection,
+    root: &Path,
+    remote_name: &str,
+    url: &str,
+    branch: &str,
+) -> ZResult<()> {
+    let base = url.trim_end_matches('/');
+
+    // What does the remote already have? Asking first keeps the upload small;
+    // the server also refuses a bundle that would move its branch backwards.
+    let (status, body) = http::request("GET", &format!("{}/v1/branches", base), None)?;
+    if status != 200 {
+        return Err(bad(format!(
+            "remote {} answered {}: {}",
+            remote_name,
+            status,
+            String::from_utf8_lossy(&body).trim()
+        )));
+    }
+    // The server tells us its head for this branch; everything reachable from it
+    // is already there, so the bundle only carries the rest.
+    let listing = String::from_utf8_lossy(&body).to_string();
+    let mut have: HashSet<String> = HashSet::new();
+    let remote_head = listing
+        .lines()
+        .find_map(|l| {
+            let mut p = l.split('\t');
+            match (p.next(), p.next()) {
+                (Some(n), Some(h)) if n == branch && h != "-" => Some(h.to_string()),
+                _ => None,
+            }
+        });
+    if let Some(h) = &remote_head {
+        have.insert(h.clone());
+    }
+
+    let bundle = remote::build_bundle(conn, branch, &have)?;
+    let wire = bundle.encode()?;
+    let object_count = bundle.objects.len();
+    let changeset_count = bundle.changesets.len();
+
+    let target = format!("{}/v1/bundle?branch={}", base, branch);
+    let (status, body) = http::request("POST", &target, Some(&wire))?;
+    if status != 200 {
+        return Err(bad(format!(
+            "push rejected by {} ({}): {}",
+            remote_name,
+            status,
+            String::from_utf8_lossy(&body).trim()
+        )));
+    }
+
+    conn.execute(
+        "INSERT INTO remote_refs(remote, branch, changeset_id, updated_at) VALUES(?1, ?2, ?3, ?4)
+         ON CONFLICT(remote, branch) DO UPDATE SET changeset_id = excluded.changeset_id,
+                                                   updated_at = excluded.updated_at",
+        rusqlite::params![remote_name, branch, bundle.head.clone().unwrap_or_default(), now()],
+    )?;
+
+    // The local repository keeps its own working tree in sync with the branch
+    // it just shared, so `push` followed by `status` is clean.
+    repo::materialise(conn, root, branch)?;
+
+    println!(
+        "pushed {} changeset(s), {} object(s) of {} to {} over http",
+        changeset_count, object_count, branch, remote_name
+    );
+    Ok(())
+}
+
+/// Pull over HTTP: download the server's bundle for `branch` and merge it.
+fn pull_http(
+    conn: &rusqlite::Connection,
+    root: &Path,
+    remote_name: &str,
+    url: &str,
+    branch: &str,
+    author: &str,
+) -> ZResult<()> {
+    let base = url.trim_end_matches('/');
+    let have: Vec<String> = ancestors(
+        conn,
+        &branch_head(conn, branch)?.unwrap_or_else(|| "none".into()),
+    )
+    .unwrap_or_default();
+    let have: Vec<String> = if have == vec!["none".to_string()] { Vec::new() } else { have };
+
+    let target = http::bundle_url(base, branch, &have);
+    let (status, body) = http::request("GET", &target, None)?;
+    if status != 200 {
+        return Err(bad(format!(
+            "cannot fetch branch {} from {} ({}): {}",
+            branch,
+            remote_name,
+            status,
+            String::from_utf8_lossy(&body).trim()
+        )));
+    }
+
+    let bundle = remote::Bundle::decode(&body)?;
+    let remote_head = bundle
+        .head
+        .clone()
+        .ok_or_else(|| bad(format!("remote {} returned no head for {}", remote_name, branch)))?;
+    // Fetch the objects but keep the local branch: the merge below decides the
+    // new head. Moving it here would discard local changesets.
+    let applied = remote::apply_bundle_opts(conn, &bundle, false)?;
+
+    let current = current_branch(conn)?;
+    if current == branch && branch_head(conn, &current)?.as_deref() != Some(remote_head.as_str()) {
+        merge_fetched(conn, root, remote_name, branch, &remote_head, author)?;
+    }
+    repo::materialise(conn, root, &current)?;
+    ops::record(conn, "pull", Some(&remote_head), Some(remote_name))?;
+    println!("pulled {} changeset(s) from {} ({}) into {}", applied, remote_name, base, branch);
+    Ok(())
+}
+
+/// Clone over HTTP: ask for the branch list, fetch the first branch.
+fn clone_http(url: &str, target: &Path) -> ZResult<()> {
+    let base = url.trim_end_matches('/');
+
+    let (status, body) = http::request("GET", &format!("{}/v1/branches", base), None)?;
+    if status != 200 {
+        return Err(bad(format!(
+            "cannot list branches at {} ({}): {}",
+            base,
+            status,
+            String::from_utf8_lossy(&body).trim()
+        )));
+    }
+    let listing = String::from_utf8_lossy(&body).to_string();
+    let branch = listing
+        .lines()
+        .find_map(|l| l.split('\t').next().filter(|s| !s.is_empty()).map(|s| s.to_string()))
+        .ok_or_else(|| bad(format!("{} has no branches", base)))?;
+
+    let (status, body) = http::request("GET", &http::bundle_url(base, &branch, &[]), None)?;
+    if status != 200 {
+        return Err(bad(format!(
+            "cannot fetch {} from {} ({}): {}",
+            branch,
+            base,
+            status,
+            String::from_utf8_lossy(&body).trim()
+        )));
+    }
+    let bundle = remote::Bundle::decode(&body)?;
+
+    let zf = target.join(ZF_DIR);
+    fs::create_dir_all(&zf)?;
+    let conn = open_db(target)?;
+    init_schema(&conn)?;
+    remote::apply_bundle(&conn, &bundle)?;
+    set_state(&conn, "current_branch", &branch)?;
+    conn.execute(
+        "INSERT INTO remotes(name, url) VALUES('origin', ?1)
+         ON CONFLICT(name) DO UPDATE SET url = excluded.url",
+        rusqlite::params![url],
+    )?;
+    let (written, _removed) = repo::restore_worktree(&conn, target, &branch)?;
+    println!(
+        "cloned {} into {} (branch {}, {} changeset(s), {} file(s))",
+        base,
+        target.display(),
+        branch,
+        bundle.changesets.len(),
+        written
+    );
+    Ok(())
+}
+
+/// Serve this repository over HTTP.
+pub fn cmd_serve(bind: &str, port: u16) -> ZResult<()> {
+    let (root, _conn) = open_repo()?;
+    http::serve(root, bind.to_string(), port)
+}
