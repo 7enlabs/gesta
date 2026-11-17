@@ -15,6 +15,7 @@ import subprocess
 import statistics
 import sys
 import time
+import time
 
 ZF = os.environ.get("ZF_BIN", "/work/gesta/target/release/gesta")
 # The benchmark must not run on a bind mount. /work is a 9p drvfs share of a
@@ -35,6 +36,11 @@ results = []
 
 
 def record(name, zf_ms, git_ms, detail=""):
+    # A row with no baseline is a measurement on its own, not a skip: the racy
+    # case has nothing to compare against but still has a number worth seeing.
+    if git_ms is None and zf_ms is not None:
+        print(f"  {name:34} gesta {zf_ms:8.1f} ms | (no baseline)")
+        return
     ok = zf_ms is not None and git_ms is not None
     results.append((name, zf_ms, git_ms))
     if not ok:
@@ -111,6 +117,12 @@ def main():
         sh(f"{ZF} init", cwd=zf_dir)
         commit_all_zf(zf_dir)
 
+        # Let the tree settle before measuring. A file written in the last couple
+        # of seconds is deliberately re-read (the racy case), so measuring right
+        # after building the tree reports worst case as if it were typical. The
+        # two numbers are reported separately below.
+        time.sleep(2.5)
+
         # status on a clean tree
         z = timeit(f"{ZF} status", zf_dir)
         g = timeit("git status --porcelain", gt_dir)
@@ -154,6 +166,14 @@ def main():
             return statistics.median(samples)
 
         record("commit, 1 file", bench_zf_commit(), bench_git_commit())
+
+        # The racy case, stated rather than folded into the typical number: every
+        # file was just written, so every stat is young and each file is re-read.
+        for d in (zf_dir,):
+            with open(os.path.join(d, "pkg1", "f100.py"), "a") as fh:
+                fh.write("# fresh\n")
+        z = timeit(f"{ZF} status", zf_dir, runs=3)
+        record(f"status, right after a write", z, None)
 
         # log
         z = timeit(f"{ZF} log --limit 10", zf_dir)
