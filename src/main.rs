@@ -11,6 +11,7 @@ mod conflict;
 mod content;
 mod delta;
 mod history;
+mod hooks;
 mod http;
 mod json;
 mod mcp;
@@ -19,6 +20,7 @@ mod ops;
 mod remote;
 mod repo;
 mod sparse;
+mod stash;
 mod store;
 #[cfg(feature = "tls")]
 mod tls;
@@ -192,6 +194,16 @@ enum Cmd {
         /// File or `.` to restore the whole working tree
         file: String,
     },
+    /// Save the working tree aside and reset it to the head
+    Stash {
+        #[command(subcommand)]
+        sub: StashCmd,
+    },
+    /// Manage hooks that run before and after a commit
+    Hook {
+        #[command(subcommand)]
+        sub: HookCmd,
+    },
     /// Undo the last operation (like git reset but reversible both ways)
     Undo,
     /// Undo the effect of one changeset by recording a new one
@@ -280,6 +292,44 @@ enum ChangesetCmd {
     Diff { id: String },
     /// List pending changesets
     List,
+}
+
+#[derive(Subcommand)]
+enum StashCmd {
+    /// Save the working tree aside and reset it to the head
+    Save {
+        #[arg(long, default_value = "wip")]
+        message: String,
+        #[arg(long, default_value = "agent")]
+        author: String,
+    },
+    /// List saved stashes, newest first
+    List,
+    /// Write the newest stash back, or a chosen one by id
+    Pop {
+        #[arg(long)]
+        id: Option<i64>,
+    },
+    /// Delete a stash without applying it
+    Drop {
+        #[arg(long)]
+        id: Option<i64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum HookCmd {
+    /// List the hooks and whether each one is installed
+    List,
+    /// Write a hook from a file or from standard input
+    Install {
+        name: String,
+        /// Path to a script. Without it, the body is read from standard input.
+        #[arg(long)]
+        file: Option<String>,
+    },
+    /// Remove a hook
+    Remove { name: String },
 }
 
 #[derive(Subcommand)]
@@ -450,6 +500,8 @@ fn run() -> ZResult<()> {
         Cmd::Branch { sub } if json => cli::cmd_branch_json(sub),
         Cmd::Changeset { sub } if json => cli::cmd_changeset_json(sub),
         Cmd::Sparse { sub } => cli::cmd_sparse(sub),
+        Cmd::Stash { sub } => cli::cmd_stash(sub, json),
+        Cmd::Hook { sub } => cli::cmd_hook(sub),
         Cmd::Init { bare } => cli::cmd_init(bare),
         Cmd::Status => cli::cmd_status(),
         Cmd::Diff { changeset, name_only } => cli::cmd_diff(changeset.as_deref(), name_only),

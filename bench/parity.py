@@ -119,8 +119,95 @@ def main():
     out = sh(f"{GESTA} fsck", cwd=repo)
     check("fsck passes on a healthy repository", out.returncode == 0, out.stdout + out.stderr)
 
-    # 9. Things a daily user will look for and not find.
-    for missing in ("bisect", "rebase", "cherry-pick", "stash", "hooks", "submodule"):
+    # 9. Saving work aside without committing it.
+    with open(os.path.join(repo, "src", "a.txt"), "a") as fh:
+        fh.write("wip line\n")
+    with open(os.path.join(repo, "scratch.txt"), "w") as fh:
+        fh.write("temporary\n")
+    r = sh(f"{GESTA} stash save --message wip", cwd=repo)
+    check("stash saves the working tree", r.returncode == 0, r.stdout + r.stderr)
+    out = sh(f"{GESTA} status", cwd=repo).stdout
+    check("stash leaves a clean tree", "clean" in out.lower(), out)
+    check(
+        "stash removed the added file from disk",
+        not os.path.exists(os.path.join(repo, "scratch.txt")),
+    )
+    out = sh(f"{GESTA} stash list", cwd=repo).stdout
+    check("stash list shows the entry", "wip" in out, out)
+    r = sh(f"{GESTA} stash pop", cwd=repo)
+    check("stash pop restores the work", r.returncode == 0, r.stdout + r.stderr)
+    restored = open(os.path.join(repo, "src", "a.txt")).read()
+    check("the stashed edit is back", "wip line" in restored, restored)
+    check(
+        "the stashed new file is back",
+        os.path.exists(os.path.join(repo, "scratch.txt")),
+    )
+
+    # Pop must refuse rather than overwrite a local change.
+    with open(os.path.join(repo, "src", "a.txt"), "a") as fh:
+        fh.write("second wip\n")
+    sh(f"{GESTA} stash save --message second", cwd=repo)
+    with open(os.path.join(repo, "src", "a.txt"), "a") as fh:
+        fh.write("local only\n")
+    out = sh(f"{GESTA} stash pop", cwd=repo).stdout
+    check("stash pop refuses over a local change", "not applied" in out, out)
+    check(
+        "the local change survives the refusal",
+        "local only" in open(os.path.join(repo, "src", "a.txt")).read(),
+    )
+
+    # 10. Hooks.
+    out = sh(f"{GESTA} hook list", cwd=repo).stdout
+    check("hook list names pre-commit", "pre-commit" in out, out)
+
+    hook = os.path.join(ROOT, "refuse.sh")
+    with open(hook, "w") as fh:
+        fh.write("#!/bin/sh\necho refusing on purpose >&2\nexit 1\n")
+    sh(f"{GESTA} hook install pre-commit --file {hook}", cwd=repo)
+    with open(os.path.join(repo, "src", "a.txt"), "a") as fh:
+        fh.write("hook test\n")
+    r = sh(f"{GESTA} changeset create hooktest --author bench", cwd=repo)
+    m = re.search(r"\b(cs[0-9a-f]{6,})\b", r.stdout)
+    head_before = sh(f"{GESTA} status", cwd=repo).stdout
+    if m:
+        r = sh(f"{GESTA} changeset commit {m.group(1)}", cwd=repo)
+        check("a failing pre-commit hook blocks the commit", r.returncode != 0, r.stdout + r.stderr)
+    else:
+        check("a failing pre-commit hook blocks the commit", False, r.stdout)
+    head_after = sh(f"{GESTA} status", cwd=repo).stdout
+    check(
+        "the blocked commit left the head unchanged",
+        [l for l in head_before.splitlines() if "HEAD" in l]
+        == [l for l in head_after.splitlines() if "HEAD" in l],
+        head_after,
+    )
+
+    passing = os.path.join(ROOT, "pass.sh")
+    with open(passing, "w") as fh:
+        fh.write("#!/bin/sh\nexit 0\n")
+    sh(f"{GESTA} hook install pre-commit --file {passing}", cwd=repo)
+    if m:
+        r = sh(f"{GESTA} changeset commit {m.group(1)}", cwd=repo)
+        check("a passing pre-commit hook lets the commit through", r.returncode == 0, r.stdout + r.stderr)
+
+    failing_post = os.path.join(ROOT, "post.sh")
+    with open(failing_post, "w") as fh:
+        fh.write("#!/bin/sh\nprintenv > /dev/null\nexit 9\n")
+    sh(f"{GESTA} hook install post-commit --file {failing_post}", cwd=repo)
+    with open(os.path.join(repo, "src", "a.txt"), "a") as fh:
+        fh.write("post test\n")
+    r = sh(f"{GESTA} changeset create posttest --author bench", cwd=repo)
+    m2 = re.search(r"\b(cs[0-9a-f]{6,})\b", r.stdout)
+    if m2:
+        r = sh(f"{GESTA} changeset commit {m2.group(1)}", cwd=repo)
+        check("a failing post-commit hook reports failure", r.returncode != 0, r.stdout + r.stderr)
+        log = sh(f"{GESTA} log --limit 1", cwd=repo).stdout
+        check("the commit survives a failing post-commit hook", "posttest" in log, log)
+    sh(f"{GESTA} hook remove pre-commit", cwd=repo)
+    sh(f"{GESTA} hook remove post-commit", cwd=repo)
+
+    # 11. Things a daily user will look for and not find.
+    for missing in ("bisect", "rebase", "cherry-pick", "submodule"):
         r = sh(f"{GESTA} {missing} --help", cwd=repo)
         check(f"{missing} is absent (known gap)", r.returncode != 0)
 

@@ -330,8 +330,18 @@ pub fn cmd_changeset_create(message: &str, author: &str) -> ZResult<()> {
 }
 
 pub fn cmd_changeset_commit(id: &str) -> ZResult<()> {
-    let (_root, conn) = open_repo()?;
+    let (root, conn) = open_repo()?;
+    // The hook runs before anything is written, so a refusal leaves the
+    // repository exactly as it was. A hook that ran afterwards could only report
+    // a commit that already happened.
+    crate::hooks::run(&root, "pre-commit", &["commit", id])?;
     let n = store::with_retry(|| repo::commit_one(&conn, id))?;
+    if n > 0 {
+        // A post-commit failure is reported but does not undo the commit: the
+        // commit is durable, and rolling it back here would leave the store and
+        // the message disagreeing. The error still propagates so a caller knows.
+        crate::hooks::run(&root, "post-commit", &["commit", id])?;
+    }
     if n == 0 {
         println!("changeset {} already committed", id);
     } else {
@@ -1146,5 +1156,135 @@ pub fn dispatch_changeset_text(sub: crate::ChangesetCmd) -> ZResult<()> {
         crate::ChangesetCmd::CommitAll => cmd_changeset_commit_all(),
         crate::ChangesetCmd::Diff { id } => cmd_changeset_diff(&id),
         crate::ChangesetCmd::List => cmd_changeset_list(),
+    }
+}
+
+pub fn cmd_stash(sub: crate::StashCmd, json: bool) -> ZResult<()> {
+    use crate::StashCmd;
+    match sub {
+        StashCmd::Save { message, author } => {
+            let (root, conn) = open_repo()?;
+            let (id, n) = crate::stash::save(&conn, &root, &message, &author)?;
+            if n == 0 {
+                println!("nothing to stash: the working tree matches the head");
+                return Ok(());
+            }
+            if json {
+                println!(
+                    "{{\"id\":{},\"files\":{},\"message\":\"{}\"}}",
+                    id,
+                    n,
+                    message.replace('"', "\\\"")
+                );
+            } else {
+                println!("saved stash {} ({} file(s)): {}", id, n, message);
+                println!("the working tree is back at the head");
+            }
+            Ok(())
+        }
+        StashCmd::List => {
+            let (_root, conn) = open_repo()?;
+            let all = crate::stash::list(&conn)?;
+            if json {
+                let mut parts = Vec::new();
+                for s in &all {
+                    parts.push(format!(
+                        "{{\"id\":{},\"message\":\"{}\",\"files\":{},\"created_at\":{}}}",
+                        s.id,
+                        s.message.replace('"', "\\\""),
+                        s.files.len(),
+                        s.created_at
+                    ));
+                }
+                println!("[{}]", parts.join(","));
+                return Ok(());
+            }
+            if all.is_empty() {
+                println!("no stashes");
+                return Ok(());
+            }
+            for s in &all {
+                println!(
+                    "stash {}  {}  {} file(s)  {}",
+                    s.id,
+                    fmt_ts(s.created_at),
+                    s.files.len(),
+                    s.message
+                );
+            }
+            Ok(())
+        }
+        StashCmd::Pop { id } => {
+            let (root, conn) = open_repo()?;
+            let (s, written, blocked) = crate::stash::pop(&conn, &root, id)?;
+            if !blocked.is_empty() {
+                // Refusing is the safe answer: writing over a path the working
+                // tree has changed would destroy work that was never recorded.
+                println!("stash {} not applied: these paths have local changes", s.id);
+                for p in &blocked {
+                    println!("  {}", p);
+                }
+                println!("commit or restore them first, then pop again");
+                return Ok(());
+            }
+            println!("applied stash {} ({} file(s)): {}", s.id, written, s.message);
+            Ok(())
+        }
+        StashCmd::Drop { id } => {
+            let (_root, conn) = open_repo()?;
+            let target = match id {
+                Some(i) => i,
+                None => {
+                    let all = crate::stash::list(&conn)?;
+                    all.first()
+                        .map(|s| s.id)
+                        .ok_or_else(|| bad("no stash to drop".to_string()))?
+                }
+            };
+            crate::stash::drop_stash(&conn, target)?;
+            println!("dropped stash {}", target);
+            Ok(())
+        }
+    }
+}
+
+pub fn cmd_hook(sub: crate::HookCmd) -> ZResult<()> {
+    use crate::HookCmd;
+    match sub {
+        HookCmd::List => {
+            let (root, _conn) = open_repo()?;
+            for (name, installed) in crate::hooks::list(&root) {
+                println!("{}  {}", if installed { "installed" } else { "absent   " }, name);
+            }
+            Ok(())
+        }
+        HookCmd::Install { name, file } => {
+            let (root, _conn) = open_repo()?;
+            let body = match file {
+                Some(path) => std::fs::read_to_string(&path)
+                    .map_err(|e| bad(format!("cannot read {}: {}", path, e)))?,
+                None => {
+                    use std::io::Read;
+                    let mut buf = String::new();
+                    std::io::stdin().read_to_string(&mut buf)?;
+                    buf
+                }
+            };
+            if body.trim().is_empty() {
+                return Err(bad("a hook needs a body: pass --file or write it on stdin"));
+            }
+            let path = crate::hooks::install(&root, &name, &body)?;
+            println!("installed {} at {}", name, path.display());
+            Ok(())
+        }
+        HookCmd::Remove { name } => {
+            let (root, _conn) = open_repo()?;
+            if crate::hooks::remove(&root, &name)? {
+                println!("removed {}", name);
+            } else {
+                println!("{} was not installed", name);
+            }
+            Ok(())
+        }
     }
 }

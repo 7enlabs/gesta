@@ -49,6 +49,13 @@ gesta blame src/main.rs
 | `show [<rev>:]<file>` | File content at a changeset or branch |
 | `checkout <file \| .> [--changeset <id>]` | Materialise files from history |
 | `restore <file \| .>` | Discard uncommitted changes |
+| `stash save [--message M]` | Save the working tree aside and reset to the head |
+| `stash list` | Saved stashes, newest first |
+| `stash pop [--id N]` | Write a stash back, refusing over local changes |
+| `stash drop [--id N]` | Delete a stash without applying it |
+| `hook list` | Which hooks are installed |
+| `hook install <name> [--file F]` | Write a hook, reading stdin when no file is given |
+| `hook remove <name>` | Remove a hook |
 | `undo` | Undo the last operation |
 | `ops [--limit N]` | Operation log |
 | `tag <name> [--list]` | Named pointer to a changeset |
@@ -63,6 +70,21 @@ gesta blame src/main.rs
 | `fsck [--prune]` | Verify integrity, optionally drop orphan objects |
 | `stats` | Object counts and compression ratio |
 | `ignore add/list/remove` | Ignore patterns |
+
+### Hooks
+
+A hook is a program in `.gesta/hooks/`. Two are supported:
+
+- `pre-commit` runs before anything is written. A non-zero exit stops the
+  commit and leaves the repository untouched, so a refusal cannot half-apply.
+- `post-commit` runs after the commit is durable. A non-zero exit is reported
+  but does not undo the commit, because rolling back a finished write would make
+  the store and the report disagree.
+
+Both receive the operation and the changeset id as arguments, and run with the
+repository root as the working directory. Nothing runs unless a file with the
+hook name exists, so a fresh repository executes nothing it did not ask for.
+
 
 Every read command takes `--json` (status, log, blame, history, diff, tag, ops, branch list, changeset list). Show commands print text by default because a terminal is still the common case.
 
