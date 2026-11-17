@@ -252,10 +252,40 @@ Two rules keep it safe. A delta is kept only when it is smaller than the compres
 
 Measured on a 558 KB file edited one line fifty times: 1,504 KB before, 692 KB after, against git's 886 KB for the same history. That is 0.78x git, the first shape where a tree of this kind costs less than a packfile.
 
+## Release gate
+
+`bench/gate.py` is the single command that decides whether a version may be published. Thirteen steps, each a real command with a real exit code:
+
+```bash
+python3 bench/gate.py            # all steps
+python3 bench/gate.py audit      # one step
+```
+
+| Step | Fails when |
+|---|---|
+| build | the release build does not finish |
+| test | any unit test fails |
+| clippy | any warning appears |
+| audit | `cargo audit` reports an advisory |
+| osv | `osv-scanner` reports an issue |
+| coverage | line coverage drops below 55% |
+| panics | `unwrap`, `expect`, `panic!`, `unreachable!` or `todo!` appears in production code |
+| secrets | a key-shaped string or a credential assignment appears in `src` |
+| paths | the guard against `../` in a remote path is gone |
+| sql | SQL is assembled with `format!` outside the one placeholder helper |
+| suites | any of the nine end to end suites fails |
+| bughunter | an adversarial scenario fails |
+
+Two of these exist because the first run of the gate found a real defect, which is the point of having it.
+
+Dependency advisories found on the first run and closed: RUSTSEC-2026-0459 in the bundled SQLite (rusqlite 0.32 to 0.43) and RUSTSEC-2025-0134, an unmaintained PEM parser. The PEM parser is now in `tls.rs`, with eight tests on the base64 decoder because that is the kind of code that fails quietly.
+
+Line coverage, measured with `cargo-llvm-cov --release --summary-only`: 60.64%. `cli.rs` and `cli_remote.rs` show 0% because unit tests never call them; the bench suites run the real binary instead, which is why the gate includes them.
+
 ## Verification
 
 ```bash
-cargo test --release              # 173 unit tests
+cargo test --release              # 184 unit tests
 python3 bench/replace_git.py      # 20 end to end capability checks
 python3 bench/http_remote.py      # 11 checks over a real socket
 python3 bench/http_auth.py        # 18 checks on tokens and roles
@@ -266,6 +296,7 @@ python3 bench/conflicts.py        # 13 checks on structured conflict reports
 python3 bench/sparse.py           # 16 checks on sparse checkout safety
 python3 bench/tls.py              # 12 checks on TLS, including refusals
 python3 bench/delta_vs_git.py     # disk usage against git on a long edit history
+python3 bench/gate.py             # the release gate: 13 steps, exits non-zero on any failure
 python3 bench/size_compare.py     # disk usage against git
 python3 bench/bench.py            # speed baseline
 ```
