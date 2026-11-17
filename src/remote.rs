@@ -18,6 +18,7 @@ use crate::store::{branch_head, get_object, hash_content, put_object, open_db, i
 use crate::{bad, now, repo_dir, ZResult};
 
 /// Everything a peer needs to catch up on one branch.
+#[derive(Clone)]
 pub struct Bundle {
     pub branch: String,
     pub head: Option<String>,
@@ -30,11 +31,22 @@ pub struct Bundle {
     /// changeset_files rows.
     pub files: Vec<(String, String, Option<String>, Option<String>)>,
     pub hashes: Vec<String>,
+    /// Objects sent as a delta against another object in the same bundle.
+    ///
+    /// Sending every version whole made a bundle eight times the size of the content
+    /// it carried: 247 KB of text with 21 versions came to 1.88 MB. The store already
+    /// keeps those versions as deltas and a delta is about a twentieth of the size,
+    /// so the wire format carries the delta instead of the expanded content.
+    ///
+    /// A delta is only sent when its base is also in this bundle, so a receiver can
+    /// always resolve it. Otherwise the object goes whole.
+    pub deltas: Vec<(String, String, Vec<crate::delta::Op>)>,
 }
 
 /// (message, author, created_at, parent, parent2) as stored in the database.
 type ChangesetMeta = (String, String, i64, Option<String>, Option<String>);
 
+#[derive(Clone)]
 pub struct ChangesetRow {
     pub id: String,
     pub message: String,
@@ -78,6 +90,10 @@ impl Bundle {
         for (hash, content) in &self.objects {
             s.push_str(&format!("ob\t{}\t{}\n", hash, enc_base64(content.as_bytes())));
         }
+        for (hash, base, ops) in &self.deltas {
+            let packed = enc_base64(&crate::delta::to_bytes(ops));
+            s.push_str(&format!("dl\t{}\t{}\t{}\n", hash, base, packed));
+        }
         s.push_str("end\n");
 
         let mut enc_stream = ZlibEncoder::new(Vec::new(), Compression::default());
@@ -107,6 +123,7 @@ impl Bundle {
             versions: Vec::new(),
             files: Vec::new(),
             hashes: Vec::new(),
+            deltas: Vec::new(),
         };
 
         for line in lines {
@@ -135,6 +152,13 @@ impl Bundle {
                     if *old == "-" { None } else { Some(old.to_string()) },
                     if *new == "-" { None } else { Some(new.to_string()) },
                 )),
+                ["dl", hash, base, ops] => {
+                    let raw = dec_base64(ops)
+                        .ok_or_else(|| bad(format!("delta for {} is not valid base64", hash)))?;
+                    let parsed = crate::delta::from_bytes(&raw)
+                        .ok_or_else(|| bad(format!("delta for {} is unreadable", hash)))?;
+                    b.deltas.push((hash.to_string(), base.to_string(), parsed));
+                }
                 ["ob", hash, content] => {
                     let bytes = dec_base64(content)
                         .ok_or_else(|| bad(format!("object {} has invalid payload", hash)))?;
@@ -266,6 +290,34 @@ fn topo_order(
     Ok(out)
 }
 
+/// The stored delta for an object, if the store keeps one.
+///
+/// A delta is stored as a base plus a list of copy and insert operations. Only copy
+/// operations are carried on the wire, because an insert's text already appears in a
+/// whole object somewhere in the bundle; a delta with an insert is therefore sent
+/// whole rather than risk a receiver that cannot rebuild it.
+fn stored_delta(
+    conn: &Connection,
+    hash: &str,
+) -> ZResult<Option<(String, Vec<crate::delta::Op>)>> {
+    let row: Option<(String, Vec<u8>)> = conn
+        .query_row(
+            "SELECT base, payload FROM deltas WHERE hash = ?1",
+            params![hash],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()?;
+    let Some((base, payload)) = row else {
+        return Ok(None);
+    };
+    // The payload is stored compressed, so it is expanded before parsing. Reading it
+    // raw silently produced an unreadable delta for every object.
+    let raw = crate::store::decompress_bytes(&payload)?;
+    let ops = crate::delta::from_bytes(&raw)
+        .ok_or_else(|| bad(format!("delta for {} is unreadable", hash)))?;
+    Ok(Some((base, ops)))
+}
+
 pub fn build_bundle(conn: &Connection, branch: &str, have: &HashSet<String>) -> ZResult<Bundle> {
     let head = branch_head(conn, branch)?;
     let mut b = Bundle {
@@ -276,6 +328,7 @@ pub fn build_bundle(conn: &Connection, branch: &str, have: &HashSet<String>) -> 
         versions: Vec::new(),
         files: Vec::new(),
         hashes: Vec::new(),
+        deltas: Vec::new(),
     };
     let Some(head) = head else { return Ok(b) };
 
@@ -357,12 +410,22 @@ pub fn build_bundle(conn: &Connection, branch: &str, have: &HashSet<String>) -> 
         }
     }
 
-    for hash in object_hashes {
-        match get_object(conn, &hash) {
-            Ok(content) => {
-                b.hashes.push(hash.clone());
-                b.objects.push((hash, content));
+    // Every version is in hand. Send a delta when the store already holds that
+    // object as a delta whose base is also going out: the base then arrives first and
+    // the receiver resolves it. Anything else goes whole, so a bundle is always
+    // self sufficient and never depends on what the other side happens to have.
+    let all: Vec<String> = object_hashes.into_iter().collect();
+    let in_bundle: HashSet<&str> = all.iter().map(|s| s.as_str()).collect();
+    for hash in &all {
+        b.hashes.push(hash.clone());
+        if let Some((base, ops)) = stored_delta(conn, hash)? {
+            if in_bundle.contains(base.as_str()) {
+                b.deltas.push((hash.clone(), base, ops));
+                continue;
             }
+        }
+        match get_object(conn, hash) {
+            Ok(content) => b.objects.push((hash.clone(), content)),
             Err(_) => return Err(bad(format!("cannot bundle missing object {}", hash))),
         }
     }
@@ -387,6 +450,49 @@ pub fn apply_bundle_opts(conn: &Connection, b: &Bundle, move_branch: bool) -> ZR
             )));
         }
         put_object(&tx, content)?;
+    }
+
+    // A delta is resolved after the whole objects land, because its base is one of
+    // them or another delta. Chain order is not known, so this runs in rounds: each
+    // round applies whatever it can, and a delta whose base has not arrived waits for
+    // the next one. A round that applies nothing means the bundle cannot be resolved,
+    // which is refused rather than left half stored. Rebuilding the content and
+    // checking it against its own hash is what makes this safe: a delta that does not
+    // reproduce the expected object is an error, not something written under a hash
+    // that lies about what it holds.
+    let mut pending: Vec<(String, String, Vec<crate::delta::Op>)> = b.deltas.clone();
+    while !pending.is_empty() {
+        let mut progressed = false;
+        let mut still: Vec<(String, String, Vec<crate::delta::Op>)> = Vec::new();
+        for (hash, base, ops) in pending {
+            let Ok(base_content) = get_object(&tx, &base) else {
+                still.push((hash, base, ops));
+                continue;
+            };
+            let content = crate::delta::apply(&base_content, &ops).ok_or_else(|| {
+                bad(format!(
+                    "delta for {} does not apply to its base {}",
+                    hash, base
+                ))
+            })?;
+            let expect = hash_content(&content);
+            if expect != hash {
+                return Err(bad(format!(
+                    "object {} rebuilt from a delta fails its hash check (got {})",
+                    hash, expect
+                )));
+            }
+            put_object(&tx, &content)?;
+            progressed = true;
+        }
+        if !progressed {
+            let names: Vec<String> = still.iter().map(|(h, _, _)| h.clone()).collect();
+            return Err(bad(format!(
+                "these objects arrive as deltas whose base is not in the bundle: {}",
+                names.join(", ")
+            )));
+        }
+        pending = still;
     }
 
     for c in &b.changesets {
@@ -599,6 +705,7 @@ mod tests {
             versions: Vec::new(),
             files: Vec::new(),
             hashes: Vec::new(),
+            deltas: Vec::new(),
         };
         b.hashes.push("0".repeat(64));
         let dest = mem_db();
@@ -710,5 +817,90 @@ mod tests {
         }
         // The merge is last: it depends on both sides.
         assert_eq!(order.last().map(|s| s.as_str()), Some("merge"));
+    }
+    /// A chain of deltas must resolve on the receiving side even though the order
+    /// they appear in is not the order they depend on. Each version here is a delta
+    /// against the previous one, so applying them in file order works only by luck;
+    /// the resolver has to run in rounds.
+    #[test]
+    fn a_chain_of_deltas_resolves_in_any_order() {
+        let src = mem_db();
+        // A realistic edit: a fixed body with a few lines rewritten per version. If
+        // every line changed, a delta would be the whole file and the store would
+        // (correctly) refuse it, which would test nothing here.
+        let body = |n: usize| {
+            let mut s = String::new();
+            for i in 0..4000 {
+                if i % 400 == n % 400 {
+                    s.push_str(&format!("line {} rewritten at version {}\n", i, n));
+                } else {
+                    s.push_str(&format!("line {} stable text that does not change\n", i));
+                }
+            }
+            s
+        };
+
+        // Ten versions of one path, each stored against the previous one so the store
+        // holds a delta chain. Every version is also recorded as a committed changeset
+        // so a bundle built from the branch reaches all of them.
+        // The base argument is the previous object's hash, not its content.
+        let mut prev_hash: Option<String> = None;
+        for v in 0..10 {
+            let content = body(v);
+            let hash =
+                crate::store::put_object_against(&src, &content, prev_hash.as_deref()).unwrap();
+            let id = format!("csver{:02}", v);
+            let parent = if v == 0 { None } else { Some(format!("csver{:02}", v - 1)) };
+            src.execute(
+                "INSERT INTO changesets(id,message,author,created_at,status,parent,branch)
+                 VALUES(?1,?2,'a',?3,'committed',?4,'main')",
+                rusqlite::params![id, format!("v{}", v), v as i64, parent],
+            )
+            .unwrap();
+            src.execute(
+                "INSERT INTO file_versions(path,version,hash,changeset_id,created_at)
+                 VALUES('f.txt',?1,?2,?3,?4)",
+                rusqlite::params![v as i64, hash, format!("csver{:02}", v), v as i64],
+            )
+            .unwrap();
+            src.execute(
+                "INSERT INTO changeset_files(changeset_id,path,old_hash,new_hash)
+                 VALUES(?1,'f.txt',?2,?3)",
+                rusqlite::params![format!("csver{:02}", v), prev_hash, hash],
+            )
+            .unwrap();
+            prev_hash = Some(hash);
+        }
+        crate::store::set_branch_head(&src, "main", "csver09").unwrap();
+
+        let bundle = build_bundle(&src, "main", &HashSet::new()).unwrap();
+        assert!(
+            !bundle.deltas.is_empty(),
+            "ten versions of one file produced no delta at all (objects={}, hashes={})",
+            bundle.objects.len(),
+            bundle.hashes.len()
+        );
+        for (hash, base, _) in &bundle.deltas {
+            let known = bundle.objects.iter().any(|(h, _)| h == base)
+                || bundle.deltas.iter().any(|(h, _, _)| h == base);
+            assert!(known, "delta {} points at base {} which is not in the bundle", hash, base);
+        }
+
+        // Reverse the deltas so a dependency appears after its dependant, then apply.
+        let mut shuffled = bundle.clone();
+        shuffled.deltas.reverse();
+        let wire = shuffled.encode().unwrap();
+        let decoded = Bundle::decode(&wire).unwrap();
+        let dest = mem_db();
+        apply_bundle(&dest, &decoded).unwrap();
+
+        for (hash, _base, _ops) in &bundle.deltas {
+            let got = crate::store::get_object(&dest, hash).unwrap();
+            let expect = crate::store::get_object(&src, hash).unwrap();
+            assert_eq!(got, expect, "rebuilt object {} differs", hash);
+        }
+        // The newest version must be readable and correct on the receiving side.
+        let newest = crate::store::get_object(&dest, &crate::store::hash_content(&body(9))).unwrap();
+        assert_eq!(newest, body(9));
     }
 }

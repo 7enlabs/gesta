@@ -319,7 +319,7 @@ fn compress_bytes(data: &[u8]) -> ZResult<Vec<u8>> {
     Ok(enc.finish()?)
 }
 
-fn decompress_bytes(blob: &[u8]) -> ZResult<Vec<u8>> {
+pub fn decompress_bytes(blob: &[u8]) -> ZResult<Vec<u8>> {
     let mut dec = ZlibDecoder::new(blob);
     let mut out = Vec::new();
     dec.read_to_end(&mut out)?;
