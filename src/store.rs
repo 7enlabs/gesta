@@ -331,24 +331,6 @@ pub fn put_object_against(
     Ok(h)
 }
 
-/// Read the delta base chain for a hash, following up to 8 levels.
-pub fn delta_chain(conn: &Connection, hash: &str) -> ZResult<Vec<String>> {
-    let mut chain = vec![hash.to_string()];
-    let mut cur = hash.to_string();
-    for _ in 0..8 {
-        let base: Option<String> = conn
-            .query_row("SELECT base FROM deltas WHERE hash = ?1", params![cur], |r| r.get(0))
-            .optional()?;
-        match base {
-            Some(b) => {
-                chain.push(b.clone());
-                cur = b;
-            }
-            None => break,
-        }
-    }
-    Ok(chain)
-}
 
 /// Number of objects stored as deltas, and the bytes they save.
 pub fn delta_stats(conn: &Connection) -> ZResult<(i64, i64)> {
@@ -381,37 +363,45 @@ pub fn delta_stats(conn: &Connection) -> ZResult<(i64, i64)> {
 }
 
 pub fn get_object(conn: &Connection, hash: &str) -> ZResult<String> {
-    let chain = delta_chain(conn, hash)?;
+    // A stored object is either whole, or a delta against another object. The
+    // base may itself be a delta, so this recurses through get_object rather
+    // than reading the base's row directly: reading the row of a delta base
+    // returns an empty body, which is exactly how a nested delta silently
+    // stopped applying.
+    let payload: Option<Vec<u8>> = conn
+        .query_row("SELECT payload FROM deltas WHERE hash = ?1", params![hash], |r| r.get(0))
+        .optional()?;
 
-    // Walk from the deepest base outwards: a chain is only ever one delta deep
-    // in practice, but the loop costs nothing and handles nesting.
-    let mut content: Option<String> = None;
-    for (i, h) in chain.iter().enumerate().rev() {
-        if i == 0 && chain.len() > 1 {
-            // The requested object: apply its delta to what the base produced.
-            let base = content
-                .take()
-                .ok_or_else(|| bad(format!("delta chain for {} is broken", hash)))?;
-            let payload: Vec<u8> = conn
-                .query_row("SELECT payload FROM deltas WHERE hash = ?1", params![h], |r| r.get(0))
-                .optional()?
-                .ok_or_else(|| bad(format!("delta for {} vanished", h)))?;
-            let raw = decompress_bytes(&payload)?;
-            let ops = crate::delta::from_bytes(&raw)
-                .ok_or_else(|| bad(format!("delta for {} is malformed", h)))?;
-            let rebuilt = crate::delta::apply(&base, &ops)
-                .ok_or_else(|| bad(format!("delta for {} does not apply to its base", h)))?;
-            // The hash is the contract. A rebuild that does not match means the
-            // store is corrupt, and returning the wrong bytes would hide it.
-            if hash_content(&rebuilt) != *hash {
-                return Err(bad(format!("rebuilt object {} does not match its hash", hash)));
-            }
-            return Ok(rebuilt);
-        }
-        content = Some(read_whole(conn, h)?);
+    let Some(packed) = payload else {
+        return read_whole(conn, hash);
+    };
+
+    let base_hash: String = conn.query_row(
+        "SELECT base FROM deltas WHERE hash = ?1",
+        params![hash],
+        |r| r.get(0),
+    )?;
+    let base = get_object(conn, &base_hash)?;
+
+    let raw = decompress_bytes(&packed)?;
+    let ops = crate::delta::from_bytes(&raw)
+        .ok_or_else(|| bad(format!("delta for {} is malformed", hash)))?;
+    let rebuilt = crate::delta::apply(&base, &ops).ok_or_else(|| {
+        bad(format!(
+            "delta for {} does not apply to its base {}",
+            hash, base_hash
+        ))
+    })?;
+
+    // The hash is the contract. A rebuild that does not match means the store is
+    // corrupt, and returning the wrong bytes would hide it.
+    if hash_content(&rebuilt) != hash {
+        return Err(bad(format!(
+            "rebuilt object {} does not match its hash",
+            hash
+        )));
     }
-
-    content.ok_or_else(|| bad(format!("object {} not found (store may be corrupted)", hash)))
+    Ok(rebuilt)
 }
 
 fn read_whole(conn: &Connection, hash: &str) -> ZResult<String> {
@@ -1013,5 +1003,74 @@ pub(crate) mod tests {
             .query_row(&sql, params![ids[0]], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn a_delta_whose_base_is_itself_a_delta_still_reads_back() {
+        // The first edit stores a delta against v0. The second edit stores a
+        // delta against the first delta. Reading the second must follow the
+        // chain: reading the base's row directly returns an empty body, and the
+        // rebuild then fails or produces the wrong bytes. This is regression
+        // number one for the delta layer.
+        let conn = mem_db();
+        let v0: String = (0..200).map(|i| format!("line {}\n", i)).collect();
+        let h0 = put_object(&conn, &v0).unwrap();
+
+        let mut lines: Vec<String> = v0.lines().map(|s| s.to_string()).collect();
+        lines[100] = "changed once".to_string();
+        let v1 = lines.join("\n") + "\n";
+        let h1 = put_object_against(&conn, &v1, Some(&h0)).unwrap();
+
+        lines[100] = "changed twice".to_string();
+        let v2 = lines.join("\n") + "\n";
+        let h2 = put_object_against(&conn, &v2, Some(&h1)).unwrap();
+
+        assert_eq!(get_object(&conn, &h1).unwrap(), v1, "first delta");
+        assert_eq!(get_object(&conn, &h2).unwrap(), v2, "nested delta");
+        assert_eq!(get_object(&conn, &h0).unwrap(), v0, "base still whole");
+    }
+
+    #[test]
+    fn thirty_successive_edits_all_read_back() {
+        // The bench that found the nested-delta defect drove thirty edits. Each
+        // one has to read back exactly, not just the last.
+        let conn = mem_db();
+        let mut lines: Vec<String> = (0..300).map(|i| format!("line {}\n", i)).collect();
+        let mut contents = vec![lines.join("")];
+        let mut hashes = vec![put_object(&conn, &contents[0]).unwrap()];
+
+        for round in 1..=30 {
+            lines[150] = format!("edited round {}\n", round);
+            let text = lines.join("");
+            let prev = hashes.last().unwrap().clone();
+            let h = put_object_against(&conn, &text, Some(&prev)).unwrap();
+            contents.push(text);
+            hashes.push(h);
+        }
+
+        for (i, h) in hashes.iter().enumerate() {
+            assert_eq!(
+                get_object(&conn, h).unwrap(),
+                contents[i],
+                "version {} did not read back",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn a_corrupt_delta_is_an_error_not_wrong_content() {
+        let conn = mem_db();
+        let v0: String = (0..100).map(|i| format!("l{}\n", i)).collect();
+        let h0 = put_object(&conn, &v0).unwrap();
+        let mut lines: Vec<String> = v0.lines().map(|s| s.to_string()).collect();
+        lines[50] = "changed".to_string();
+        let v1 = lines.join("\n") + "\n";
+        let h1 = put_object_against(&conn, &v1, Some(&h0)).unwrap();
+
+        // Corrupt the payload in place.
+        conn.execute("UPDATE deltas SET payload = X'00' WHERE hash = ?1", params![h1])
+            .unwrap();
+        assert!(get_object(&conn, &h1).is_err(), "corruption must not be silent");
     }
 }

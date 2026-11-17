@@ -141,6 +141,29 @@ def main():
                 bad.append(f"{f}:{line} {m.group(0)[:40]}")
         record("no SQL built by string formatting", not bad, "\n".join(bad[:10]))
 
+    if want("pipe"):
+        # A tool that writes to stdout gets piped into `head` constantly. A panic
+        # on the closed pipe prints a stack trace from the standard library,
+        # which looks like a crash in the tool. git exits silently, so this
+        # must too.
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        sh(f"{ZF} init", cwd=tmp)
+        for i in range(300):
+            with open(os.path.join(tmp, f"f{i}.txt"), "w") as fh:
+                fh.write(f"content {i}\n")
+        sh(f"{ZF} changeset create seed --author t", cwd=tmp)
+        out = sh(f"{ZF} changeset list --json", cwd=tmp)[1]
+        cid = re.search(r"(cs[0-9a-f]+)", out)
+        if cid:
+            sh(f"{ZF} changeset commit {cid.group(1)}", cwd=tmp)
+        for i in range(300):
+            with open(os.path.join(tmp, f"f{i}.txt"), "w") as fh:
+                fh.write(f"changed {i}\n")
+        rc, out = sh(f"{ZF} status 2>&1 | head -2", cwd=tmp)
+        panicked = "panicked" in out or "Broken pipe" in out
+        record("a closed pipe does not panic", not panicked, out[:250])
+
     if want("suites"):
         suites = [
             "replace_git", "http_remote", "http_auth", "mcp_json", "api_changeset",

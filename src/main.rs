@@ -340,7 +340,34 @@ enum IgnoreCmd {
     Remove { pattern: String },
 }
 
+/// Exit quietly when the reader closed the pipe.
+///
+/// `println!` panics on a broken pipe, so `zenforge status | head -1` printed a
+/// panic message and a backtrace from inside the standard library. Every tool
+/// that writes to stdout is piped into something eventually, and git exits
+/// silently in the same situation, so a closed pipe is normal use rather than an
+/// error worth a stack trace.
+///
+/// Only a broken pipe is swallowed. Any other panic keeps the default message,
+/// because hiding a real bug would be worse than the noise.
+fn quiet_broken_pipe() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info.payload();
+        let text = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        if text.contains("Broken pipe") {
+            std::process::exit(0);
+        }
+        default(info);
+    }));
+}
+
 fn main() {
+    quiet_broken_pipe();
     if let Err(e) = run() {
         eprintln!("zenforge: {}", e);
         std::process::exit(1);

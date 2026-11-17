@@ -1,5 +1,5 @@
 
-import subprocess, os, shutil
+import subprocess, os, shutil, re
 
 ZF = "/work/zenforge/target/release/zenforge"
 N = 500
@@ -19,7 +19,7 @@ def workload(root, use_git):
         subprocess.run(["git","add","-A"], check=True); subprocess.run(["git","commit","-qm","v0"], check=True)
     else:
         o = subprocess.run([ZF,"changeset","create","v0","--author","b"], capture_output=True, text=True).stdout
-        cs = [w for w in o.split() if w.startswith("cs")][0]
+        cs = re.search(r"\b(cs[0-9a-f]{6,})\b", o).group(1)
         subprocess.run([ZF,"changeset","commit",cs], capture_output=True, check=True)
     for r in range(1,31):
         lines[200] = f"line 200: EDITED round {r}"
@@ -28,9 +28,12 @@ def workload(root, use_git):
             subprocess.run(["git","add","-A"], check=True); subprocess.run(["git","commit","-qm",f"e{r}"], check=True)
         else:
             o = subprocess.run([ZF,"changeset","create",f"e{r}","--author","b"], capture_output=True, text=True).stdout
-            cs = [w for w in o.split() if w.startswith("cs")][0]
+            cs = re.search(r"\b(cs[0-9a-f]{6,})\b", o).group(1)
             subprocess.run([ZF,"changeset","commit",cs], capture_output=True, check=True)
-    total = sum(os.path.getsize(os.path.join(dp,f)) for dp,_,fs in os.walk(".") for f in fs)
+    # Only the repository metadata counts. Summing the working tree would count
+    # the same file twice and say nothing about how the history is stored.
+    target = ".git" if use_git else ".zenforge"
+    total = sum(os.path.getsize(os.path.join(dp,f)) for dp,_,fs in os.walk(target) for f in fs)
     return total
 
 zf = workload("/tmp/zf_cmp2", False); os.chdir("/")
