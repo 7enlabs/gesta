@@ -1,4 +1,4 @@
-//! ZenForge — source control for AI agents.
+//! ZenForge: source control for AI agents.
 //!
 //! Server-side changesets, content-addressed compressed objects, derived blame
 //! and history, three-way merge, remote sync, and an operation log for undo.

@@ -431,8 +431,8 @@ mod tests {
     fn utf8_without_nul_is_text() {
         let tmp = tmpdir("utf8");
         let p = tmp.join("vi.txt");
-        fs::write(&p, "Tiếng Việt có dấu\n節点\n").unwrap();
-        assert_eq!(read_text(&p).unwrap(), "Tiếng Việt có dấu\n節点\n");
+        fs::write(&p, "Tiếng Việt có dấu\n\u{7bc0}\u{70b9}\n").unwrap();
+        assert_eq!(read_text(&p).unwrap(), "Tiếng Việt có dấu\n\u{7bc0}\u{70b9}\n");
         let _ = fs::remove_dir_all(&tmp);
     }
 }

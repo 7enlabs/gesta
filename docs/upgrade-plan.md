@@ -36,7 +36,7 @@ Same workload (a 500-line, 23 KB file, one line edited 30 times):
 
 Cause: every commit of a file writes the **whole file content** into `objects` as TEXT. git compresses and packs deltas. For an agent that edits large files thousands of times a day this cost is not ignorable.
 
-Measured in isolation: 30 edits of one line in a 23 KB file grew the database by 732 KB, about 24 KB per single-line edit — exactly the file size.
+Measured in isolation: 30 edits of one line in a 23 KB file grew the database by 732 KB, about 24 KB per single-line edit, which is exactly the file size.
 
 ## 2. Nine defects, ordered by damage
 
@@ -234,12 +234,19 @@ These are inferences, with no measurement or source behind them:
 
 ### Judgement
 
-ZenForge can now serve as the source control for a single developer or a set of
-agents working on one machine: every daily operation exists, merges are safe, and
-nothing is lost silently. It cannot yet replace git for a team, because there is
-no way to get the repository to another machine over a network. Calling it a git
-replacement today would be wrong; calling it usable for local agent work is
-accurate and now backed by 20 checks.
+ZenForge can serve as the source control for a single developer or a set of
+agents on one machine or on a trusted network. Every daily operation exists,
+merges are safe, and nothing is lost silently. A second machine can clone, push
+and pull over HTTP.
+
+It still cannot replace git for a team outside a trusted network. There is no
+TLS and no authentication, so anyone who can reach the port can push. Small file
+heavy trees cost 4.32x git in disk. Both are real blockers for shared use, and
+neither is a small change.
+
+Calling it a git replacement today would be wrong. Calling it usable for agent
+work on a trusted network is accurate, and that claim now rests on 67 unit tests,
+20 end-to-end checks and 11 checks over a real socket.
 
 
 ## 8. v0.3.1: HTTP remote
