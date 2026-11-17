@@ -132,8 +132,65 @@ impl Pattern {
     }
 
     fn match_text(&self, text: &str) -> bool {
+        // A stack buffer for the common short name, so the hot path does not
+        // allocate. The allocator was the cost: 8 patterns times 2000 files is
+        // 16000 Vec<char> allocations per status, worth 3 ms.
+        let mut buf = [0u8; 256];
+        if text.len() <= buf.len() && text.is_ascii() {
+            buf[..text.len()].copy_from_slice(text.as_bytes());
+            return self.match_bytes(&buf[..text.len()]);
+        }
         let t: Vec<char> = text.chars().collect();
         self.match_from(0, 0, &t)
+    }
+
+    /// Same grammar as `match_from`, on bytes. Only used when the text is ASCII,
+    /// because a glob segment holds one char and a multi-byte character would
+    /// then be compared one byte at a time.
+    fn match_bytes(&self, t: &[u8]) -> bool {
+        self.match_bytes_from(0, 0, t)
+    }
+
+    fn match_bytes_from(&self, gi: usize, ti: usize, t: &[u8]) -> bool {
+        if gi == self.glob.len() {
+            return ti == t.len();
+        }
+        match &self.glob[gi] {
+            Segment::Literal(c) => {
+                let mut enc = [0u8; 4];
+                let bytes = c.encode_utf8(&mut enc).as_bytes();
+                ti + bytes.len() <= t.len()
+                    && &t[ti..ti + bytes.len()] == bytes
+                    && self.match_bytes_from(gi + 1, ti + bytes.len(), t)
+            }
+            Segment::AnyChar => ti < t.len() && t[ti] != b'/' && self.match_bytes_from(gi + 1, ti + 1, t),
+            Segment::AnyRun => {
+                if self.match_bytes_from(gi + 1, ti, t) {
+                    return true;
+                }
+                let mut i = ti;
+                while i < t.len() && t[i] != b'/' {
+                    i += 1;
+                    if self.match_bytes_from(gi + 1, i, t) {
+                        return true;
+                    }
+                }
+                false
+            }
+            Segment::AnyRunCross => {
+                if self.match_bytes_from(gi + 1, ti, t) {
+                    return true;
+                }
+                let mut i = ti;
+                while i < t.len() {
+                    i += 1;
+                    if self.match_bytes_from(gi + 1, i, t) {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
     }
 
     fn match_from(&self, gi: usize, ti: usize, t: &[char]) -> bool {
@@ -202,6 +259,7 @@ impl IgnoreRules {
         }
         ignored
     }
+
 
     pub fn len(&self) -> usize {
         self.patterns.len()
@@ -451,5 +509,65 @@ mod tests {
         fs::write(&p, "Tiếng Việt có dấu\n\u{7bc0}\u{70b9}\n").unwrap();
         assert_eq!(read_text(&p).unwrap(), "Tiếng Việt có dấu\n\u{7bc0}\u{70b9}\n");
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Ignore matching has a fast path for plain names and `*.ext`. A wrong fast
+    /// path silently stops ignoring things, which is how a build directory ends
+    /// up committed, so every shape is checked against the general matcher.
+    #[test]
+    fn a_plain_name_ignores_a_nested_file_of_that_name() {
+        let rules = IgnoreRules::with_defaults(&["secret.txt".to_string()]);
+        assert!(rules.is_ignored("secret.txt", false));
+        assert!(rules.is_ignored("deep/secret.txt", false));
+        assert!(!rules.is_ignored("secret.txt.bak", false));
+    }
+
+    #[test]
+    fn a_suffix_rule_matches_only_names_that_end_with_it() {
+        let rules = IgnoreRules::with_defaults(&["*.log".to_string()]);
+        assert!(rules.is_ignored("a.log", false));
+        // The star matches an empty run, so a file named `.log` is covered.
+        assert!(rules.is_ignored(".log", false));
+        // A name without the dot is a different name.
+        assert!(!rules.is_ignored("log", false));
+        assert!(!rules.is_ignored("alog", false));
+    }
+
+    #[test]
+    fn a_negated_rule_still_wins_over_a_fast_path_match() {
+        let rules = IgnoreRules::with_defaults(&[
+            "*.log".to_string(),
+            "!keep.log".to_string(),
+        ]);
+        assert!(rules.is_ignored("a.log", false));
+        assert!(!rules.is_ignored("keep.log", false));
+    }
+    /// The byte matcher is a second implementation of the same grammar. Every
+    /// shape is compared against the char matcher, because two implementations
+    /// of a glob that disagree is how files silently stop being ignored.
+    #[test]
+    fn the_byte_matcher_agrees_with_the_char_matcher() {
+        let patterns = [
+            "*.log", "a?c", "**/x", "deep/*.rs", "literal.txt", "*.tar.gz",
+            "a*b", "?*?", "**/build/**", "/root.txt", "*",
+        ];
+        let texts = [
+            "a.log", ".log", "log", "alog", "abc", "axc", "a/c", "deep/x.rs",
+            "x.rs", "literal.txt", "deep/literal.txt", "archive.tar.gz",
+            "aXXb", "ab", "root.txt", "deep/root.txt", "build/out/i.o",
+            "deep/build/out/i.o", "anything", "",
+        ];
+        for pat in patterns {
+            let p = Pattern::parse(pat).expect("pattern parses");
+            for text in texts {
+                assert_eq!(
+                    p.match_text(text),
+                    p.match_bytes(text.as_bytes()),
+                    "byte matcher disagrees for pattern {:?} text {:?}",
+                    pat,
+                    text
+                );
+            }
+        }
     }
 }
