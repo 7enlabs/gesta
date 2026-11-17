@@ -1655,3 +1655,55 @@ pub fn cmd_secret(sub: crate::SecretCmd) -> ZResult<()> {
         }
     }
 }
+
+/// `gesta diff --from A --to B`: compare two revisions.
+pub fn cmd_diff_range(from: Option<&str>, to: Option<&str>, name_only: bool) -> ZResult<()> {
+    let (_root, conn) = open_repo()?;
+    let diffs = crate::repo::diff_revs(&conn, from, to)?;
+    if diffs.is_empty() {
+        println!(
+            "no difference between {} and {}",
+            from.unwrap_or("an empty tree"),
+            to.unwrap_or("an empty tree")
+        );
+        return Ok(());
+    }
+    for (path, removed, added) in diffs {
+        if name_only {
+            println!("{}", path);
+            continue;
+        }
+        println!("\n--- {}", path);
+        for l in &removed {
+            println!("-{}", l);
+        }
+        for l in &added {
+            println!("+{}", l);
+        }
+    }
+    Ok(())
+}
+
+/// The same as `cmd_diff_range` with `--json`.
+pub fn cmd_diff_range_json(from: Option<&str>, to: Option<&str>) -> ZResult<()> {
+    let (_root, conn) = open_repo()?;
+    let diffs = crate::repo::diff_revs(&conn, from, to)?;
+    use crate::json::Json;
+    let arr = Json::arr(
+        diffs
+            .into_iter()
+            .map(|(path, removed, added)| {
+                Json::obj(vec![
+                    ("path", Json::str(path)),
+                    (
+                        "removed",
+                        Json::arr(removed.into_iter().map(Json::str).collect()),
+                    ),
+                    ("added", Json::arr(added.into_iter().map(Json::str).collect())),
+                ])
+            })
+            .collect(),
+    );
+    println!("{}", arr.render());
+    Ok(())
+}

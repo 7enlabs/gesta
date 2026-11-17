@@ -161,6 +161,12 @@ enum Cmd {
         /// Compare against this changeset instead of the branch head
         #[arg(long)]
         changeset: Option<String>,
+        /// Compare from this revision (a branch, tag or changeset) to --to
+        #[arg(long)]
+        from: Option<String>,
+        /// Compare to this revision. Defaults to the working tree
+        #[arg(long)]
+        to: Option<String>,
         /// Only report names
         #[arg(long)]
         name_only: bool,
@@ -581,7 +587,13 @@ fn run() -> ZResult<()> {
         Cmd::Log { limit, .. } if json => cli::cmd_log_json(limit),
         Cmd::Blame { file } if json => cli::cmd_blame_json(&file),
         Cmd::History { file } if json => cli::cmd_history_json(&file),
-        Cmd::Diff { changeset, .. } if json => cli::cmd_diff_json(changeset.as_deref()),
+        Cmd::Diff { changeset, from, to, .. } if json => {
+            if from.is_some() || to.is_some() {
+                cli::cmd_diff_range_json(from.as_deref(), to.as_deref())
+            } else {
+                cli::cmd_diff_json(changeset.as_deref())
+            }
+        }
         Cmd::Tag { .. } if json => cli::cmd_tag_json(),
         Cmd::Ops { limit } if json => cli::cmd_ops_json(limit),
         // The specific arms come before the general one: a catch-all
@@ -606,7 +618,13 @@ fn run() -> ZResult<()> {
         Cmd::Hook { sub } => cli::cmd_hook(sub),
         Cmd::Init { bare } => cli::cmd_init(bare),
         Cmd::Status => cli::cmd_status(),
-        Cmd::Diff { changeset, name_only } => cli::cmd_diff(changeset.as_deref(), name_only),
+        Cmd::Diff { changeset, from, to, name_only } => {
+            if from.is_some() || to.is_some() {
+                cli::cmd_diff_range(from.as_deref(), to.as_deref(), name_only)
+            } else {
+                cli::cmd_diff(changeset.as_deref(), name_only)
+            }
+        }
         Cmd::Log { limit, oneline } => cli::cmd_log(limit, oneline),
         Cmd::Changeset { sub } => match sub {
             ChangesetCmd::Create { message, author } => cli::cmd_changeset_create(&message, &author),

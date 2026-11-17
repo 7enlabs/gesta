@@ -1217,6 +1217,127 @@ pub fn restore_worktree(conn: &Connection, root: &Path, branch: &str) -> ZResult
 
 
 
+/// One path's change between two revisions: the lines removed and the lines added.
+pub type PathDiff = (String, Vec<String>, Vec<String>);
+
+/// Compare two revisions and report the lines that differ per path.
+///
+/// `from` and `to` are anything `resolve_rev` understands: a branch, a tag, a
+/// changeset id, or `head`. Either side may be empty, meaning an empty tree, which is
+/// how the first changeset of a branch is shown on its own.
+///
+/// The comparison is between two stored trees, not between the working directory and
+/// something. Reviewing a step means asking what one point in history changed against
+/// another, and until now the only ways to ask were the working tree against the head
+/// or one changeset against its own parent. A step in the middle of a branch could not
+/// be examined at all.
+pub fn diff_revs(conn: &Connection, from: Option<&str>, to: Option<&str>) -> ZResult<Vec<PathDiff>> {
+    fn tree_of(conn: &Connection, rev: Option<&str>) -> ZResult<Vec<(String, String)>> {
+        match rev {
+            None => Ok(Vec::new()),
+            Some(r) => {
+                let id = crate::store::resolve_rev(conn, r)?.ok_or_else(|| {
+                    bad(format!("no such revision: {}", r))
+                })?;
+                tree_at(conn, &id)
+            }
+        }
+    }
+
+    let before = tree_of(conn, from)?;
+    let after = tree_of(conn, to)?;
+    let before_map: std::collections::HashMap<String, String> = before.into_iter().collect();
+    let after_map: std::collections::HashMap<String, String> = after.into_iter().collect();
+
+    let mut paths: Vec<String> = before_map
+        .keys()
+        .chain(after_map.keys())
+        .cloned()
+        .collect::<std::collections::HashSet<String>>()
+        .into_iter()
+        .collect();
+    paths.sort();
+
+    let mut out = Vec::new();
+    for path in paths {
+        let old_hash = before_map.get(&path);
+        let new_hash = after_map.get(&path);
+        if old_hash == new_hash {
+            continue;
+        }
+        let old_text = match old_hash {
+            Some(h) => crate::store::get_object(conn, h)?,
+            None => String::new(),
+        };
+        let new_text = match new_hash {
+            Some(h) => crate::store::get_object(conn, h)?,
+            None => String::new(),
+        };
+        if old_text == new_text {
+            continue;
+        }
+        let (removed, added) = line_diff(&old_text, &new_text);
+        out.push((path, removed, added));
+    }
+    Ok(out)
+}
+
+/// Lines removed and added between two texts.
+///
+/// A simple longest common subsequence over lines, which is what a review needs: it
+/// shows what changed, not the smallest possible edit script. The cap keeps a
+/// pathological pair of files from taking quadratic time forever; beyond it, the whole
+/// old text is reported as removed and the whole new text as added, which is honest
+/// about not having computed a diff.
+fn line_diff(old: &str, new: &str) -> (Vec<String>, Vec<String>) {
+    const MAX_LINES: usize = 4000;
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+    if a.len() > MAX_LINES || b.len() > MAX_LINES {
+        return (
+            a.iter().map(|s| s.to_string()).collect(),
+            b.iter().map(|s| s.to_string()).collect(),
+        );
+    }
+
+    // table[i][j] = length of the common subsequence of a[i..] and b[j..]
+    let mut table = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            table[i][j] = if a[i] == b[j] {
+                table[i + 1][j + 1] + 1
+            } else {
+                table[i + 1][j].max(table[i][j + 1])
+            };
+        }
+    }
+
+    let mut removed = Vec::new();
+    let mut added = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            i += 1;
+            j += 1;
+        } else if table[i + 1][j] >= table[i][j + 1] {
+            removed.push(a[i].to_string());
+            i += 1;
+        } else {
+            added.push(b[j].to_string());
+            j += 1;
+        }
+    }
+    while i < a.len() {
+        removed.push(a[i].to_string());
+        i += 1;
+    }
+    while j < b.len() {
+        added.push(b[j].to_string());
+        j += 1;
+    }
+    (removed, added)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1865,4 +1986,72 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// Reviewing a step means comparing two points in history, not the working tree
+    /// against the head. This covers a modified file, an added file, a deleted file,
+    /// and a range that spans several changesets.
+    #[test]
+    fn diff_between_two_revisions_reports_changes_on_both_sides() {
+        let conn = mem_db();
+        commit_files(&conn, "r1", "one", &[("a.txt", "alpha\n"), ("b.txt", "beta\n")]);
+
+        // A removal and an addition in the second commit.
+        conn.execute(
+            "INSERT INTO changesets(id,message,author,created_at,status,parent,parent2,branch)
+             VALUES('r2','two','a',2,'pending','r1',NULL,'main')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO changeset_files(changeset_id,path,old_hash,new_hash)
+             VALUES('r2','b.txt',NULL,NULL)",
+            [],
+        )
+        .unwrap();
+        commit_one(&conn, "r2").unwrap();
+
+        commit_files(&conn, "r3", "three", &[("a.txt", "alpha changed\n"), ("c.txt", "gamma\n")]);
+
+        // One step: b.txt deleted, and nothing else. r2 records only that, so a.txt
+        // must not appear even though r3 changes it later.
+        let one = diff_revs(&conn, Some("r1"), Some("r2")).unwrap();
+        let names: Vec<&str> = one.iter().map(|(p, _, _)| p.as_str()).collect();
+        assert_eq!(names, vec!["b.txt"], "expected only the deletion, got {:?}", names);
+
+        // Spanning two steps: c.txt appears as well.
+        let all = diff_revs(&conn, Some("r1"), Some("r3")).unwrap();
+        let names: Vec<&str> = all.iter().map(|(p, _, _)| p.as_str()).collect();
+        assert!(names.contains(&"c.txt"), "c.txt missing from {:?}", names);
+
+        // The same revision on both sides is no difference at all.
+        assert!(diff_revs(&conn, Some("r3"), Some("r3")).unwrap().is_empty());
+
+        // An empty left side compares against nothing, which is how a first changeset
+        // is shown on its own.
+        let from_nothing = diff_revs(&conn, None, Some("r1")).unwrap();
+        assert_eq!(from_nothing.len(), 2, "expected both files, got {:?}", from_nothing);
+    }
+
+    #[test]
+    fn an_unknown_revision_is_an_error_not_an_empty_result() {
+        let conn = mem_db();
+        commit_files(&conn, "r1", "one", &[("a.txt", "alpha\n")]);
+        let err = diff_revs(&conn, Some("does-not-exist"), Some("r1")).unwrap_err();
+        assert!(
+            err.to_string().contains("no such revision"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn a_diff_shows_the_lines_that_changed_and_nothing_else() {
+        let (removed, added) = line_diff("a\nb\nc\n", "a\nB\nc\n");
+        assert_eq!(removed, vec!["b".to_string()]);
+        assert_eq!(added, vec!["B".to_string()]);
+
+        // An append reports only the new line.
+        let (removed, added) = line_diff("a\nb\n", "a\nb\nc\n");
+        assert!(removed.is_empty(), "an append removes nothing, got {:?}", removed);
+        assert_eq!(added, vec!["c".to_string()]);
+    }
 }

@@ -281,6 +281,47 @@ def main():
     if fix_id:
         sh(f"{GESTA} changeset commit {fix_id}", cwd=cp)
 
+    # Reviewing a step: comparing two points in history, which is how a change is
+    # examined before it is merged.
+    if fix_id and base_id:
+        r = sh(f"{GESTA} diff --from {base_id} --to {fix_id}", cwd=cp)
+        # base holds "one/two/three" and fix changes the middle line, so the diff is
+        # exactly one removed line and one added line, and the unchanged lines must not
+        # appear.
+        check(
+            "diff between two revisions shows the changed lines",
+            r.returncode == 0
+            and "-two" in r.stdout
+            and "+TWO-PICKED" in r.stdout
+            and "one" not in r.stdout
+            and "three" not in r.stdout,
+            r.stdout + r.stderr,
+        )
+        r = sh(f"{GESTA} diff --from {base_id} --to {fix_id} --name-only", cwd=cp)
+        check(
+            "diff range can report names only",
+            r.returncode == 0 and r.stdout.strip() == "f.txt",
+            r.stdout + r.stderr,
+        )
+        r = sh(f"{GESTA} diff --from main --to main", cwd=cp)
+        check(
+            "a revision compared with itself is empty",
+            r.returncode == 0 and "no difference" in r.stdout,
+            r.stdout + r.stderr,
+        )
+        r = sh(f"{GESTA} --json diff --from {base_id} --to {fix_id}", cwd=cp)
+        check(
+            "diff range has a JSON form",
+            r.returncode == 0 and r.stdout.strip().startswith("[") and '"path"' in r.stdout,
+            r.stdout[:150] + r.stderr,
+        )
+        r = sh(f"{GESTA} diff --from nope-nope --to {fix_id}", cwd=cp)
+        check(
+            "an unknown revision is refused",
+            r.returncode != 0 and "no such revision" in (r.stdout + r.stderr),
+            r.stdout + r.stderr,
+        )
+
     sh(f"{GESTA} branch switch main", cwd=cp)
     before = open(os.path.join(cp, "f.txt")).read()
     check("the branch does not have the change before picking", "TWO-PICKED" not in before, before)
