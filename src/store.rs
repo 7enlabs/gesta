@@ -100,7 +100,12 @@ pub fn init_schema(conn: &Connection) -> ZResult<()> {
             status     TEXT NOT NULL CHECK (status IN ('pending','committed')),
             parent     TEXT,
             parent2    TEXT,
-            branch     TEXT NOT NULL DEFAULT 'main'
+            branch     TEXT NOT NULL DEFAULT 'main',
+            -- Provenance: which session produced this change and why. When an agent
+            -- writes most of the code, the reason behind a change is part of the
+            -- change; a message alone loses it.
+            session    TEXT,
+            intent     TEXT
         );
         CREATE TABLE IF NOT EXISTS changeset_files (
             changeset_id TEXT NOT NULL,
@@ -288,6 +293,14 @@ pub fn migrate(conn: &Connection) -> ZResult<bool> {
     ] {
         if table_columns(conn, table)?.is_empty() {
             conn.execute_batch(ddl)?;
+            changed = true;
+        }
+    }
+
+    // Provenance columns, for a repository created before they existed.
+    for col in ["session", "intent"] {
+        if !table_columns(conn, "changesets")?.iter().any(|c| c == col) {
+            conn.execute_batch(&format!("ALTER TABLE changesets ADD COLUMN {} TEXT", col))?;
             changed = true;
         }
     }

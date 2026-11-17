@@ -60,7 +60,15 @@ pub struct Bundle {
 }
 
 /// (message, author, created_at, parent, parent2) as stored in the database.
-type ChangesetMeta = (String, String, i64, Option<String>, Option<String>);
+type ChangesetMeta = (
+    String,
+    String,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 #[derive(Clone)]
 pub struct ChangesetRow {
@@ -70,6 +78,10 @@ pub struct ChangesetRow {
     pub created_at: i64,
     pub parent: Option<String>,
     pub parent2: Option<String>,
+    /// Which session produced this change and why. Travels with the changeset so a clone
+    /// keeps the reasoning as well as the result.
+    pub session: Option<String>,
+    pub intent: Option<String>,
 }
 
 impl Bundle {
@@ -85,13 +97,15 @@ impl Bundle {
         }
         for c in &self.changesets {
             s.push_str(&format!(
-                "cs\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                "cs\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                 c.id,
                 c.created_at,
                 enc(&c.author),
                 enc(&c.message),
                 c.parent.clone().unwrap_or_else(|| "-".into()),
-                c.parent2.clone().unwrap_or_else(|| "-".into())
+                c.parent2.clone().unwrap_or_else(|| "-".into()),
+                c.session.clone().map(|v| enc(&v)).unwrap_or_else(|| "-".into()),
+                c.intent.clone().map(|v| enc(&v)).unwrap_or_else(|| "-".into())
             ));
         }
         for (path, ver, hash, cs, ts) in &self.versions {
@@ -156,6 +170,8 @@ impl Bundle {
                 ["branch", name] => b.branch = name.to_string(),
                 ["head", h] => b.head = if *h == "-" { None } else { Some(h.to_string()) },
                 ["shallow", root] => b.shallow_root = Some(root.to_string()),
+                // A seven field row is what a bundle written before provenance existed
+                // contains, so both forms are accepted rather than refusing old archives.
                 ["cs", id, ts, author, message, p1, p2] => b.changesets.push(ChangesetRow {
                     id: id.to_string(),
                     message: dec_str(message),
@@ -163,7 +179,29 @@ impl Bundle {
                     created_at: ts.parse().unwrap_or(0),
                     parent: if *p1 == "-" { None } else { Some(p1.to_string()) },
                     parent2: if *p2 == "-" { None } else { Some(p2.to_string()) },
+                    session: None,
+                    intent: None,
                 }),
+                ["cs", id, ts, author, message, p1, p2, session, intent] => {
+                    b.changesets.push(ChangesetRow {
+                        id: id.to_string(),
+                        message: dec_str(message),
+                        author: dec_str(author),
+                        created_at: ts.parse().unwrap_or(0),
+                        parent: if *p1 == "-" { None } else { Some(p1.to_string()) },
+                        parent2: if *p2 == "-" { None } else { Some(p2.to_string()) },
+                        session: if *session == "-" {
+                            None
+                        } else {
+                            Some(dec_str(session))
+                        },
+                        intent: if *intent == "-" {
+                            None
+                        } else {
+                            Some(dec_str(intent))
+                        },
+                    })
+                }
                 ["fv", path, ver, hash, cs, ts] => b.versions.push((
                     dec_str(path),
                     ver.parse().unwrap_or(0),
@@ -378,7 +416,7 @@ pub fn build_bundle(conn: &Connection, branch: &str, have: &HashSet<String>) -> 
     for id in &needed {
         let row: Option<ChangesetMeta> = conn
             .query_row(
-                "SELECT message, author, created_at, parent, parent2
+                "SELECT message, author, created_at, parent, parent2, session, intent
                  FROM changesets WHERE id = ?1",
                 params![id],
                 |r| {
@@ -388,11 +426,15 @@ pub fn build_bundle(conn: &Connection, branch: &str, have: &HashSet<String>) -> 
                         r.get::<_, i64>(2)?,
                         r.get::<_, Option<String>>(3)?,
                         r.get::<_, Option<String>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, Option<String>>(6)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((message, author, ts, parent, parent2)) = row else { continue };
+        let Some((message, author, ts, parent, parent2, session, intent)) = row else {
+            continue;
+        };
         b.changesets.push(ChangesetRow {
             id: id.clone(),
             message,
@@ -400,6 +442,8 @@ pub fn build_bundle(conn: &Connection, branch: &str, have: &HashSet<String>) -> 
             created_at: ts,
             parent,
             parent2,
+            session,
+            intent,
         });
 
         let mut stmt = conn.prepare(
@@ -533,9 +577,19 @@ pub fn apply_bundle_opts(conn: &Connection, b: &Bundle, move_branch: bool) -> ZR
             continue;
         }
         tx.execute(
-            "INSERT INTO changesets(id, message, author, created_at, status, parent, parent2, branch)
-             VALUES(?1, ?2, ?3, ?4, 'committed', ?5, ?6, ?7)",
-            params![c.id, c.message, c.author, c.created_at, c.parent, c.parent2, b.branch],
+            "INSERT INTO changesets(id, message, author, created_at, status, parent, parent2, branch, session, intent)
+             VALUES(?1, ?2, ?3, ?4, 'committed', ?5, ?6, ?7, ?8, ?9)",
+            params![
+                c.id,
+                c.message,
+                c.author,
+                c.created_at,
+                c.parent,
+                c.parent2,
+                b.branch,
+                c.session,
+                c.intent
+            ],
         )?;
         applied += 1;
     }
@@ -1232,5 +1286,59 @@ mod tests {
         // gone entirely.
         let (p1, _) = crate::store::parents_of_public(&conn, "csd00").unwrap();
         assert!(p1.is_none(), "the first changeset has no parent");
+    }
+    /// Provenance has to survive the wire, and a bundle written before it existed has to
+    /// stay readable. Both directions matter: losing the reasoning on a clone defeats the
+    /// point, and refusing an old archive strands every repository already pushed.
+    #[test]
+    fn provenance_travels_and_old_bundles_still_decode() {
+        let conn = mem_db();
+        commit_files(&conn, "p1", "one", &[("a.txt", "alpha\n")]);
+        conn.execute(
+            "UPDATE changesets SET session = 'sess-7', intent = 'add the fixture' WHERE id = 'p1'",
+            [],
+        )
+        .unwrap();
+
+        let b = build_bundle(&conn, "main", &HashSet::new()).unwrap();
+        assert_eq!(b.changesets.len(), 1);
+        assert_eq!(b.changesets[0].session.as_deref(), Some("sess-7"));
+        assert_eq!(b.changesets[0].intent.as_deref(), Some("add the fixture"));
+
+        let wire = b.encode().unwrap();
+        let back = Bundle::decode(&wire).unwrap();
+        assert_eq!(back.changesets[0].session.as_deref(), Some("sess-7"));
+        assert_eq!(back.changesets[0].intent.as_deref(), Some("add the fixture"));
+
+        // And it lands in a fresh repository.
+        let dest = mem_db();
+        apply_bundle(&dest, &back).unwrap();
+        let stored: (Option<String>, Option<String>) = dest
+            .query_row(
+                "SELECT session, intent FROM changesets WHERE id = 'p1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored.0.as_deref(), Some("sess-7"));
+        assert_eq!(stored.1.as_deref(), Some("add the fixture"));
+    }
+
+    #[test]
+    fn a_bundle_without_provenance_still_reads() {
+        // The shape an older build wrote: seven fields, no session or intent.
+        let text = "gesta-bundle 1\nbranch\tmain\nhead\tp1\n\
+cs\tp1\t1\tagent\tone\t-\t-\nend\n";
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(text.as_bytes()).unwrap();
+        let wire = enc.finish().unwrap();
+        let b = Bundle::decode(&wire).unwrap();
+        assert_eq!(b.changesets.len(), 1, "the old row was dropped");
+        assert_eq!(b.changesets[0].id, "p1");
+        assert!(b.changesets[0].session.is_none());
+        assert!(b.changesets[0].intent.is_none());
     }
 }

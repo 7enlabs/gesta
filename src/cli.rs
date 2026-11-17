@@ -256,10 +256,21 @@ pub fn cmd_diff(changeset: Option<&str>, name_only: bool) -> ZResult<()> {
 
 pub fn cmd_log(limit: usize, oneline: bool) -> ZResult<()> {
     let (_root, conn) = open_repo()?;
-    let all: Vec<(String, String, String, i64, String, Option<String>)> = {
+    // One row of the log: id, message, author, time, status, parent, session, intent.
+    type LogRow = (
+        String,
+        String,
+        String,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let all: Vec<LogRow> = {
         let mut stmt = conn.prepare(
-            "SELECT id, message, author, created_at, status, parent FROM changesets
-             ORDER BY created_at DESC, rowid DESC LIMIT ?1",
+            "SELECT id, message, author, created_at, status, parent, session, intent
+             FROM changesets ORDER BY created_at DESC, rowid DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
             Ok((
@@ -269,14 +280,27 @@ pub fn cmd_log(limit: usize, oneline: bool) -> ZResult<()> {
                 row.get::<_, i64>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     let mut n = 0;
-    for (id, msg, author, ts, status, parent) in all {
+    for (id, msg, author, ts, status, parent, session, intent) in all {
         if oneline {
-            println!("{:<14} {} {}", &id[..id.len().min(14)], fmt_ts(ts), msg);
+            // The intent rides along on one line, because a reason that needs a second
+            // command to see is a reason nobody reads.
+            match &intent {
+                Some(i) => println!(
+                    "{:<14} {} {}  ({})",
+                    &id[..id.len().min(14)],
+                    fmt_ts(ts),
+                    msg,
+                    i
+                ),
+                None => println!("{:<14} {} {}", &id[..id.len().min(14)], fmt_ts(ts), msg),
+            }
         } else {
             println!("changeset {:<14}", id);
             println!("Author:  {}", author);
@@ -284,6 +308,12 @@ pub fn cmd_log(limit: usize, oneline: bool) -> ZResult<()> {
             println!("Status:  {}", status);
             if let Some(p) = parent {
                 println!("Parent:  {}", p);
+            }
+            if let Some(s) = session {
+                println!("Session: {}", s);
+            }
+            if let Some(i) = intent {
+                println!("Intent:  {}", i);
             }
             for line in msg.lines() {
                 println!("    {}", line);
@@ -300,7 +330,18 @@ pub fn cmd_log(limit: usize, oneline: bool) -> ZResult<()> {
 
 // changesets.
 
-pub fn cmd_changeset_create(message: &str, author: &str) -> ZResult<()> {
+/// Create a changeset, recording which session produced it and why.
+///
+/// When an agent writes most of the code, the reason behind a change is part of the
+/// change. A message says what happened; the session and intent keep it attached to the
+/// conversation that produced it, so a reviewer can ask why instead of guessing from the
+/// shape of the diff.
+pub fn cmd_changeset_create_meta(
+    message: &str,
+    author: &str,
+    session: Option<&str>,
+    intent: Option<&str>,
+) -> ZResult<()> {
     let (root, conn) = open_repo()?;
     let branch = current_branch(&conn)?;
 
@@ -310,6 +351,13 @@ pub fn cmd_changeset_create(message: &str, author: &str) -> ZResult<()> {
             Ok(())
         }
         Some(cs) => {
+            // Recorded after the row exists, because the id comes from the snapshot.
+            if session.is_some() || intent.is_some() {
+                conn.execute(
+                    "UPDATE changesets SET session = ?1, intent = ?2 WHERE id = ?3",
+                    rusqlite::params![session, intent, cs.id],
+                )?;
+            }
             println!("created changeset {} ({} file(s), branch {})", cs.id, cs.files.len(), branch);
             for (rel, old, _) in &cs.files {
                 println!("  {} {}", if old.is_none() { "A" } else { "M" }, rel);
@@ -487,15 +535,21 @@ pub fn cmd_blame(file: &str) -> ZResult<()> {
         }
     };
 
-    let rows: Vec<(i64, String, String)> = {
+    // A blame row answers who wrote a line. With provenance it can also answer which
+    // session wrote it and why, which is the question that actually comes up when an
+    // agent produced most of the file.
+    let rows: Vec<(i64, String, String, Option<String>)> = {
         let mut stmt = conn.prepare(
-            "SELECT line_no, changeset_id, author FROM blame WHERE path = ?1 ORDER BY line_no",
+            "SELECT b.line_no, b.changeset_id, b.author, c.intent
+             FROM blame b LEFT JOIN changesets c ON c.id = b.changeset_id
+             WHERE b.path = ?1 ORDER BY b.line_no",
         )?;
         let rows = stmt.query_map(rusqlite::params![rel], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
             ))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -505,18 +559,37 @@ pub fn cmd_blame(file: &str) -> ZResult<()> {
         println!("no blame data for {} (never committed)", rel);
         return Ok(());
     }
-    let map: std::collections::HashMap<i64, (String, String)> =
-        rows.into_iter().map(|(n, c, a)| (n, (c, a))).collect();
+    let map: std::collections::HashMap<i64, (String, String, Option<String>)> = rows
+        .into_iter()
+        .map(|(n, c, a, i)| (n, (c, a, i)))
+        .collect();
 
     let mut unattributed = 0usize;
+    let mut intents: Vec<String> = Vec::new();
     for (i, line) in content.lines().enumerate() {
         let n = (i + 1) as i64;
         match map.get(&n) {
-            Some((cs, author)) => println!("{:<14} {:<10} {:>4} | {}", cs, author, n, line),
+            Some((cs, author, intent)) => {
+                println!("{:<14} {:<10} {:>4} | {}", cs, author, n, line);
+                // Collected rather than printed per line, because a reason repeated on
+                // every line of a block is noise. It is listed once, at the end.
+                if let Some(it) = intent {
+                    let entry = format!("{}: {}", &cs[..cs.len().min(14)], it);
+                    if !intents.contains(&entry) {
+                        intents.push(entry);
+                    }
+                }
+            }
             None => {
                 unattributed += 1;
                 println!("{:<14} {:<10} {:>4} | {}", "?", "?", n, line)
             }
+        }
+    }
+    if !intents.is_empty() {
+        println!("\nwhy these lines exist:");
+        for i in &intents {
+            println!("  {}", i);
         }
     }
     if unattributed > 0 {
@@ -1160,7 +1233,9 @@ pub fn dispatch_branch_text(sub: crate::BranchCmd) -> ZResult<()> {
 
 pub fn dispatch_changeset_text(sub: crate::ChangesetCmd) -> ZResult<()> {
     match sub {
-        crate::ChangesetCmd::Create { message, author } => cmd_changeset_create(&message, &author),
+        crate::ChangesetCmd::Create { message, author, session, intent } => {
+            cmd_changeset_create_meta(&message, &author, session.as_deref(), intent.as_deref())
+        }
         crate::ChangesetCmd::Commit { id } => cmd_changeset_commit(&id),
         crate::ChangesetCmd::Apply { id } => cmd_changeset_apply(&id),
         crate::ChangesetCmd::CommitAll => cmd_changeset_commit_all(),

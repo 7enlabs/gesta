@@ -359,6 +359,13 @@ enum ChangesetCmd {
         message: String,
         #[arg(long, default_value = "agent")]
         author: String,
+        /// Which session produced this change, so the reasoning stays attached.
+        /// Defaults to GESTA_SESSION when that is set.
+        #[arg(long)]
+        session: Option<String>,
+        /// Why the change was made, in one line
+        #[arg(long)]
+        intent: Option<String>,
     },
     /// Commit a pending changeset onto the current branch
     Commit { id: String },
@@ -670,7 +677,15 @@ fn run() -> ZResult<()> {
         }
         Cmd::Log { limit, oneline } => cli::cmd_log(limit, oneline),
         Cmd::Changeset { sub } => match sub {
-            ChangesetCmd::Create { message, author } => cli::cmd_changeset_create(&message, &author),
+            ChangesetCmd::Create { message, author, session, intent } => {
+                let session = session.or_else(|| std::env::var("GESTA_SESSION").ok());
+                cli::cmd_changeset_create_meta(
+                    &message,
+                    &author,
+                    session.as_deref(),
+                    intent.as_deref(),
+                )
+            }
             ChangesetCmd::Commit { id } => cli::cmd_changeset_commit(&id),
             ChangesetCmd::Apply { id } => cli::cmd_changeset_apply(&id),
             ChangesetCmd::CommitAll => cli::cmd_changeset_commit_all(),

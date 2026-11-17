@@ -38,7 +38,7 @@ gesta blame src/main.rs
 | `status` | Branch, HEAD, pending changesets, added/modified/deleted files |
 | `diff [--changeset <id>] [--name-only]` | Working tree diff, or one changeset's diff |
 | `log [--limit N] [--oneline]` | Changesets, newest first |
-| `changeset create <msg> --author <a>` | Snapshot the working tree |
+| `changeset create <msg> --author <a> [--session S] [--intent I]` | Snapshot the tree, recording which session made the change and why |
 | `changeset commit <id>` | Commit one changeset, move the branch head |
 | `changeset commit-all` | Commit every pending changeset in order |
 | `changeset apply <id>` | Commit this and all earlier pending changesets |
@@ -162,7 +162,7 @@ One file: `.gesta/gesta.db` (SQLite, WAL mode). No loose objects, no packfiles, 
 | Table | Purpose |
 |---|---|
 | `objects` | Content addressed blobs, zlib compressed when that shrinks the row |
-| `changesets` | id, message, author, created_at, status, parent, parent2 (merges), branch |
+| `changesets` | id, message, author, created_at, status, parent, parent2 (merges), branch, session, intent |
 | `changeset_files` | Old and new hash per file inside a changeset |
 | `file_versions` | Version chain per path (v1, v2, ...) |
 | `blame` | Line ownership, recomputed on commit |
