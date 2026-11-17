@@ -406,3 +406,79 @@ removes the class.
 ### Still missing
 
 TLS. Delta compression, so a 500 KB file edited fifty times still stores fifty compressed copies. Sparse checkout, so a monorepo can expose one directory. Conflict output as structured JSON with line numbers, so an agent can resolve without parsing markers. Token expiry and revocation.
+
+## 11. v0.5.0: TLS, deltas, sparse checkout, structured conflicts
+
+Four gaps were left after v0.4.1. All four are closed.
+
+| Gap | What was built | Where |
+|---|---|---|
+| no TLS | `serve --tls <cert\|self-signed>`, client `--pin`, rustls with ring | `src/tls.rs` |
+| conflict output was markers only | `branch conflicts`, `merge --json`, MCP tool, both sides with line numbers | `src/conflict.rs` |
+| no sparse checkout | `sparse set/list/clear`, scope applied to both sides of the scan | `src/sparse.rs` |
+| every version stored whole | line delta against the previous version, verified on write and read | `src/delta.rs` |
+
+### The TLS decision that matters
+
+A client verifies against the public roots by default. A self-signed certificate
+is accepted only when its fingerprint is given with `--pin`. Writing a verifier
+that returns `assertion()` for any certificate would have been three lines and
+would have made the TLS decorative, which is worse than plaintext because it
+looks safe.
+
+Pinning does skip the chain check. It does not skip the handshake signature, and
+a different certificate fails with both fingerprints printed, so an operator can
+see what changed. The bench suite checks the three refusals: no pin against a
+self-signed certificate, a wrong pin, and `serve --tls` without tokens.
+
+One bug only a real socket exposed: the server dropped the TLS stream without
+sending close_notify, so the client read a complete response and then reported a
+truncated one. The server now closes the session explicitly, and the client
+tolerates a missing close_notify when the response is already whole.
+
+### Why the delta is small and safe
+
+Delta encoding is where a storage layer invents silent corruption, so the format
+is verified at both ends: `encode` rebuilds the target and returns nothing if the
+rebuild differs, and `get_object` checks the rebuilt bytes against the SHA-256
+that names them. A delta is stored only when it beats the compressed whole
+object, measured per object.
+
+Measured on 558 KB edited one line fifty times: 1,504 KB to 692 KB, against
+git's 886 KB. Before this, `stats` reported a 1716x compression ratio by
+counting only the object table and ignoring delta payloads, which was true and
+misleading; the line now includes both and a real history shows 1431x.
+
+### Why sparse checkout needed both sides
+
+Materialising fewer files is the easy half. The hard half is the scan: a tracked
+file that was never checked out is indistinguishable from a deleted one, so a
+naive `status` reports the rest of the repository as deleted and the next commit
+removes it. The scope is applied to the disk side and to the committed side, and
+two checks exist only for that case, including a pattern that matches nothing.
+
+### Verification
+
+| Check | Result |
+|---|---|
+| `cargo test --release` | 173 |
+| `bench/replace_git.py` | 20/20 |
+| `bench/http_remote.py` | 13/13 |
+| `bench/http_auth.py` | 18/18 |
+| `bench/mcp_json.py` | 14/14 |
+| `bench/api_changeset.py` | 13/13 |
+| `bench/concurrency.py` | 8/8 |
+| `bench/conflicts.py` | 13/13 |
+| `bench/sparse.py` | 16/16 |
+| `bench/tls.py` | 12/12 |
+| `bench/delta_vs_git.py` | 3/3 |
+| clippy | 0 warnings |
+
+### What is still missing
+
+Many tiny files still cost 4.32x git, because per-row overhead dominates when an
+object is a few dozen bytes; the fix is packing several small blobs per row.
+There is no rebase, cherry-pick, bisect, hooks, submodules, LFS or
+`.gitattributes`. A token cannot be revoked before its expiry without editing the
+auth file. Sparse checkout is pattern based, not a virtual filesystem, so a file
+outside the scope is absent rather than fetched on demand.

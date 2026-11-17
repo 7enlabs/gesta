@@ -81,6 +81,21 @@ pub fn tool_definitions() -> Json {
             ]),
         ),
         tool(
+            "zenforge_merge_conflicts",
+            "Report what merging a branch would conflict on, with both sides and line numbers, without touching anything.",
+            Json::obj(vec![
+                ("type", Json::str("object")),
+                (
+                    "properties",
+                    Json::obj(vec![
+                        ("source", Json::obj(vec![("type", Json::str("string")), ("description", Json::str("Branch to merge from."))])),
+                        ("target", Json::obj(vec![("type", Json::str("string")), ("description", Json::str("Branch to merge into, default the current branch."))])),
+                    ]),
+                ),
+                ("required", Json::arr(vec![Json::str("source")])),
+            ]),
+        ),
+        tool(
             "zenforge_create_changeset",
             "Snapshot the working tree as a pending changeset. Nothing is committed until zenforge_commit.",
             Json::obj(vec![
@@ -230,6 +245,7 @@ fn call_tool(root: &Path, params: &Json) -> Result<Json, ToolError> {
         "zenforge_read_file" => tool_read_file(&conn, &args),
         "zenforge_blame" => tool_blame(&conn, &args),
         "zenforge_diff" => tool_diff(&conn, root, &args),
+        "zenforge_merge_conflicts" => tool_merge_conflicts(&conn, root, &args),
         "zenforge_create_changeset" => tool_create_changeset(&conn, root, &args),
         "zenforge_commit" => tool_commit(&conn, &args),
         other => return Err((-32602, format!("unknown tool: {}", other))),
@@ -419,6 +435,17 @@ fn tool_diff(conn: &Connection, root: &Path, args: &Json) -> Result<Json, String
             ]))
         }
     }
+}
+
+
+fn tool_merge_conflicts(conn: &Connection, root: &Path, args: &Json) -> Result<Json, String> {
+    let source = arg_str(args, "source").ok_or("merge_conflicts needs a source branch")?;
+    let target = match arg_str(args, "target") {
+        Some(t) => t,
+        None => current_branch(conn).map_err(|e| e.to_string())?,
+    };
+    let reports = repo::merge_preview(conn, root, &source, &target).map_err(|e| e.to_string())?;
+    Ok(crate::conflict::reports_to_json(&reports))
 }
 
 fn tool_create_changeset(conn: &Connection, root: &Path, args: &Json) -> Result<Json, String> {

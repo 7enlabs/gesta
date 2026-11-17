@@ -18,6 +18,54 @@ use crate::{bad, fmt_ts, normalise, now, open_repo, repo_root, ZResult, ZF_DIR};
 
 // init / status / diff / log.
 
+
+/// `sparse set|list|clear`.
+pub fn cmd_sparse(sub: crate::SparseCmd) -> ZResult<()> {
+    match sub {
+        crate::SparseCmd::List => {
+            let (_root, conn) = open_repo()?;
+            let scope = crate::sparse::SparseScope::load(&conn)?;
+            if scope.is_empty() {
+                println!("working set: everything (no sparse scope)");
+            } else {
+                println!("working set: {} pattern(s)", scope.patterns.len());
+                for p in &scope.patterns {
+                    println!("  {}", p);
+                }
+            }
+            Ok(())
+        }
+        crate::SparseCmd::Set { patterns } => {
+            let (root, conn) = open_repo()?;
+            let scope = crate::sparse::SparseScope { patterns: patterns.clone() };
+            if scope.is_empty() {
+                return Err(bad("give at least one pattern, or use 'sparse clear'"));
+            }
+            let branch = current_branch(&conn)?;
+            let (written, kept) = store::with_retry(|| {
+                scope.checkout_sparse(&conn, &root, &branch)
+            })?;
+            scope.save(&conn)?;
+            println!(
+                "working set: {} pattern(s). {} file(s) written, {} left in the branch but not checked out.",
+                scope.patterns.len(),
+                written,
+                kept
+            );
+            println!("Files outside the scope are not treated as deleted.");
+            Ok(())
+        }
+        crate::SparseCmd::Clear => {
+            let (root, conn) = open_repo()?;
+            crate::sparse::SparseScope::clear(&conn)?;
+            let branch = current_branch(&conn)?;
+            let n = repo::materialise(&conn, &root, &branch)?;
+            println!("working set: everything. {} file(s) restored.", n);
+            Ok(())
+        }
+    }
+}
+
 /// Run the MCP server. stdout belongs to the protocol, so nothing else may
 /// write to it while this runs.
 pub fn cmd_mcp() -> ZResult<()> {
@@ -104,6 +152,17 @@ pub fn cmd_status() -> ZResult<()> {
             for f in &d.deleted {
                 println!("  D {}", f);
             }
+        }
+    }
+
+    let scope = crate::sparse::SparseScope::load(&conn)?;
+    if !scope.is_empty() {
+        println!(
+            "\nsparse: {} pattern(s), files outside it are not treated as deleted",
+            scope.patterns.len()
+        );
+        for p in &scope.patterns {
+            println!("  {}", p);
         }
     }
 
@@ -682,6 +741,45 @@ pub fn cmd_branch_delete(name: &str) -> ZResult<()> {
     Ok(())
 }
 
+/// Print the conflicts of a merge attempt as JSON.
+pub fn cmd_branch_merge_json(source: &str, target: &str, author: &str) -> ZResult<()> {
+    let (root, conn) = open_repo()?;
+    let out = store::with_retry(|| repo::merge_branch(&conn, &root, source, target, author))?;
+    emit(crate::json::Json::obj(vec![
+        (
+            "merged",
+            crate::json::Json::Bool(out.merge_changeset.is_some()),
+        ),
+        (
+            "changeset",
+            out.merge_changeset
+                .clone()
+                .map(crate::json::Json::str)
+                .unwrap_or(crate::json::Json::Null),
+        ),
+        (
+            "applied",
+            crate::json::Json::arr(out.applied.iter().cloned().map(crate::json::Json::str).collect()),
+        ),
+        ("conflicts", crate::conflict::reports_to_json(&out.reports)),
+    ]));
+    // A conflicted merge is still a failure for a script, so keep the exit code.
+    if out.merge_changeset.is_none() && !out.reports.is_empty() {
+        return Err(bad("merge produced conflicts"));
+    }
+    Ok(())
+}
+
+/// Report the conflicts of a merge without performing it (dry run).
+///
+/// An agent asks this first, decides how to resolve, then writes its answer.
+pub fn cmd_merge_preview(source: &str, target: &str) -> ZResult<()> {
+    let (root, conn) = open_repo()?;
+    let out = repo::merge_preview(&conn, &root, source, target)?;
+    emit(crate::conflict::reports_to_json(&out));
+    Ok(())
+}
+
 pub fn cmd_branch_merge(source: &str, target: &str, author: &str) -> ZResult<()> {
     let (root, conn) = open_repo()?;
     let out = store::with_retry(|| repo::merge_branch(&conn, &root, source, target, author))?;
@@ -1028,6 +1126,7 @@ pub fn dispatch_branch_text(sub: crate::BranchCmd) -> ZResult<()> {
         crate::BranchCmd::Delete { name } => cmd_branch_delete(&name),
         crate::BranchCmd::Merge { source, target, author } => cmd_branch_merge(&source, &target, &author),
         crate::BranchCmd::Info { name } => cmd_branch_info(&name),
+        crate::BranchCmd::Conflicts { source, target } => cmd_merge_preview(&source, &target),
     }
 }
 

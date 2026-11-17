@@ -55,11 +55,13 @@ zenforge blame src/main.rs
 | `ops [--limit N]` | Operation log |
 | `tag <name> [--list]` | Named pointer to a changeset |
 | `branch create/list/switch/delete/merge/info` | Branch operations |
-| `remote add/list/push/pull/clone` | Remote sync, filesystem path or `http://` |
+| `remote add/list/push/pull/clone` | Remote sync over a path, `http://` or `https://` |
 | `remote token add <role> <name> [--hashed]` | Generate an access token for serving |
 | `remote token list` | Show configured tokens, last four characters only |
-| `serve [--bind ADDR] [--port N]` | Serve this repository over HTTP |
+| `serve [--bind ADDR] [--port N] [--tls <cert\|self-signed>] [--key K]` | Serve this repository over HTTP or HTTPS |
 | `mcp` | MCP server on stdio, exposing the repository as tools |
+| `branch conflicts <source>` | Report merge conflicts as JSON without touching anything |
+| `sparse set/list/clear` | Limit the working tree to a set of paths |
 | `fsck [--prune]` | Verify integrity, optionally drop orphan objects |
 | `stats` | Object counts and compression ratio |
 | `ignore add/list/remove` | Ignore patterns |
@@ -118,7 +120,33 @@ zenforge remote pull origin
 
 Endpoints: `GET /v1/health`, `GET /v1/branches`, `GET /v1/bundle?branch=X&have=...`, `POST /v1/bundle?branch=X`, `GET /v1/file?path=&rev=`, `POST /v1/changeset`.
 
-A push that would move the server's branch to a head not containing its current head gets a 409 and the branch stays where it was. `https://` is refused with an explanation: terminate TLS in a proxy in front of it.
+A push that would move the server's branch to a head not containing its current head gets a 409 and the branch stays where it was.
+
+## TLS
+
+`https://` works. Two ways to get a certificate:
+
+```bash
+# a private network: generate one and pin its fingerprint
+zenforge serve --bind 0.0.0.0 --port 8787 --tls self-signed
+# prints: pin this on clients with --pin 9f2c...
+
+# a certificate you already have
+zenforge serve --bind 0.0.0.0 --port 8787 --tls /etc/zf/cert.pem --key /etc/zf/key.pem
+```
+
+A client verifies against the public roots by default, so a real certificate needs no flag. For a self-signed one, pin the fingerprint once:
+
+```bash
+zenforge remote clone https://server:8787 project --token <token> --pin <fingerprint>
+zenforge remote add origin https://server:8787 --token <token> --pin <fingerprint>
+```
+
+The pin is stored with the remote, so a later push needs no flag. It is trust on first use made explicit, not "ignore certificate errors": the handshake still has to prove possession of the key that matches the pinned certificate, and a different certificate fails with the two fingerprints printed.
+
+Three refusals are deliberate. A client with no pin rejects a self-signed certificate. A client with the wrong pin rejects it and says which fingerprints differ. `serve --tls` without tokens refuses to start, because an encrypted port with no access control is still an open port.
+
+rustls with the ring backend is used rather than OpenSSL, so the build gains no second C toolchain beside the bundled SQLite.
 
 ## Access control
 
@@ -190,16 +218,54 @@ Two rules are enforced: a path that escapes the repository (`../`) is refused, a
 
 The comparison base is the tree the branch will have once every pending changeset commits, not just the head. Without that, a second call could not see what the first one wrote.
 
+## Sparse checkout
+
+A monorepo can be tens of gigabytes, and an agent that needs one module should not pay for the rest.
+
+```bash
+zenforge sparse set crates/api docs/**
+zenforge sparse list
+zenforge sparse clear
+```
+
+A directory prefix selects its subtree, `**` crosses separators, and a pattern with no slash matches a file name at any depth.
+
+The failure mode that matters is not "fewer files on disk". A file that is in the branch tree but was never written looks exactly like a file somebody deleted, so a naive scan would report the rest of the repository as deleted and the next commit would wipe it. The scope is applied to both sides of the comparison: the scan ignores disk paths outside it, and the deleted computation ignores committed paths outside it. Two checks in `bench/sparse.py` exist only for that, including a scope that matches nothing.
+
+## Structured conflicts
+
+Markers are readable by a person and awkward for an agent. `branch conflicts` reports the same conflict as data, without touching the working tree:
+
+```bash
+zenforge branch conflicts feature --target main
+```
+
+Each file carries `ours`, `theirs` and `base` in full, plus one entry per conflicting region with `ours_start`, `ours_end`, `theirs_start`, `theirs_end`, the lines from each side, and three lines of context either way. An agent can choose per region and write the answer directly.
+
+The same shape comes from `branch merge --json` and from the MCP tool `zenforge_merge_conflicts`.
+
+## Delta compression
+
+A 500 KB file edited fifty times stores fifty versions. Storing each one whole costs fifty compressions of a file that changed in one line, so an object may be stored as a delta against the previous version of the same path: copy runs plus inserted lines, the same idea as a git packfile.
+
+Two rules keep it safe. A delta is kept only when it is smaller than the compressed whole object, measured rather than assumed. And the delta is verified by rebuilding the target and comparing, so a bad encode returns nothing instead of storing a wrong version. On read, the rebuilt object is checked against its SHA-256 and a mismatch is an error, never silent corruption.
+
+Measured on a 558 KB file edited one line fifty times: 1,504 KB before, 692 KB after, against git's 886 KB for the same history. That is 0.78x git, the first shape where a tree of this kind costs less than a packfile.
+
 ## Verification
 
 ```bash
-cargo test --release              # 129 unit tests
+cargo test --release              # 173 unit tests
 python3 bench/replace_git.py      # 20 end to end capability checks
 python3 bench/http_remote.py      # 11 checks over a real socket
 python3 bench/http_auth.py        # 18 checks on tokens and roles
 python3 bench/mcp_json.py         # 14 checks on the MCP server and --json
 python3 bench/api_changeset.py    # 13 checks on remote changesets and path scope
 python3 bench/concurrency.py      # 8 checks on parallel snapshots and commits
+python3 bench/conflicts.py        # 13 checks on structured conflict reports
+python3 bench/sparse.py           # 16 checks on sparse checkout safety
+python3 bench/tls.py              # 12 checks on TLS, including refusals
+python3 bench/delta_vs_git.py     # disk usage against git on a long edit history
 python3 bench/size_compare.py     # disk usage against git
 python3 bench/bench.py            # speed baseline
 ```
@@ -234,8 +300,8 @@ Disk usage, 21 versions of a 42 KB file edited one line at a time: 267 KB agains
 
 ## Limitations
 
-- **No TLS.** Plain HTTP. Put a TLS terminating proxy in front of it before sending credentials over an untrusted network.
-- **Tokens have a path scope but no expiry.** A token can be limited to path globs, but nothing revokes it on a schedule.
+- **TLS needs a certificate you supply or pin.** `serve --tls self-signed` works on a private network once a client pins the fingerprint; a public deployment needs a real certificate from a CA.
+- **Tokens expire but are not revocable per session.** An entry can carry an expiry date, and removing its line revokes it, but there is no "revoke this one now" call.
 - **No SSH transport.**
 - **Small files cost more than git.** 4.32x for a tree of tiny files. Fixing it means packing several objects per row, which is a schema change.
 - **Blame is line-sequence based.** A line moved and edited in the same commit loses its original author.
@@ -260,6 +326,10 @@ src/cache.rs       working tree scan with a (mtime, size, hash) cache
 src/content.rs     changesets built from supplied content, no working tree
 src/json.rs        JSON writer and parser, no serde
 src/mcp.rs         MCP server over stdio
+src/conflict.rs    structured conflict reports
+src/sparse.rs      working set patterns and sparse checkout
+src/delta.rs       line delta encode, apply, serialise
+src/tls.rs         TLS server and client, certificate pinning
 ```
 
 Build environment: Docker container `hermes-workspace`, Rust 1.100.0, image `hermes-workspace-rust:latest`.
@@ -283,10 +353,13 @@ Each of these is pinned by a test, and each one exists because the first impleme
 - **Concurrent writers succeed.** `busy_timeout` covers a reader waiting for a writer but not two writers arriving at once, so mutating commands retry a busy database with a growing pause. Before that, 20 parallel commits produced 19 `database is locked` failures; now all 20 land.
 - **A deleted file stays deleted.** Content lookups read `changeset_files`, where a deletion is a row with no hash, not `file_versions`, which has no row for a deletion at all. Reading versions alone resurrected deleted files.
 - **A queued changeset is visible to the next one.** The base for a new changeset is the effective tree, so a second API call can edit or delete what the first one wrote before either is committed.
+- **A sparse scope never deletes anything.** A path outside the working set is not on disk by design, so its absence is not a deletion; reporting it as one would let one commit remove the rest of the repository.
+- **A delta is verified before it is used.** Encoding rebuilds the target, and reading re-checks the hash, so a corrupt delta is an error rather than wrong content.
+- **A custom certificate verifier still proves key possession.** Pinning a fingerprint skips the chain check, not the handshake signature.
 - **A revision can be a branch, a tag or a changeset.** One resolver answers all three, so `show main:x.txt` reads the branch head instead of reporting a file that is plainly there.
 
 ## Status
 
-Version 0.4.0. Usable for one developer or a set of agents on a machine or a trusted network, including agents that never check out the tree. Not yet a full git replacement: no TLS, no delta compression, no sparse checkout, and a tree of tiny files costs 4.32x git in disk.
+Version 0.5.0. Usable for one developer or a set of agents, on one machine, on a private network over TLS, or by agents that never check out the tree. Still not a full git replacement: a tree of many tiny files costs 4.32x git in disk, there is no rebase, cherry-pick, bisect, hooks or LFS, and a token cannot be revoked before its expiry without editing the auth file.
 
 `docs/upgrade-plan.md` holds the measurements behind each decision and the list of what is still missing.

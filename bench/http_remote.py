@@ -183,10 +183,25 @@ def main():
             status = e.code
         record("unknown branch returns 404", status == 404, f"status={status}")
 
-        # --- https is refused with an explanation ---
-        rc, out = run("remote", "clone", "https://example.com/repo", os.path.join(ROOT, "x"), cwd=ROOT)
-        record("https is refused with a clear message",
-               rc != 0 and "https is not supported" in out, out)
+        # --- https is a real transport now. A public host without a ZenForge
+        # server must produce a clean failure, not a hang or a TLS error.
+        rc, out = run("remote", "clone", "https://example.com/repo",
+                      os.path.join(ROOT, "x"), cwd=ROOT)
+        record("https reaches a public host and reports a clean failure",
+               rc != 0 and ("404" in out or "no branches" in out.lower() or "cannot list" in out.lower()),
+               out[:250])
+
+        # --- a bare word is a filesystem path, so it must fail as a missing
+        # local repository rather than being mistaken for a host name.
+        rc, out = run("remote", "clone", "example.com", os.path.join(ROOT, "y"), cwd=ROOT)
+        record("a bare path is treated as local, not as a host",
+               rc != 0 and "no zenforge repository at" in out, out[:200])
+
+        # --- a scheme that is neither http nor https is refused ---
+        rc, out = run("remote", "clone", "ftp://example.com/repo",
+                      os.path.join(ROOT, "z"), cwd=ROOT)
+        record("an unsupported scheme is refused with a clear message",
+               rc != 0, out[:200])
 
     finally:
         server.terminate()

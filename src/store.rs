@@ -68,6 +68,20 @@ pub fn with_retry<T>(mut f: impl FnMut() -> ZResult<T>) -> ZResult<T> {
     }
 }
 
+/// Add a column to a table that predates it.
+///
+/// SQLite has no `ADD COLUMN IF NOT EXISTS`, so the column list decides. An
+/// existing repository keeps working without a manual migration step.
+fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> ZResult<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+    let existing: Vec<String> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    if !existing.iter().any(|c| c == column) {
+        conn.execute(&format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, decl), [])?;
+    }
+    Ok(())
+}
+
 pub fn init_schema(conn: &Connection) -> ZResult<()> {
     conn.execute_batch(
         r#"
@@ -140,7 +154,8 @@ pub fn init_schema(conn: &Connection) -> ZResult<()> {
         CREATE TABLE IF NOT EXISTS remotes (
             name  TEXT PRIMARY KEY,
             url   TEXT NOT NULL,
-            token TEXT
+            token TEXT,
+            pin   TEXT
         );
         CREATE TABLE IF NOT EXISTS remote_refs (
             remote       TEXT NOT NULL,
@@ -148,6 +163,12 @@ pub fn init_schema(conn: &Connection) -> ZResult<()> {
             changeset_id TEXT NOT NULL,
             updated_at   INTEGER NOT NULL,
             PRIMARY KEY (remote, branch)
+        );
+        CREATE TABLE IF NOT EXISTS deltas (
+            hash       TEXT PRIMARY KEY,
+            base       TEXT NOT NULL,
+            payload    BLOB NOT NULL,
+            created_at INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS worktree_cache (
             path  TEXT PRIMARY KEY,
@@ -166,6 +187,11 @@ pub fn init_schema(conn: &Connection) -> ZResult<()> {
         CREATE INDEX IF NOT EXISTS idx_blame_cs ON blame(changeset_id);
         "#,
     )?;
+
+    // Columns added after the first release. A repository created by an older
+    // build has the table but not the column, so the schema step upgrades it in
+    // place instead of asking the operator to run a migration.
+    ensure_column(conn, "remotes", "pin", "TEXT")?;
     Ok(())
 }
 
@@ -212,6 +238,19 @@ fn compress(content: &str) -> ZResult<Vec<u8>> {
     Ok(enc.finish()?)
 }
 
+fn compress_bytes(data: &[u8]) -> ZResult<Vec<u8>> {
+    let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(data)?;
+    Ok(enc.finish()?)
+}
+
+fn decompress_bytes(blob: &[u8]) -> ZResult<Vec<u8>> {
+    let mut dec = ZlibDecoder::new(blob);
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out)?;
+    Ok(out)
+}
+
 fn decompress(blob: &[u8]) -> ZResult<String> {
     let mut dec = ZlibDecoder::new(blob);
     let mut out = String::new();
@@ -226,6 +265,20 @@ fn decompress(blob: &[u8]) -> ZResult<String> {
 /// carries a fixed header and trailer, so for a short file compressing makes the
 /// row bigger than the text itself; small objects are stored raw instead.
 pub fn put_object(conn: &Connection, content: &str) -> ZResult<String> {
+    put_object_against(conn, content, None)
+}
+
+/// Store `content`, optionally as a delta against `base`.
+///
+/// A delta only wins when it is smaller than the compressed whole object, which
+/// is measured rather than assumed: a two-line change to a large file produces a
+/// tiny delta, while an unrelated rewrite produces a delta bigger than the file
+/// and is discarded.
+pub fn put_object_against(
+    conn: &Connection,
+    content: &str,
+    base: Option<&str>,
+) -> ZResult<String> {
     let h = hash_content(content);
     let exists: Option<i64> = conn
         .query_row("SELECT 1 FROM objects WHERE hash = ?1", params![h], |r| r.get(0))
@@ -237,10 +290,38 @@ pub fn put_object(conn: &Connection, content: &str) -> ZResult<String> {
     let raw = content.as_bytes().to_vec();
     let packed = compress(content)?;
     let (blob, compressed) = if packed.len() < raw.len() {
-        (packed, 1i64)
+        (packed.clone(), 1i64)
     } else {
         (raw, 0i64)
     };
+    let whole_size = blob.len();
+
+    // Try a delta only when a base is offered and it is a different object.
+    if let Some(base_hash) = base {
+        if base_hash != h {
+            if let Ok(base_text) = get_object(conn, base_hash) {
+                if let Some(ops) = crate::delta::encode(&base_text, content) {
+                    let payload = crate::delta::to_bytes(&ops);
+                    let packed_delta = compress_bytes(&payload)?;
+                    // A delta is only worth it when it beats the compressed
+                    // whole object by a real margin, not by a few bytes.
+                    if packed_delta.len() + 32 < whole_size {
+                        conn.execute(
+                            "INSERT OR IGNORE INTO objects(hash, content, size, compressed, created_at)
+                             VALUES(?1, X'', ?2, 0, ?3)",
+                            params![h, content.len() as i64, now()],
+                        )?;
+                        conn.execute(
+                            "INSERT OR REPLACE INTO deltas(hash, base, payload, created_at)
+                             VALUES(?1, ?2, ?3, ?4)",
+                            params![h, base_hash, packed_delta, now()],
+                        )?;
+                        return Ok(h);
+                    }
+                }
+            }
+        }
+    }
 
     conn.execute(
         "INSERT OR IGNORE INTO objects(hash, content, size, compressed, created_at)
@@ -250,7 +331,90 @@ pub fn put_object(conn: &Connection, content: &str) -> ZResult<String> {
     Ok(h)
 }
 
+/// Read the delta base chain for a hash, following up to 8 levels.
+pub fn delta_chain(conn: &Connection, hash: &str) -> ZResult<Vec<String>> {
+    let mut chain = vec![hash.to_string()];
+    let mut cur = hash.to_string();
+    for _ in 0..8 {
+        let base: Option<String> = conn
+            .query_row("SELECT base FROM deltas WHERE hash = ?1", params![cur], |r| r.get(0))
+            .optional()?;
+        match base {
+            Some(b) => {
+                chain.push(b.clone());
+                cur = b;
+            }
+            None => break,
+        }
+    }
+    Ok(chain)
+}
+
+/// Number of objects stored as deltas, and the bytes they save.
+pub fn delta_stats(conn: &Connection) -> ZResult<(i64, i64)> {
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM deltas", [], |r| r.get(0))
+        .unwrap_or(0);
+    if count == 0 {
+        return Ok((0, 0));
+    }
+    let mut stmt = conn.prepare(
+        "SELECT d.hash, LENGTH(d.payload), o.size FROM deltas d
+         JOIN objects o ON o.hash = d.hash",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+    let mut saved = 0i64;
+    for r in rows {
+        let (_h, payload, raw) = r?;
+        // Compare against the raw size, which is the optimistic alternative: a
+        // real whole object would also be compressed, so the true saving is
+        // smaller than this. Reported as an upper bound.
+        saved += (raw - payload).max(0);
+    }
+    Ok((count, saved))
+}
+
 pub fn get_object(conn: &Connection, hash: &str) -> ZResult<String> {
+    let chain = delta_chain(conn, hash)?;
+
+    // Walk from the deepest base outwards: a chain is only ever one delta deep
+    // in practice, but the loop costs nothing and handles nesting.
+    let mut content: Option<String> = None;
+    for (i, h) in chain.iter().enumerate().rev() {
+        if i == 0 && chain.len() > 1 {
+            // The requested object: apply its delta to what the base produced.
+            let base = content
+                .take()
+                .ok_or_else(|| bad(format!("delta chain for {} is broken", hash)))?;
+            let payload: Vec<u8> = conn
+                .query_row("SELECT payload FROM deltas WHERE hash = ?1", params![h], |r| r.get(0))
+                .optional()?
+                .ok_or_else(|| bad(format!("delta for {} vanished", h)))?;
+            let raw = decompress_bytes(&payload)?;
+            let ops = crate::delta::from_bytes(&raw)
+                .ok_or_else(|| bad(format!("delta for {} is malformed", h)))?;
+            let rebuilt = crate::delta::apply(&base, &ops)
+                .ok_or_else(|| bad(format!("delta for {} does not apply to its base", h)))?;
+            // The hash is the contract. A rebuild that does not match means the
+            // store is corrupt, and returning the wrong bytes would hide it.
+            if hash_content(&rebuilt) != *hash {
+                return Err(bad(format!("rebuilt object {} does not match its hash", hash)));
+            }
+            return Ok(rebuilt);
+        }
+        content = Some(read_whole(conn, h)?);
+    }
+
+    content.ok_or_else(|| bad(format!("object {} not found (store may be corrupted)", hash)))
+}
+
+fn read_whole(conn: &Connection, hash: &str) -> ZResult<String> {
     let row: Option<(Vec<u8>, i64)> = conn
         .query_row(
             "SELECT content, compressed FROM objects WHERE hash = ?1",

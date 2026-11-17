@@ -7,7 +7,7 @@ use std::path::Path;
 use crate::merge::{diff_hunks, merge3, MergeResult};
 use crate::store::{
     branch_head, current_branch, get_object, hash_at_point, hash_content, latest_hash,
-    merge_base, new_changeset_id, put_object,
+    merge_base, new_changeset_id, put_object, put_object_against,
 };
 use crate::worktree::IgnoreRules;
 use crate::{bad, now, ZResult, ZF_DIR};
@@ -60,6 +60,7 @@ pub struct WorktreeDelta {
 /// Compare the working tree to `branch`.
 pub fn diff_worktree(conn: &Connection, root: &Path, branch: &str) -> ZResult<WorktreeDelta> {
     let rules = load_ignore_rules(root, conn)?;
+    let scope = crate::sparse::SparseScope::load(conn)?;
     let mut d = WorktreeDelta {
         added: Vec::new(),
         modified: Vec::new(),
@@ -79,6 +80,11 @@ pub fn diff_worktree(conn: &Connection, root: &Path, branch: &str) -> ZResult<Wo
     // disk and re-hashed on every `status`.
     let scanned = crate::cache::scan_with_cache(conn, root, &rules)?;
     for f in &scanned.files {
+        // A sparse checkout leaves out-of-scope files on disk. Counting them
+        // would report the rest of the repository as new.
+        if !scope.contains(&f.rel) {
+            continue;
+        }
         seen.insert(f.rel.clone());
         match committed.get(&f.rel) {
             None => d.added.push(f.rel.clone()),
@@ -95,10 +101,15 @@ pub fn diff_worktree(conn: &Connection, root: &Path, branch: &str) -> ZResult<Wo
     d.cached = scanned.cached;
     d.rehashed = scanned.rehashed;
 
-    // Files tracked on the branch but absent from disk.
+    // Files tracked on the branch but absent from disk. A path outside the
+    // sparse scope was never supposed to be on disk, so its absence is not a
+    // deletion: reporting it as one would let a commit wipe the whole repo.
     let mut tracked: Vec<String> = committed.keys().cloned().collect();
     tracked.sort();
     for path in tracked {
+        if !scope.contains(&path) {
+            continue;
+        }
         if !seen.contains(&path) && !root.join(&path).exists() {
             d.deleted.push(path);
         }
@@ -124,6 +135,7 @@ pub fn create_changeset(
 ) -> ZResult<Option<NewChangeset>> {
     let branch = current_branch(conn)?;
     let rules = load_ignore_rules(root, conn)?;
+    let scope = crate::sparse::SparseScope::load(conn)?;
 
     let mut changes: Vec<(String, Option<String>, String, String)> = Vec::new();
     let mut deleted: Vec<String> = Vec::new();
@@ -137,6 +149,9 @@ pub fn create_changeset(
         return Err(bad(format!("cannot read {} ({} more)", first, scanned.unreadable.len() - 1)));
     }
     for f in scanned.files {
+        if !scope.contains(&f.rel) {
+            continue;
+        }
         seen.insert(f.rel.clone());
         let old_hash = committed.get(&f.rel).cloned();
         if old_hash.as_deref() != Some(f.hash.as_str()) {
@@ -148,6 +163,9 @@ pub fn create_changeset(
     let mut tracked: Vec<String> = committed.keys().cloned().collect();
     tracked.sort();
     for path in tracked {
+        if !scope.contains(&path) {
+            continue;
+        }
         if !seen.contains(&path) && !root.join(&path).exists() {
             deleted.push(path);
         }
@@ -169,7 +187,9 @@ pub fn create_changeset(
 
     let mut files = Vec::new();
     for (rel, old, new, content) in &changes {
-        put_object(&tx, content)?;
+        // A delta against the previous version of this path is what keeps a
+        // long editing history small. `old` is that previous version's hash.
+        put_object_against(&tx, content, old.as_deref())?;
         tx.execute(
             "INSERT INTO changeset_files(changeset_id, path, old_hash, new_hash)
              VALUES(?1, ?2, ?3, ?4)",
@@ -380,7 +400,93 @@ pub fn write_conflict_copy(root: &Path, path: &str, theirs: &str) -> ZResult<Str
 pub struct MergeOutcome {
     pub applied: Vec<String>,
     pub conflicts: Vec<String>,
+    /// One structured report per conflicted file, with both sides and line
+    /// numbers, so a caller can hand it to an agent instead of markers.
+    pub reports: Vec<crate::conflict::ConflictReport>,
     pub merge_changeset: Option<String>,
+}
+
+/// Compute what merging `source` into `target` would conflict on, without
+/// touching the working tree, the branch heads, or the database.
+///
+/// A merge that stops on conflict has already written markers to disk, which is
+/// fine for a person but wasteful for an agent: it would have to read files it
+/// is about to overwrite. This answers the same question from the object store.
+pub fn merge_preview(
+    conn: &Connection,
+    _root: &Path,
+    source: &str,
+    target: &str,
+) -> ZResult<Vec<crate::conflict::ConflictReport>> {
+    let src_head = branch_head(conn, source)?;
+    let tgt_head = branch_head(conn, target)?;
+    let Some(src_head) = src_head else {
+        return Ok(Vec::new());
+    };
+    if Some(src_head.clone()) == tgt_head {
+        return Ok(Vec::new());
+    }
+
+    let base = match &tgt_head {
+        Some(t) => merge_base(conn, t, &src_head)?,
+        None => None,
+    };
+
+    let src_anc = crate::store::ancestors(conn, &src_head)?;
+    let tgt_anc: Vec<String> = match &tgt_head {
+        Some(t) => crate::store::ancestors(conn, t)?,
+        None => Vec::new(),
+    };
+    let base_set: std::collections::HashSet<String> = match &base {
+        Some(b) => crate::store::ancestors(conn, b)?.into_iter().collect(),
+        None => std::collections::HashSet::new(),
+    };
+
+    let collect = |ids: &[String], exclude: &std::collections::HashSet<String>| -> ZResult<Vec<String>> {
+        let mut out = std::collections::HashSet::new();
+        let mut stmt = conn.prepare("SELECT path FROM changeset_files WHERE changeset_id = ?1")?;
+        for id in ids {
+            if exclude.contains(id) {
+                continue;
+            }
+            let rows = stmt.query_map(params![id], |r| r.get::<_, String>(0))?;
+            for r in rows {
+                out.insert(r?);
+            }
+        }
+        Ok(out.into_iter().collect())
+    };
+
+    let mut all: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for p in collect(&src_anc, &base_set)? {
+        all.insert(p);
+    }
+    for p in collect(&tgt_anc, &base_set)? {
+        all.insert(p);
+    }
+    let mut paths: Vec<String> = all.into_iter().collect();
+    paths.sort();
+
+    let read = |path: &str, rev: Option<&String>| -> ZResult<String> {
+        match rev {
+            Some(r) => match hash_at_point(conn, path, r)? {
+                Some(h) => get_object(conn, &h),
+                None => Ok(String::new()),
+            },
+            None => Ok(String::new()),
+        }
+    };
+
+    let mut reports = Vec::new();
+    for path in &paths {
+        let base_text = read(path, base.as_ref())?;
+        let our_text = read(path, tgt_head.as_ref())?;
+        let their_text = read(path, Some(&src_head))?;
+        if let Some(rep) = crate::conflict::report(path, &base_text, &our_text, &their_text) {
+            reports.push(rep);
+        }
+    }
+    Ok(reports)
 }
 
 /// Merge `source` into `target` with a real three-way merge.
@@ -398,17 +504,17 @@ pub fn merge_branch(
     let tgt_head = branch_head(conn, target)?;
 
     let Some(src_head) = src_head else {
-        return Ok(MergeOutcome { applied: Vec::new(), conflicts: Vec::new(), merge_changeset: None });
+        return Ok(MergeOutcome { applied: Vec::new(), conflicts: Vec::new(), reports: Vec::new(), merge_changeset: None });
     };
     if Some(src_head.clone()) == tgt_head {
-        return Ok(MergeOutcome { applied: Vec::new(), conflicts: Vec::new(), merge_changeset: None });
+        return Ok(MergeOutcome { applied: Vec::new(), conflicts: Vec::new(), reports: Vec::new(), merge_changeset: None });
     }
 
     // Fast-forward when the target is already an ancestor of the source.
     if let Some(t) = &tgt_head {
         let tgt_anc = crate::store::ancestors(conn, t)?;
         if tgt_anc.contains(&src_head) {
-            return Ok(MergeOutcome { applied: Vec::new(), conflicts: Vec::new(), merge_changeset: None });
+            return Ok(MergeOutcome { applied: Vec::new(), conflicts: Vec::new(), reports: Vec::new(), merge_changeset: None });
         }
         let src_anc = crate::store::ancestors(conn, &src_head)?;
         if src_anc.contains(t) {
@@ -419,6 +525,7 @@ pub fn merge_branch(
             return Ok(MergeOutcome {
                 applied: vec![src_head],
                 conflicts: Vec::new(),
+                reports: Vec::new(),
                 merge_changeset: None,
             });
         }
@@ -468,6 +575,7 @@ pub fn merge_branch(
 
     let mut merged_files: Vec<(String, String)> = Vec::new();
     let mut conflicts: Vec<String> = Vec::new();
+    let mut reports: Vec<crate::conflict::ConflictReport> = Vec::new();
 
     for path in &paths {
         let base_text = match &base {
@@ -502,6 +610,11 @@ pub fn merge_branch(
             // show a useful conflict message.
             let _ = result.ours();
             write_conflict_copy(root, path, &theirs)?;
+            // Keep the structured report alongside the markers: markers for a
+            // human, the report for an agent that has to decide.
+            if let Some(rep) = crate::conflict::report(path, &base_text, &our_text, &their_text) {
+                reports.push(rep);
+            }
             merged_files.push((path.clone(), result.text().to_string()));
             conflicts.push(path.clone());
         } else if result.text() != our_text {
@@ -519,7 +632,7 @@ pub fn merge_branch(
             }
             fs::write(&target_path, text)?;
         }
-        return Ok(MergeOutcome { applied: Vec::new(), conflicts, merge_changeset: None });
+        return Ok(MergeOutcome { applied: Vec::new(), conflicts, reports, merge_changeset: None });
     }
 
     // Record the merge as a changeset with two parents.
@@ -575,7 +688,7 @@ pub fn merge_branch(
         .collect();
     recompute_blame(conn, &touched)?;
 
-    Ok(MergeOutcome { applied: vec![id.clone()], conflicts: Vec::new(), merge_changeset: Some(id) })
+    Ok(MergeOutcome { applied: vec![id.clone()], conflicts: Vec::new(), reports: Vec::new(), merge_changeset: Some(id) })
 }
 
 /// Diff two changesets (or a changeset against its first parent).

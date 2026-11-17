@@ -273,9 +273,13 @@ def c15_compression_ratio():
     rc, out = run("stats", cwd=d)
     ratio = 0.0
     for line in out.split("\n"):
-        if "compression" in line:
+        # The stats line ends with the ratio, after the stored byte count. Read
+        # the last token before the closing paren so the wording can change.
+        if "objects:" in line and "x)" in line:
             try:
-                ratio = float(line.split("(")[1].split("x")[0].split()[-1])
+                # Format: "... = 5167 stored, 17.2x)". Take the last token and
+                # strip the trailing "x)".
+                ratio = float(line.rsplit(" ", 1)[-1].rstrip(")").rstrip("x"))
             except (IndexError, ValueError):
                 pass
     record("object store compresses text", ratio >= 2.0, out)

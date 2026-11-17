@@ -7,7 +7,9 @@ mod auth;
 mod cache;
 mod cli;
 mod cli_remote;
+mod conflict;
 mod content;
+mod delta;
 mod history;
 mod http;
 mod json;
@@ -16,7 +18,9 @@ mod merge;
 mod ops;
 mod remote;
 mod repo;
+mod sparse;
 mod store;
+mod tls;
 mod worktree;
 
 use clap::{Parser, Subcommand};
@@ -176,6 +180,19 @@ enum Cmd {
         bind: String,
         #[arg(long, default_value_t = 8787)]
         port: u16,
+        /// Serve over TLS. Give `self-signed` to generate a certificate, or the
+        /// path to a PEM certificate.
+        #[arg(long)]
+        tls: Option<String>,
+        /// Private key for `--tls`, required when the certificate is given as a
+        /// path. Ignored for `self-signed`.
+        #[arg(long)]
+        key: Option<String>,
+    },
+    /// Limit the working tree to a set of paths
+    Sparse {
+        #[command(subcommand)]
+        sub: SparseCmd,
     },
     /// Verify repository integrity
     Fsck {
@@ -213,6 +230,16 @@ enum ChangesetCmd {
 }
 
 #[derive(Subcommand)]
+enum SparseCmd {
+    /// Set the working set and check those paths out
+    Set { patterns: Vec<String> },
+    /// Show the current working set
+    List,
+    /// Return to a full checkout
+    Clear,
+}
+
+#[derive(Subcommand)]
 enum BranchCmd {
     Create {
         name: String,
@@ -230,6 +257,12 @@ enum BranchCmd {
         author: String,
     },
     Info { name: String },
+    /// Report what a merge would conflict on, without touching anything
+    Conflicts {
+        source: String,
+        #[arg(long, default_value = "main")]
+        target: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -240,6 +273,9 @@ enum RemoteCmd {
         /// Token the server requires, stored with the remote.
         #[arg(long)]
         token: Option<String>,
+        /// SHA-256 fingerprint of the server certificate, for a self-signed one.
+        #[arg(long)]
+        pin: Option<String>,
     },
     List,
     /// Manage access tokens for serving over HTTP
@@ -269,6 +305,9 @@ enum RemoteCmd {
         dir: String,
         #[arg(long)]
         token: Option<String>,
+        /// SHA-256 fingerprint of the server certificate, for a self-signed one.
+        #[arg(long)]
+        pin: Option<String>,
     },
 }
 
@@ -319,8 +358,18 @@ fn run() -> ZResult<()> {
         Cmd::Diff { changeset, .. } if json => cli::cmd_diff_json(changeset.as_deref()),
         Cmd::Tag { .. } if json => cli::cmd_tag_json(),
         Cmd::Ops { limit } if json => cli::cmd_ops_json(limit),
+        // The specific arms come before the general one: a catch-all
+        // `Cmd::Branch { sub } if json` would swallow them, and a match arm
+        // that never runs is worse than a compile error.
+        Cmd::Branch {
+            sub: BranchCmd::Conflicts { source, target },
+        } => cli::cmd_merge_preview(&source, &target),
+        Cmd::Branch {
+            sub: BranchCmd::Merge { source, target, author },
+        } if json => cli::cmd_branch_merge_json(&source, &target, &author),
         Cmd::Branch { sub } if json => cli::cmd_branch_json(sub),
         Cmd::Changeset { sub } if json => cli::cmd_changeset_json(sub),
+        Cmd::Sparse { sub } => cli::cmd_sparse(sub),
         Cmd::Init { bare } => cli::cmd_init(bare),
         Cmd::Status => cli::cmd_status(),
         Cmd::Diff { changeset, name_only } => cli::cmd_diff(changeset.as_deref(), name_only),
@@ -351,10 +400,11 @@ fn run() -> ZResult<()> {
             BranchCmd::Delete { name } => cli::cmd_branch_delete(&name),
             BranchCmd::Merge { source, target, author } => cli::cmd_branch_merge(&source, &target, &author),
             BranchCmd::Info { name } => cli::cmd_branch_info(&name),
+            BranchCmd::Conflicts { source, target } => cli::cmd_merge_preview(&source, &target),
         },
         Cmd::Remote { sub } => match sub {
-            RemoteCmd::Add { name, url, token } => {
-                cli_remote::cmd_remote_add(&name, &url, token.as_deref())
+            RemoteCmd::Add { name, url, token, pin } => {
+                cli_remote::cmd_remote_add(&name, &url, token.as_deref(), pin.as_deref())
             }
             RemoteCmd::List => cli_remote::cmd_remote_list(),
             RemoteCmd::Token { sub } => match sub {
@@ -364,12 +414,14 @@ fn run() -> ZResult<()> {
             },
             RemoteCmd::Push { remote, branch } => cli_remote::cmd_push(&remote, &branch),
             RemoteCmd::Pull { remote, branch, author } => cli_remote::cmd_pull(&remote, &branch, &author),
-            RemoteCmd::Clone { url, dir, token } => {
-                cli_remote::cmd_clone(&url, &dir, token.as_deref())
+            RemoteCmd::Clone { url, dir, token, pin } => {
+                cli_remote::cmd_clone(&url, &dir, token.as_deref(), pin.as_deref())
             }
         },
         Cmd::Mcp => cli::cmd_mcp(),
-        Cmd::Serve { bind, port } => cli_remote::cmd_serve(&bind, port),
+        Cmd::Serve { bind, port, tls, key } => {
+            cli_remote::cmd_serve(&bind, port, tls.as_deref(), key.as_deref())
+        }
         Cmd::Fsck { prune } => cli_remote::cmd_fsck(prune),
         Cmd::Stats => cli_remote::cmd_stats(),
         Cmd::Ignore { sub } => match sub {

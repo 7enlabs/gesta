@@ -12,41 +12,76 @@ use crate::ops;
 use crate::remote;
 use crate::repo;
 use crate::store::{
-    ancestors, branch_head, current_branch, get_object, init_schema, object_store_bytes, open_db,
-    set_state,
+    ancestors, branch_head, current_branch, delta_stats, get_object, init_schema,
+    object_store_bytes, open_db, set_state,
 };
 use crate::worktree::IgnoreRules;
 use crate::{bad, now, open_repo, ZResult, ZF_DIR};
 
 // remotes.
 
-pub fn cmd_remote_add(name: &str, url: &str, token: Option<&str>) -> ZResult<()> {
+pub fn cmd_remote_add(
+    name: &str,
+    url: &str,
+    token: Option<&str>,
+    pin: Option<&str>,
+) -> ZResult<()> {
     let (_root, conn) = open_repo()?;
+    if let Some(p) = pin {
+        // Reject a malformed pin now, not on the first push over a network.
+        crate::tls::client_config(Some(p))?;
+    }
     conn.execute(
-        "INSERT INTO remotes(name, url, token) VALUES(?1, ?2, ?3)
+        "INSERT INTO remotes(name, url, token, pin) VALUES(?1, ?2, ?3, ?4)
          ON CONFLICT(name) DO UPDATE SET url = excluded.url,
-                                         token = COALESCE(excluded.token, remotes.token)",
-        rusqlite::params![name, url, token],
+                                         token = COALESCE(excluded.token, remotes.token),
+                                         pin = COALESCE(excluded.pin, remotes.pin)",
+        rusqlite::params![name, url, token, pin],
     )?;
     println!("remote {} -> {}", name, url);
+    if url.starts_with("https://") {
+        println!("transport: TLS");
+    }
     if token.is_some() {
         println!("token stored in the repository database");
+    }
+    if pin.is_some() {
+        println!("certificate pin stored in the repository database");
     }
     Ok(())
 }
 
+/// Pin saved for this remote, if any.
+fn remote_pin(conn: &rusqlite::Connection, name: &str) -> ZResult<Option<String>> {
+    Ok(conn
+        .query_row("SELECT pin FROM remotes WHERE name = ?1", rusqlite::params![name], |r| {
+            r.get::<_, Option<String>>(0)
+        })
+        .optional()?
+        .flatten())
+}
+
 pub fn cmd_remote_list() -> ZResult<()> {
     let (_root, conn) = open_repo()?;
-    let all: Vec<(String, String)> = {
-        let mut stmt = conn.prepare("SELECT name, url FROM remotes ORDER BY name")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let all: Vec<(String, String, Option<String>)> = {
+        let mut stmt = conn.prepare("SELECT name, url, pin FROM remotes ORDER BY name")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     if all.is_empty() {
         println!("no remotes configured");
     }
-    for (n, u) in all {
-        println!("{:<10} {}", n, u);
+    for (n, u, pin) in all {
+        match pin {
+            Some(p) => println!("{:<10} {} (pin {}...)", n, u, &p[..p.len().min(12)]),
+            None => println!("{:<10} {}", n, u),
+        }
     }
     Ok(())
 }
@@ -149,7 +184,7 @@ pub fn cmd_pull(remote_name: &str, branch: &str, author: &str) -> ZResult<()> {
     Ok(())
 }
 
-pub fn cmd_clone(url: &str, dir: &str, token: Option<&str>) -> ZResult<()> {
+pub fn cmd_clone(url: &str, dir: &str, token: Option<&str>, pin: Option<&str>) -> ZResult<()> {
     let target = Path::new(dir);
     if target.join(ZF_DIR).is_dir() {
         return Err(bad(format!("{} already contains a zenforge repository", dir)));
@@ -157,7 +192,7 @@ pub fn cmd_clone(url: &str, dir: &str, token: Option<&str>) -> ZResult<()> {
     fs::create_dir_all(target)?;
 
     if http::is_http_url(url) {
-        return clone_http(url, target, token);
+        return clone_http(url, target, token, pin);
     }
 
     let remote_path = remote::resolve_remote(url);
@@ -182,9 +217,9 @@ pub fn cmd_clone(url: &str, dir: &str, token: Option<&str>) -> ZResult<()> {
     remote::apply_bundle(&conn, &received)?;
     set_state(&conn, "current_branch", &branch)?;
     conn.execute(
-        "INSERT INTO remotes(name, url) VALUES('origin', ?1)
-         ON CONFLICT(name) DO UPDATE SET url = excluded.url",
-        rusqlite::params![url],
+        "INSERT INTO remotes(name, url, pin) VALUES('origin', ?1, ?2)
+         ON CONFLICT(name) DO UPDATE SET url = excluded.url, pin = excluded.pin",
+        rusqlite::params![url, pin],
     )?;
 
     let (written, _removed) = repo::restore_worktree(&conn, target, &branch)?;
@@ -320,8 +355,19 @@ pub fn cmd_stats() -> ZResult<()> {
     let branches: i64 = conn.query_row("SELECT COUNT(*) FROM branches", [], |r| r.get(0))?;
     let tags: i64 = conn.query_row("SELECT COUNT(*) FROM tags", [], |r| r.get(0))?;
 
-    let ratio = if raw > 0 { raw as f64 / stored.max(1) as f64 } else { 0.0 };
-    println!("objects:     {} ({} bytes raw, {} bytes stored, {:.1}x compression)", objects, raw, stored, ratio);
+    // Delta payloads live in their own table, so the object table alone
+    // understates the real cost and reports an absurd compression ratio. The
+    // footer adds them back, which is the number a person should read.
+    let (deltas, saved) = delta_stats(&conn)?;
+    let delta_bytes: i64 = conn
+        .query_row("SELECT COALESCE(SUM(LENGTH(payload)), 0) FROM deltas", [], |r| r.get(0))
+        .unwrap_or(0);
+    let total_stored = stored + delta_bytes;
+    let ratio = if raw > 0 { raw as f64 / total_stored.max(1) as f64 } else { 0.0 };
+    println!(
+        "objects:     {} ({} bytes raw, {} bytes in objects plus {} in deltas = {} stored, {:.1}x)",
+        objects, raw, stored, delta_bytes, total_stored, ratio
+    );
     println!("changesets:  {}", changesets);
     println!("versions:    {}", versions);
     println!("blame rows:  {}", blame);
@@ -332,6 +378,15 @@ pub fn cmd_stats() -> ZResult<()> {
         .query_row("SELECT COUNT(*) FROM worktree_cache", [], |r| r.get(0))
         .unwrap_or(0);
     println!("stat cache:  {} path(s)", cache_count);
+
+    if deltas > 0 {
+        println!(
+            "deltas:      {} object(s), at most {} bytes saved against raw size",
+            deltas, saved
+        );
+    } else {
+        println!("deltas:      0");
+    }
     Ok(())
 }
 
@@ -447,8 +502,14 @@ fn push_http(
 
     // What does the remote already have? Asking first keeps the upload small;
     // the server also refuses a bundle that would move its branch backwards.
-    let (status, body) =
-        http::request_with_token("GET", &format!("{}/v1/branches", base), None, token.as_deref())?;
+    let pin = remote_pin(conn, remote_name)?;
+    let (status, body) = http::request_with_pin(
+        "GET",
+        &format!("{}/v1/branches", base),
+        None,
+        token.as_deref(),
+        pin.as_deref(),
+    )?;
     if status == 401 || status == 403 {
         return Err(bad(format!(
             "remote {} rejected the token ({}): {}",
@@ -488,7 +549,8 @@ fn push_http(
     let changeset_count = bundle.changesets.len();
 
     let target = format!("{}/v1/bundle?branch={}", base, branch);
-    let (status, body) = http::request_with_token("POST", &target, Some(&wire), token.as_deref())?;
+    let (status, body) =
+        http::request_with_pin("POST", &target, Some(&wire), token.as_deref(), pin.as_deref())?;
     if status != 200 {
         return Err(bad(format!(
             "push rejected by {} ({}): {}",
@@ -535,7 +597,9 @@ fn pull_http(
     let have: Vec<String> = if have == vec!["none".to_string()] { Vec::new() } else { have };
 
     let target = http::bundle_url(base, branch, &have);
-    let (status, body) = http::request_with_token("GET", &target, None, token.as_deref())?;
+    let pin = remote_pin(conn, remote_name)?;
+    let (status, body) =
+        http::request_with_pin("GET", &target, None, token.as_deref(), pin.as_deref())?;
     if status != 200 {
         return Err(bad(format!(
             "cannot fetch branch {} from {} ({}): {}",
@@ -566,11 +630,11 @@ fn pull_http(
 }
 
 /// Clone over HTTP: ask for the branch list, fetch the first branch.
-fn clone_http(url: &str, target: &Path, token: Option<&str>) -> ZResult<()> {
+fn clone_http(url: &str, target: &Path, token: Option<&str>, pin: Option<&str>) -> ZResult<()> {
     let base = url.trim_end_matches('/');
 
     let (status, body) =
-        http::request_with_token("GET", &format!("{}/v1/branches", base), None, token)?;
+        http::request_with_pin("GET", &format!("{}/v1/branches", base), None, token, pin)?;
     if status != 200 {
         return Err(bad(format!(
             "cannot list branches at {} ({}): {}",
@@ -586,7 +650,7 @@ fn clone_http(url: &str, target: &Path, token: Option<&str>) -> ZResult<()> {
         .ok_or_else(|| bad(format!("{} has no branches", base)))?;
 
     let (status, body) =
-        http::request_with_token("GET", &http::bundle_url(base, &branch, &[]), None, token)?;
+        http::request_with_pin("GET", &http::bundle_url(base, &branch, &[]), None, token, pin)?;
     if status != 200 {
         return Err(bad(format!(
             "cannot fetch {} from {} ({}): {}",
@@ -626,10 +690,41 @@ fn clone_http(url: &str, target: &Path, token: Option<&str>) -> ZResult<()> {
 /// Tokens come from `.zenforge/auth`, one `token:role:name` per line. Without
 /// that file the server only binds to loopback, so an open port with no
 /// password is never the accidental default.
-pub fn cmd_serve(bind: &str, port: u16) -> ZResult<()> {
+pub fn cmd_serve(
+    bind: &str,
+    port: u16,
+    tls: Option<&str>,
+    key: Option<&str>,
+) -> ZResult<()> {
     let (root, _conn) = open_repo()?;
     let auth = auth::Auth::from_entries(&read_auth_file(&root)?);
-    http::serve(root, bind.to_string(), port, auth)
+
+    match tls {
+        None => http::serve(root, bind.to_string(), port, auth),
+        Some("self-signed") => {
+            // A generated certificate is for a private network. Writing it under
+            // .zenforge/ keeps it with the repository and out of a changeset,
+            // since that directory is never tracked.
+            let dir = root.join(ZF_DIR);
+            let (cert, key_path, fp) = crate::tls::generate_self_signed(bind, &dir)?;
+            println!("generated {} and {}", cert.display(), key_path.display());
+            println!("pin this on clients with --pin {}", fp);
+            http::serve_tls(root, bind.to_string(), port, auth, &cert, &key_path)
+        }
+        Some(cert_path) => {
+            let key_path = key
+                .map(std::path::PathBuf::from)
+                .ok_or_else(|| bad("--tls <cert> needs --key <key.pem>"))?;
+            http::serve_tls(
+                root,
+                bind.to_string(),
+                port,
+                auth,
+                &std::path::PathBuf::from(cert_path),
+                &key_path,
+            )
+        }
+    }
 }
 
 fn read_auth_file(root: &Path) -> ZResult<Vec<String>> {

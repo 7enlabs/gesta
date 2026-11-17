@@ -31,6 +31,15 @@ pub struct Grant {
     /// Glob patterns for the paths this token may write. Empty means every path,
     /// which is what an entry without a scope field grants.
     pub scope: Vec<String>,
+    /// Unix timestamp after which the token is dead. `None` means it does not
+    /// expire, which is the old behaviour and still the default.
+    pub expires_at: Option<i64>,
+}
+
+impl Grant {
+    pub fn is_expired(&self, now: i64) -> bool {
+        matches!(self.expires_at, Some(t) if now >= t)
+    }
 }
 
 impl Grant {
@@ -52,6 +61,14 @@ impl Grant {
 
 /// Match one glob pattern. Supports `*` inside a segment and `**` across
 /// segments, plus `?` for a single character.
+/// Match one glob pattern against a path.
+///
+/// Shared with sparse checkout: two matchers that disagree about `**` would be
+/// a subtle and very annoying bug.
+pub fn glob_is_match(pattern: &str, text: &str) -> bool {
+    glob_match(pattern, text)
+}
+
 fn glob_match(pattern: &str, text: &str) -> bool {
     fn go(p: &[char], t: &[char]) -> bool {
         if p.is_empty() {
@@ -125,12 +142,13 @@ impl Auth {
             // `sha256:<digest>:<role>:<name>` has four fields, the clear form
             // has three, so the digest marker has to be handled first.
             if let Some(rest) = line.strip_prefix("sha256:") {
-                let mut parts = rest.splitn(4, ':');
+                let mut parts = rest.splitn(5, ':');
                 let (Some(digest_hex), Some(role)) = (parts.next(), parts.next()) else {
                     continue;
                 };
                 let name = parts.next().unwrap_or("unnamed");
                 let scope = parts.next().unwrap_or("");
+                let expires = parts.next().unwrap_or("");
                 let digest_hex = digest_hex.trim().to_ascii_lowercase();
                 if digest_hex.len() != 64 || !digest_hex.chars().all(|c| c.is_ascii_hexdigit()) {
                     continue; // a malformed digest must never match anything
@@ -142,12 +160,13 @@ impl Auth {
                         name: name.trim().to_string(),
                         role,
                         scope: parse_scope(scope),
+                        expires_at: parse_expiry(expires),
                     },
                 );
                 continue;
             }
 
-            let mut parts = line.splitn(4, ':');
+            let mut parts = line.splitn(5, ':');
             let token = match parts.next() {
                 Some(t) if !t.trim().is_empty() => t.trim().to_string(),
                 _ => continue,
@@ -155,9 +174,15 @@ impl Auth {
             let role = parse_role(parts.next().unwrap_or("read"));
             let name = parts.next().unwrap_or("unnamed").trim().to_string();
             let scope = parts.next().unwrap_or("");
+            let expires = parts.next().unwrap_or("");
             tokens.insert(
                 digest(&token),
-                Grant { name, role, scope: parse_scope(scope) },
+                Grant {
+                    name,
+                    role,
+                    scope: parse_scope(scope),
+                    expires_at: parse_expiry(expires),
+                },
             );
         }
         Auth { required: !tokens.is_empty(), tokens }
@@ -168,14 +193,61 @@ impl Auth {
     }
 
     /// Resolve a presented token to a role, or `None` when it is unknown.
+    #[cfg(test)]
     pub fn authenticate(&self, presented: &str) -> Option<Grant> {
         self.tokens.get(&digest(presented)).cloned()
+    }
+
+    /// Authenticate and reject a grant that has expired.
+    ///
+    /// Separate from `authenticate` so a caller can tell "wrong token" from
+    /// "right token, too late" and answer 401 with a different reason. The
+    /// server uses this one.
+    pub fn authenticate_now(&self, presented: &str, now: i64) -> AuthOutcome {
+        match self.tokens.get(&digest(presented)) {
+            None => AuthOutcome::Unknown,
+            Some(g) if g.is_expired(now) => AuthOutcome::Expired(g.name.clone()),
+            Some(g) => AuthOutcome::Granted(g.clone()),
+        }
     }
 
     /// Does `role` satisfy `needed`?
     pub fn allows(role: Role, needed: Role) -> bool {
         role >= needed
     }
+}
+
+/// The result of checking a presented token.
+#[derive(Debug, Clone)]
+pub enum AuthOutcome {
+    Granted(Grant),
+    Expired(String),
+    Unknown,
+}
+
+/// Parse an expiry field.
+///
+/// Accepts a unix timestamp, an ISO date (`2027-03-01`), or an ISO timestamp.
+/// An empty field or `never` means no expiry. Anything unparseable also means no
+/// expiry rather than "expires now", because a typo locking every agent out of a
+/// repository is worse than a token that lives longer than intended.
+pub fn parse_expiry(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("never") {
+        return None;
+    }
+    if let Ok(n) = s.parse::<i64>() {
+        return Some(if n > 1_000_000_000_000 { n / 1000 } else { n });
+    }
+    if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Some(d.and_hms_opt(23, 59, 59)?.and_utc().timestamp());
+    }
+    for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"] {
+        if let Ok(d) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
+            return Some(d.and_utc().timestamp());
+        }
+    }
+    None
 }
 
 fn parse_scope(s: &str) -> Vec<String> {
@@ -338,5 +410,83 @@ mod tests {
         assert!(is_loopback("::1"));
         assert!(!is_loopback("0.0.0.0"));
         assert!(!is_loopback("192.168.1.10"));
+    }
+
+    #[test]
+    fn a_token_without_an_expiry_field_never_expires() {
+        let a = Auth::from_entries(&["abc:write:alice".to_string()]);
+        let g = a.authenticate("abc").unwrap();
+        assert_eq!(g.expires_at, None);
+        assert!(!g.is_expired(i64::MAX / 2));
+    }
+
+    #[test]
+    fn a_unix_timestamp_expiry_is_honoured() {
+        let a = Auth::from_entries(&["abc:write:alice::1000".to_string()]);
+        let g = a.authenticate("abc").unwrap();
+        assert_eq!(g.expires_at, Some(1000));
+        assert!(!g.is_expired(999));
+        assert!(g.is_expired(1000), "the exact second counts as expired");
+        assert!(g.is_expired(1001));
+    }
+
+    #[test]
+    fn an_iso_date_expiry_covers_the_whole_day() {
+        // A person writing 2027-03-01 means "through that day", not "until
+        // midnight at the start of it".
+        let ts = parse_expiry("2027-03-01").unwrap();
+        let d = chrono::DateTime::from_timestamp(ts, 0).unwrap().naive_utc();
+        assert_eq!(d.date().to_string(), "2027-03-01");
+        assert_eq!(d.time().to_string(), "23:59:59");
+    }
+
+    #[test]
+    fn a_millisecond_timestamp_is_normalised_to_seconds() {
+        assert_eq!(parse_expiry("1700000000000"), Some(1_700_000_000));
+    }
+
+    #[test]
+    fn an_unparseable_expiry_means_no_expiry_not_lockout() {
+        // A typo must not revoke every agent at once.
+        assert_eq!(parse_expiry("next tuesday"), None);
+        assert_eq!(parse_expiry(""), None);
+        assert_eq!(parse_expiry("never"), None);
+    }
+
+    #[test]
+    fn authenticate_now_separates_expired_from_unknown() {
+        let a = Auth::from_entries(&["abc:write:alice::1000".to_string()]);
+        assert!(matches!(a.authenticate_now("abc", 500), AuthOutcome::Granted(_)));
+        match a.authenticate_now("abc", 2000) {
+            AuthOutcome::Expired(name) => assert_eq!(name, "alice"),
+            other => panic!("expected Expired, got {:?}", other),
+        }
+        assert!(matches!(a.authenticate_now("wrong", 500), AuthOutcome::Unknown));
+    }
+
+    #[test]
+    fn an_expiry_works_on_the_hashed_form_too() {
+        let token = "s3cret";
+        let line = format!("sha256:{}:read:bob:docs/**:1800000000", digest(token));
+        let a = Auth::from_entries(&[line]);
+        let g = a.authenticate(token).unwrap();
+        assert_eq!(g.expires_at, Some(1_800_000_000));
+        assert_eq!(g.scope, vec!["docs/**".to_string()]);
+    }
+
+    #[test]
+    fn a_scope_pattern_matches_the_way_a_person_expects() {
+        let g = Grant {
+            name: "x".into(),
+            role: Role::Write,
+            scope: vec!["docs/**".into(), "*.md".into(), "src/lib/one.rs".into()],
+            expires_at: None,
+        };
+        assert!(g.permits("docs/a/b.md"));
+        assert!(g.permits("README.md"));
+        assert!(g.permits("nested/readme.md"), "a bare name pattern matches any depth");
+        assert!(g.permits("src/lib/one.rs"));
+        assert!(!g.permits("src/lib/two.rs"));
+        assert!(!g.permits("src/main.rs"));
     }
 }

@@ -232,19 +232,22 @@ pub struct HttpUrl {
     pub host: String,
     pub port: u16,
     pub base_path: String,
+    /// True for `https://`. The scheme decides both the transport and the
+    /// default port, so it is carried in the parsed form rather than re-tested.
+    pub tls: bool,
 }
 
 pub fn parse_http_url(url: &str) -> ZResult<HttpUrl> {
-    // Check https BEFORE stripping the scheme, otherwise the strip fails first
-    // and the user gets "not an http url" instead of an explanation.
-    if url.starts_with("https://") {
-        return Err(bad(
-            "https is not supported: ZenForge speaks plain HTTP. Put it behind a TLS-terminating proxy",
-        ));
-    }
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| bad(format!("not an http url: {}", url)))?;
+    let (rest, tls, default_port) = if let Some(r) = url.strip_prefix("https://") {
+        (r, true, 443u16)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        (r, false, 80u16)
+    } else {
+        return Err(bad(format!(
+            "not an http or https url: {} (expected a scheme)",
+            url
+        )));
+    };
     let (authority, base_path) = match rest.find('/') {
         Some(i) => (&rest[..i], rest[i..].to_string()),
         None => (rest, String::new()),
@@ -255,12 +258,12 @@ pub fn parse_http_url(url: &str) -> ZResult<HttpUrl> {
             p.parse::<u16>()
                 .map_err(|_| bad(format!("bad port in url: {}", p)))?,
         ),
-        None => (authority.to_string(), 80u16),
+        None => (authority.to_string(), default_port),
     };
     if host.is_empty() {
         return Err(bad("empty host in url"));
     }
-    Ok(HttpUrl { host, port, base_path })
+    Ok(HttpUrl { host, port, base_path, tls })
 }
 
 pub fn is_http_url(url: &str) -> bool {
@@ -268,42 +271,63 @@ pub fn is_http_url(url: &str) -> bool {
 }
 
 /// Perform one HTTP request with an optional bearer token.
+#[allow(dead_code)] // kept as the two-argument form used by older callers and tests
 pub fn request_with_token(
     method: &str,
     url: &str,
     body: Option<&[u8]>,
     token: Option<&str>,
 ) -> ZResult<(u16, Vec<u8>)> {
+    request_with_pin(method, url, body, token, None)
+}
+
+/// Same as `request_with_token`, plus a certificate pin for a private server.
+///
+/// `pin` is the SHA-256 fingerprint a server printed when it started. Without
+/// one, the certificate is verified against the public roots, which is the only
+/// safe default for a host reached over the internet.
+pub fn request_with_pin(
+    method: &str,
+    url: &str,
+    body: Option<&[u8]>,
+    token: Option<&str>,
+    pin: Option<&str>,
+) -> ZResult<(u16, Vec<u8>)> {
     let u = parse_http_url(url)?;
-    let mut stream = TcpStream::connect((u.host.as_str(), u.port))
-        .map_err(|e| bad(format!("cannot connect to {}:{}: {}", u.host, u.port, e)))?;
-    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(120)))?;
+    let timeout = Duration::from_secs(120);
+    let head = build_request_head(method, &u, body, token);
 
-    let mut head = format!(
-        "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: */*\r\n",
-        method,
-        if u.base_path.is_empty() { "/".to_string() } else { u.base_path.clone() },
-        u.host
-    );
-    if let Some(tok) = token {
-        head.push_str(&format!("Authorization: Bearer {}\r\n", tok));
+    // Both transports run the same request bytes and the same response parser;
+    // only the socket differs.
+    let mut raw: Vec<u8> = Vec::new();
+    if u.tls {
+        let mut stream = crate::tls::connect(&u.host, u.port, pin, timeout)?;
+        stream.write_all(head.as_bytes())?;
+        if let Some(b) = body {
+            stream.write_all(b)?;
+        }
+        stream.flush()?;
+        if let Err(e) = stream.read_to_end(&mut raw) {
+            // A server that closes without close_notify leaves a complete
+            // response that rustls refuses to hand over quietly. If bytes
+            // arrived and the document is whole, say so instead of failing.
+            let complete = find_subslice(&raw, b"\r\n\r\n").is_some();
+            if !(complete && is_eof_error(&e)) {
+                return Err(bad(format!("reading the response failed: {}", e)));
+            }
+        }
+    } else {
+        let mut stream = TcpStream::connect((u.host.as_str(), u.port))
+            .map_err(|e| bad(format!("cannot connect to {}:{}: {}", u.host, u.port, e)))?;
+        stream.set_read_timeout(Some(timeout))?;
+        stream.set_write_timeout(Some(timeout))?;
+        stream.write_all(head.as_bytes())?;
+        if let Some(b) = body {
+            stream.write_all(b)?;
+        }
+        stream.flush()?;
+        stream.read_to_end(&mut raw)?;
     }
-    if let Some(b) = body {
-        head.push_str(&format!(
-            "Content-Type: application/octet-stream\r\nContent-Length: {}\r\n",
-            b.len()
-        ));
-    }
-    head.push_str("\r\n");
-    stream.write_all(head.as_bytes())?;
-    if let Some(b) = body {
-        stream.write_all(b)?;
-    }
-    stream.flush()?;
-
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw)?;
 
     let split = find_subslice(&raw, b"\r\n\r\n")
         .ok_or_else(|| bad("response has no end of headers"))?;
@@ -333,7 +357,107 @@ pub fn request_with_token(
     Ok((status, payload))
 }
 
+/// Assemble the request header block for either transport.
+/// Is this the "peer closed without close_notify" case?
+fn is_eof_error(e: &std::io::Error) -> bool {
+    let text = e.to_string();
+    text.contains("close_notify") || text.contains("UnexpectedEof")
+}
+
+fn build_request_head(
+    method: &str,
+    u: &HttpUrl,
+    body: Option<&[u8]>,
+    token: Option<&str>,
+) -> String {
+    let mut head = format!(
+        "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: */*\r\n",
+        method,
+        if u.base_path.is_empty() { "/".to_string() } else { u.base_path.clone() },
+        u.host
+    );
+    if let Some(tok) = token {
+        head.push_str("Authorization: Bearer ");
+        head.push_str(tok);
+        head.push_str("\r\n");
+    }
+    if let Some(b) = body {
+        head.push_str(&format!(
+            "Content-Type: application/octet-stream\r\nContent-Length: {}\r\n",
+            b.len()
+        ));
+    }
+    head.push_str("\r\n");
+    head
+}
+
 /// Serve `root` over HTTP until the process is killed.
+/// Serve `root` over TLS until the process is killed.
+///
+/// The request and response handling is shared with the plaintext server: only
+/// the socket differs. A repository served with a certificate is meant to leave
+/// loopback, so a bind without tokens is still refused.
+pub fn serve_tls(
+    root: PathBuf,
+    bind: String,
+    port: u16,
+    auth: Auth,
+    cert: &Path,
+    key: &Path,
+) -> ZResult<()> {
+    let cfg = crate::tls::server_config(cert, key)?;
+    let listener = TcpListener::bind((bind.as_str(), port))
+        .map_err(|e| bad(format!("cannot bind {}:{}: {}", bind, port, e)))?;
+    let local = listener.local_addr()?;
+    println!("zenforge listening on https://{}", local);
+    println!("certificate: {}", cert.display());
+    println!("fingerprint: {}", crate::tls::fingerprint_of(cert)?);
+    println!("repository: {}", root.display());
+    if auth.required {
+        println!("access: {} token(s) configured", auth.token_count());
+    } else {
+        return Err(bad(format!(
+            "refusing to serve TLS on {} without tokens: add entries to .zenforge/auth",
+            bind
+        )));
+    }
+    println!("press Ctrl-C to stop");
+
+    let root = Arc::new(root);
+    let auth = Arc::new(auth);
+    for incoming in listener.incoming() {
+        let stream = match incoming {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let root = Arc::clone(&root);
+        let auth = Arc::clone(&auth);
+        let cfg = Arc::clone(&cfg);
+        std::thread::spawn(move || {
+            match crate::tls::accept(stream, cfg) {
+                Ok(tls) => {
+                    let _ = handle_tls_connection(tls, &root, &auth);
+                }
+                Err(e) => eprintln!("tls handshake failed: {}", e),
+            }
+        });
+    }
+    Ok(())
+}
+
+fn handle_tls_connection(mut stream: crate::tls::TlsStream, root: &Path, auth: &Auth) -> ZResult<()> {
+    let resp = match read_request_generic(&mut stream) {
+        Ok(req) => route(root, &req, auth),
+        Err(e) => Response::error(400, "Bad Request", e.to_string()),
+    };
+    stream.write_all(&resp.to_bytes())?;
+    stream.flush()?;
+    // A dropped TLS stream looks like a truncated response to the peer, so the
+    // session is closed explicitly before the socket goes away.
+    stream.close()?;
+    Ok(())
+}
+
 pub fn serve(root: PathBuf, bind: String, port: u16, auth: Auth) -> ZResult<()> {
     let listener = TcpListener::bind((bind.as_str(), port))
         .map_err(|e| bad(format!("cannot bind {}:{}: {}", bind, port, e)))?;
@@ -382,6 +506,11 @@ fn handle_connection(mut stream: TcpStream, root: &Path, auth: &Auth) -> ZResult
 }
 
 fn read_request(stream: &mut TcpStream) -> ZResult<Request> {
+    read_request_generic(stream)
+}
+
+/// The request reader, generic over the socket so TLS and plaintext share it.
+fn read_request_generic<S: Read>(stream: &mut S) -> ZResult<Request> {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 8192];
 
@@ -462,19 +591,27 @@ pub fn route(root: &Path, req: &Request, auth: &Auth) -> Response {
                         .and_then(decode_basic_token)
                         .map(|s| Box::leak(s.into_boxed_str()) as &str)
                 });
-            match presented.and_then(|p| auth.authenticate(p)) {
-                Some(g) if Auth::allows(g.role, needed) => {
+            let now = chrono::Utc::now().timestamp();
+            match presented.map(|p| auth.authenticate_now(p, now)) {
+                Some(crate::auth::AuthOutcome::Granted(g)) if Auth::allows(g.role, needed) => {
                     who = g.name.clone();
                     grant = Some(g);
                 }
-                Some(_) => {
+                Some(crate::auth::AuthOutcome::Expired(name)) => {
+                    return Response::error(
+                        401,
+                        "Unauthorized",
+                        format!("token for {} expired", name),
+                    )
+                }
+                Some(crate::auth::AuthOutcome::Granted(_)) => {
                     return Response::error(
                         403,
                         "Forbidden",
                         format!("token does not grant {:?} access", needed),
                     )
                 }
-                None => {
+                None | Some(crate::auth::AuthOutcome::Unknown) => {
                     // A short sleep blunts online guessing without needing state
                     // per client. It costs an attacker 200 ms per attempt.
                     std::thread::sleep(std::time::Duration::from_millis(200));
@@ -888,9 +1025,32 @@ mod tests {
     }
 
     #[test]
-    fn https_is_refused_with_a_useful_message() {
-        let err = parse_http_url("https://example.com").unwrap_err().to_string();
-        assert!(err.contains("https is not supported"), "got: {}", err);
+    fn https_parses_with_tls_and_the_default_443() {
+        let u = parse_http_url("https://example.com/path").unwrap();
+        assert!(u.tls);
+        assert_eq!(u.port, 443);
+        assert_eq!(u.host, "example.com");
+        assert_eq!(u.base_path, "/path");
+    }
+
+    #[test]
+    fn http_still_parses_as_plaintext_on_port_80() {
+        let u = parse_http_url("http://example.com").unwrap();
+        assert!(!u.tls);
+        assert_eq!(u.port, 80);
+    }
+
+    #[test]
+    fn an_explicit_https_port_overrides_the_default() {
+        let u = parse_http_url("https://example.com:9443").unwrap();
+        assert!(u.tls);
+        assert_eq!(u.port, 9443);
+    }
+
+    #[test]
+    fn a_url_without_a_scheme_is_refused() {
+        let err = parse_http_url("example.com").unwrap_err().to_string();
+        assert!(err.contains("not an http or https url"), "got: {}", err);
     }
 
     #[test]
