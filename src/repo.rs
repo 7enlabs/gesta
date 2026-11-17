@@ -10,7 +10,7 @@ use crate::store::{
     merge_base, new_changeset_id, put_object, put_object_against,
 };
 use crate::worktree::IgnoreRules;
-use crate::{bad, now, ZResult, ZF_DIR};
+use crate::{bad, now, repo_dir, ZResult};
 
 /// Files loaded from the repository's ignore configuration.
 pub fn load_ignore_rules(root: &Path, conn: &Connection) -> ZResult<IgnoreRules> {
@@ -26,7 +26,7 @@ pub fn load_ignore_rules(root: &Path, conn: &Connection) -> ZResult<IgnoreRules>
             }
         }
     }
-    if let Ok(text) = fs::read_to_string(root.join(ZF_DIR).join("ignore")) {
+    if let Ok(text) = fs::read_to_string(repo_dir(root).join("ignore")) {
         for line in text.lines() {
             let l = line.trim();
             if !l.is_empty() && !l.starts_with('#') {

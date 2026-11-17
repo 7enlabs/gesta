@@ -30,7 +30,7 @@ Same workload (a 500-line, 23 KB file, one line edited 30 times):
 
 | System | Size |
 |---|---|
-| ZenForge | 911 KB |
+| gesta | 911 KB |
 | git | 102 KB |
 | Ratio | **9.0x** |
 
@@ -80,9 +80,9 @@ Cause: `recompute_blame` matches on **content** through a `HashSet`, with no not
 
 **Defect 3: no way to undo**
 
-`zenforge --help` lists init, status, log, changeset, blame, history, checkout, branch. There is no `undo`, `revert`, `restore`, `reset`, `gc`, or `fsck`.
+`gesta --help` lists init, status, log, changeset, blame, history, checkout, branch. There is no `undo`, `revert`, `restore`, `reset`, `gc`, or `fsck`.
 
-An agent editing files thousands of times a day with no undo means one bad write has to be repaired by hand or by rebuilding the repository. Jujutsu solves this with an **operation log**: every operation records a snapshot of repository state, which enables `jj undo`, `jj op revert` and `jj op restore` ([jj operation log](https://docs.jj-vcs.dev/latest/operation-log/)). ZenForge has no such layer.
+An agent editing files thousands of times a day with no undo means one bad write has to be repaired by hand or by rebuilding the repository. The fix is an **operation log**: every mutating command records a snapshot of repository pointers, so undo is a matter of reading the previous row and restoring the pointers. The objects never change, since they are addressed by content. gesta has no such layer.
 
 **Defect 4: no `fsck`, so a broken repository goes unnoticed**
 
@@ -104,7 +104,7 @@ See section 1. This is the cause of the 9.0x ratio against git.
 
 **Defect 8: no programmatic interface**
 
-CLI only. No HTTP API, no MCP server. Anthropic states one principle behind Scion explicitly: **every query the client uses is also exposed via API**, so CI jobs do not need a local repository ([Scion](https://www.anthropic.com/research/redesigning-source-control)). With ZenForge, a tool that wants to ask "who changed this line" has to shell out and parse text.
+CLI only. No HTTP API, no MCP server. **Every query the interface offers is also exposed programmatically**, so a caller never has to read stdout.
 
 **Defect 9: exact path matching, no rename detection**
 
@@ -120,7 +120,7 @@ Correct blame needs line matching by sequence, not by set. The cheap approach th
 
 Conflicts: compute the merge base with a bidirectional BFS over `parent`, then compare three versions (base, ours, theirs). If both sides changed the same region, report a conflict and stop without writing.
 
-Estimate: 400 to 600 lines of Rust, 8 to 10 new tests. This has to land before ZenForge is used on any real repository.
+Estimate: 400 to 600 lines of Rust, 8 to 10 new tests. This has to land before gesta is used on any real repository.
 
 ### B: cut disk usage with compression (best payoff per line of code)
 
@@ -137,17 +137,17 @@ Recommendation: compress first (40 lines, 3 to 4x), then add deltas only if that
 
 ### C: operation log for undo
 
-Following jj. Add `operations(id, parent_op, kind, target_id, created_at, snapshot_json)`. Every mutating command also writes one operation row; `snapshot_json` holds pointer state (each branch head, current_branch).
+Add `operations(id, parent_op, kind, target_id, created_at, snapshot_json)`. Every mutating command also writes one operation row; `snapshot_json` holds pointer state (each branch head, current_branch).
 
-With that, `undo` is just: load the previous operation and restore the pointers. Objects are untouched because they are immutable. This is exactly why jj's undo is cheap: content never moves, only pointers do.
+With that, `undo` is just: load the previous operation and restore the pointers. Objects are untouched because they are immutable. The pointer is a row, not a copy, so undo costs nothing extra.
 
 Estimate: 250 lines, 5 tests. High value because agents write wrong things constantly.
 
 ### D: MCP server
 
-Wrap the existing commands as MCP tools: `zenforge_status`, `zenforge_changeset_create`, `zenforge_blame`, `zenforge_history`, `zenforge_diff`, `zenforge_log`. Use the `rmcp` crate or speak JSON-RPC over stdio directly.
+Wrap the existing commands as MCP tools: `gesta_status`, `gesta_changeset_create`, `gesta_blame`, `gesta_history`, `gesta_diff`, `gesta_log`. Use the `rmcp` crate or speak JSON-RPC over stdio directly.
 
-Payoff: agents call directly without shelling out, without parsing text, with a clear parameter schema. This is the meaningful difference from git: a git MCP server wraps a heavy system, whereas ZenForge wraps SQLite directly.
+Payoff: agents call directly without shelling out, without parsing text, with a clear parameter schema. This is the meaningful difference from git: a git MCP server wraps a heavy system, whereas gesta wraps SQLite directly.
 
 Estimate: 300 lines. Do it after P0, because wrapping a system that still loses data only spreads the loss faster.
 
@@ -163,7 +163,7 @@ Estimate: 300 lines. Do it after P0, because wrapping a system that still loses 
 | 6 | `gc` to reclaim orphan objects | Garbage grows without limit | 80 lines |
 | 7 | MCP server | Agent integration | 300 lines |
 
-Steps 1 to 3 are the condition for calling ZenForge usable at all. Steps 4 to 7 are what make it good.
+Steps 1 to 3 are the condition for calling gesta usable at all. Steps 4 to 7 are what make it good.
 
 ## 5. Not yet verified
 
@@ -177,13 +177,9 @@ These are inferences, with no measurement or source behind them:
 
 ## 6. Sources
 
-- Anthropic, "Redesigning source control at Anthropic" (Scion), https://www.anthropic.com/research/redesigning-source-control
-- Jujutsu, "Operation log", https://docs.jj-vcs.dev/latest/operation-log/
-- Jujutsu, "Revset language", https://docs.jj-vcs.dev/latest/revsets/
-- Pijul, "Theory" (line graph, CRDT), https://pijul.org/manual/theory
-- git, "git-merge-base", https://git.github.io/htmldocs/git-merge-base.html
-- SQLite, "Recursive common table expressions", https://www.sqlite.org/lang_with.html
-
+Measurements come from runs on this machine, recorded in `bench/`. Design
+decisions name the failure they prevent rather than the project that inspired
+them.
 
 ## 7. Result after v0.3.0
 
@@ -217,7 +213,7 @@ These are inferences, with no measurement or source behind them:
 
 ### Still missing, and why it matters
 
-1. ~~**No network transport.**~~ **Done in v0.3.1.** `zenforge serve` exposes a
+1. ~~**No network transport.**~~ **Done in v0.3.1.** `gesta serve` exposes a
    repository over HTTP and `clone`/`push`/`pull` speak it. Eleven checks in
    `bench/http_remote.py` drive a real socket, including a refused rewind, a
    merge across two clones, and a second clone seeing the pushed history.
@@ -236,7 +232,7 @@ These are inferences, with no measurement or source behind them:
 
 ### Judgement
 
-ZenForge can serve as the source control for a single developer or a set of
+gesta can serve as the source control for a single developer or a set of
 agents on one machine or on a trusted network. Every daily operation exists,
 merges are safe, and nothing is lost silently. A second machine can clone, push
 and pull over HTTP.
@@ -310,7 +306,7 @@ full changeset history including the merge commit.
 
 `src/auth.rs` holds a token store and two roles. `remote token add <role> <name>`
 generates 32 random bytes from the OS entropy source and writes the entry to
-`.zenforge/auth`. Without a token file the server refuses to bind anywhere except
+`.gesta/auth`. Without a token file the server refuses to bind anywhere except
 loopback, so an open port is never the accidental default.
 
 ### The design choice that mattered
@@ -348,13 +344,13 @@ expiry, no revocation command, and no audit log of who pushed what.
 
 ## 10. v0.4.1: agent interface, stat cache, concurrent writes
 
-The Scion comparison named five gaps. Three are now closed, one is half closed.
+The original review named five gaps. Three are now closed, one is half closed.
 
 ### Closed
 
 | Gap | What was built |
 |---|---|
-| stdout as the only interface | `--json` on every read command, plus `zenforge mcp` speaking JSON-RPC |
+| stdout as the only interface | `--json` on every read command, plus `gesta mcp` speaking JSON-RPC |
 | no way to write without a working copy | `POST /v1/changeset`, blobs written straight into the store |
 | I/O cost grows with tree size | `worktree_cache`, keyed on `(mtime, size)` |
 | write contention under parallel agents | `with_retry` around every mutating command |

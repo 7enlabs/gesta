@@ -14,7 +14,7 @@ use crate::repo;
 use crate::store::{self, branch_head, current_branch, get_object, hash_at_point, init_schema,
     open_db, reachable_from, set_state};
 use crate::worktree;
-use crate::{bad, fmt_ts, normalise, now, open_repo, repo_root, ZResult, ZF_DIR};
+use crate::{bad, fmt_ts, normalise, now, open_repo, repo_dir, repo_root, ZResult};
 
 // init / status / diff / log.
 
@@ -75,9 +75,9 @@ pub fn cmd_mcp() -> ZResult<()> {
 
 pub fn cmd_init(bare: bool) -> ZResult<()> {
     let root = std::env::current_dir()?;
-    let zf = root.join(ZF_DIR);
+    let zf = repo_dir(&root);
     if zf.is_dir() {
-        println!("already a zenforge repository: {}", zf.display());
+        println!("already a repository: {}", zf.display());
         return Ok(());
     }
     fs::create_dir_all(&zf)?;
@@ -94,7 +94,7 @@ pub fn cmd_init(bare: bool) -> ZResult<()> {
         // working tree: the scanner refuses to track anything.
         set_state(&conn, "bare", "1")?;
     }
-    println!("initialized zenforge repository at {}", zf.display());
+    println!("initialized repository at {}", zf.display());
     println!("branch: main (no changesets yet)");
     Ok(())
 }
@@ -323,7 +323,7 @@ pub fn cmd_changeset_create(message: &str, author: &str) -> ZResult<()> {
                     println!("  ? {}", f);
                 }
             }
-            println!("\nnext: zenforge changeset commit {}", cs.id);
+            println!("\nnext: gesta changeset commit {}", cs.id);
             Ok(())
         }
     }
@@ -458,7 +458,7 @@ pub fn cmd_revert(id: &str, reason: Option<&str>, author: &str) -> ZResult<()> {
     let revert_id = store::with_retry(|| history::revert_changeset(&conn, &root, id, author, reason))?;
     ops::record(&conn, "revert", Some(&revert_id), Some(id))?;
     println!("reverted {} as {}", id, revert_id);
-    println!("\nThe revert is a normal changeset: `zenforge log` shows both, and");
+    println!("\nThe revert is a normal changeset: `gesta log` shows both, and");
     println!("reverting the revert restores the change.");
     Ok(())
 }

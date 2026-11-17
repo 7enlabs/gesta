@@ -1,4 +1,4 @@
-//! ZenForge: source control for AI agents.
+//! gesta: source control for AI agents.
 //!
 //! Server-side changesets, content-addressed compressed objects, derived blame
 //! and history, three-way merge, remote sync, and an operation log for undo.
@@ -30,8 +30,57 @@ use std::path::PathBuf;
 
 use store::{init_schema, migrate, open_db};
 
-pub const ZF_DIR: &str = ".zenforge";
-pub const ZF_DB: &str = "zenforge.db";
+/// Directory that holds the repository. Named after the tool, and the old name is
+/// still recognised so repositories created before the rename keep working.
+pub const ZF_DIR: &str = ".gesta";
+/// The directory this project used before it was renamed. Reading it is
+/// supported; nothing ever writes to it.
+pub const LEGACY_DIR: &str = ".zenforge";
+
+/// The repository directory in `root`, whatever name it was created under.
+///
+/// Every path built against `ZF_DIR` would look in `.gesta/` and miss a
+/// repository made before the rename, so callers ask here instead. When neither
+/// exists the new name is returned, which is what `init` then creates.
+/// The database file for the repository in `root`, under whichever name the
+/// repository was created with.
+///
+/// The directory name and the file name changed together, so a repository made
+/// before the rename has `.zenforge/zenforge.db`. Looking only for `.gesta` and
+/// `gesta.db` finds nothing inside an existing repository, and the schema init
+/// then creates an empty database next to the real one, which looks like every
+/// file went missing.
+pub fn repo_db(root: &std::path::Path) -> PathBuf {
+    let new = repo_dir(root).join(ZF_DB);
+    let legacy = root.join(LEGACY_DIR).join(LEGACY_DB);
+
+    // Size, not existence. An empty file of the new name is what a failed or
+    // interrupted start leaves behind, and preferring it over the real database
+    // next to it makes every repository look empty.
+    let size = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    if size(&new) > 0 {
+        return new;
+    }
+    if size(&legacy) > 0 {
+        return legacy;
+    }
+    new
+}
+
+pub fn repo_dir(root: &std::path::Path) -> PathBuf {
+    let new = root.join(ZF_DIR);
+    if new.is_dir() {
+        return new;
+    }
+    let old = root.join(LEGACY_DIR);
+    if old.is_dir() {
+        return old;
+    }
+    new
+}
+pub const ZF_DB: &str = "gesta.db";
+/// Database file name used before the rename, inside `LEGACY_DIR`.
+pub const LEGACY_DB: &str = "zenforge.db";
 
 pub type ZResult<T> = std::result::Result<T, Box<dyn Error>>;
 
@@ -56,11 +105,14 @@ pub fn normalise(file: &str) -> String {
 pub fn repo_root() -> ZResult<PathBuf> {
     let mut cur = std::env::current_dir()?;
     loop {
-        if cur.join(ZF_DIR).is_dir() {
+        // A repository made before the rename has the old directory name. Reading
+        // it keeps every existing repository usable; `gesta init` and every write
+        // path use the new name, so nothing new lands in the old directory.
+        if cur.join(ZF_DIR).is_dir() || cur.join(LEGACY_DIR).is_dir() {
             return Ok(cur);
         }
         if !cur.pop() {
-            return Err(bad("not a zenforge repository (run 'zenforge init')"));
+            return Err(bad("not a repository (run 'gesta init')"));
         }
     }
 }
@@ -78,7 +130,7 @@ fn open_repo() -> ZResult<(PathBuf, rusqlite::Connection)> {
 // CLI.
 
 #[derive(Parser)]
-#[command(name = "zenforge", version, about = "Source control for AI agents")]
+#[command(name = "gesta", version, about = "Source control for AI agents")]
 struct Cli {
     /// Print machine-readable JSON instead of text
     #[arg(long, global = true)]
@@ -314,7 +366,7 @@ enum RemoteCmd {
 
 #[derive(Subcommand)]
 enum TokenCmd {
-    /// Generate a token and write it to .zenforge/auth
+    /// Generate a token and write it to .gesta/auth
     Add {
         /// read or write
         #[arg(default_value = "write")]
@@ -343,7 +395,7 @@ enum IgnoreCmd {
 
 /// Exit quietly when the reader closed the pipe.
 ///
-/// `println!` panics on a broken pipe, so `zenforge status | head -1` printed a
+/// `println!` panics on a broken pipe, so `gesta status | head -1` printed a
 /// panic message and a backtrace from inside the standard library. Every tool
 /// that writes to stdout is piped into something eventually, and git exits
 /// silently in the same situation, so a closed pipe is normal use rather than an
@@ -370,7 +422,7 @@ fn quiet_broken_pipe() {
 fn main() {
     quiet_broken_pipe();
     if let Err(e) = run() {
-        eprintln!("zenforge: {}", e);
+        eprintln!("gesta: {}", e);
         std::process::exit(1);
     }
 }
@@ -457,5 +509,69 @@ fn run() -> ZResult<()> {
             IgnoreCmd::List => cli_remote::cmd_ignore_list(),
             IgnoreCmd::Remove { pattern } => cli_remote::cmd_ignore_remove(&pattern),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "gesta-root-{}-{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn a_new_repository_uses_the_current_directory_name() {
+        let d = tmp("new");
+        std::fs::create_dir_all(d.join(ZF_DIR)).unwrap();
+        assert_eq!(repo_dir(&d), d.join(ZF_DIR));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_repository_made_before_the_rename_is_still_found() {
+        // The rename touched the directory name and the database file name at
+        // once. Finding the directory but not the database created an empty one
+        // beside the real one, and the repository then looked empty.
+        let d = tmp("old");
+        std::fs::create_dir_all(d.join(LEGACY_DIR)).unwrap();
+        std::fs::write(d.join(LEGACY_DIR).join(LEGACY_DB), b"not empty").unwrap();
+
+        assert_eq!(repo_dir(&d), d.join(LEGACY_DIR));
+        assert_eq!(repo_db(&d), d.join(LEGACY_DIR).join(LEGACY_DB));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_empty_database_of_the_new_name_does_not_shadow_the_real_one() {
+        // An interrupted start can leave a zero byte file behind. Choosing it
+        // because it exists is how a full repository reads as empty.
+        let d = tmp("shadow");
+        std::fs::create_dir_all(d.join(LEGACY_DIR)).unwrap();
+        std::fs::write(d.join(LEGACY_DIR).join(LEGACY_DB), b"schema and data").unwrap();
+        std::fs::write(d.join(LEGACY_DIR).join(ZF_DB), b"").unwrap();
+
+        assert_eq!(repo_db(&d), d.join(LEGACY_DIR).join(LEGACY_DB));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_new_name_wins_when_both_exist_with_content() {
+        let d = tmp("both");
+        std::fs::create_dir_all(d.join(ZF_DIR)).unwrap();
+        std::fs::create_dir_all(d.join(LEGACY_DIR)).unwrap();
+        std::fs::write(d.join(ZF_DIR).join(ZF_DB), b"new data").unwrap();
+        std::fs::write(d.join(LEGACY_DIR).join(LEGACY_DB), b"old data").unwrap();
+
+        assert_eq!(repo_dir(&d), d.join(ZF_DIR));
+        assert_eq!(repo_db(&d), d.join(ZF_DIR).join(ZF_DB));
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

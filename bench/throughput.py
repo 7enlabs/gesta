@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Head to head with git on the operations an agent actually repeats.
+"""Throughput on the operations an agent actually repeats.
 
 An agent does three things thousands of times a day: check status, diff, and
-commit. Raw throughput on those decides whether ZenForge is usable, and any
+commit. Raw throughput on those decides whether the tool is usable, and any
 comparison that measures something else is decoration.
 
-Run: python3 bench/vs_git.py
+Run: python3 bench/throughput.py
 """
 
 import os
@@ -16,7 +16,7 @@ import statistics
 import sys
 import time
 
-ZF = os.environ.get("ZF_BIN", "/work/zenforge/target/release/zenforge")
+ZF = os.environ.get("ZF_BIN", "/work/gesta/target/release/gesta")
 # The benchmark must not run on a bind mount. /work is a 9p drvfs share of a
 # Windows drive, where every read crosses the container boundary, and a 3.7 MB
 # binary then takes 7 ms to page in instead of 0.9 ms. Measuring there blames the
@@ -25,7 +25,7 @@ ZF = os.environ.get("ZF_BIN", "/work/zenforge/target/release/zenforge")
 ROOT = os.environ.get("ZF_BENCH_ROOT", "/tmp/zf_vs_git_bench")
 
 # Copy the binary to the same local filesystem as the work it measures.
-LOCAL_ZF = "/tmp/zenforge_bench_bin"
+LOCAL_ZF = "/tmp/gesta_bench_bin"
 if os.path.exists(ZF) and not os.path.exists(LOCAL_ZF):
     shutil.copy2(ZF, LOCAL_ZF)
     os.chmod(LOCAL_ZF, 0o755)
@@ -42,7 +42,7 @@ def record(name, zf_ms, git_ms, detail=""):
         return
     ratio = zf_ms / git_ms if git_ms else 0
     verdict = "faster" if ratio < 1 else "slower"
-    print(f"  {name:34} zenforge {zf_ms:8.1f} ms | git {git_ms:8.1f} ms | {ratio:5.2f}x {verdict}")
+    print(f"  {name:34} gesta {zf_ms:8.1f} ms | git {git_ms:8.1f} ms | {ratio:5.2f}x {verdict}")
 
 
 def sh(cmd, cwd=None):
@@ -107,7 +107,7 @@ def main():
         sh("git config user.email a@b.c", cwd=gt_dir)
         sh("git config user.name bench", cwd=gt_dir)
         sh("git add -A && git commit -qm init", cwd=gt_dir)
-        # zenforge
+        # gesta
         sh(f"{ZF} init", cwd=zf_dir)
         commit_all_zf(zf_dir)
 
@@ -168,7 +168,7 @@ def main():
     print()
     wins = sum(1 for _, z, g in results if z and g and z < g)
     total = sum(1 for _, z, g in results if z and g)
-    print(f"zenforge faster on {wins}/{total} operations")
+    print(f"gesta faster on {wins}/{total} operations")
     return 0
 
 

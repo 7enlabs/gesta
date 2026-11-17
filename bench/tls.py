@@ -18,7 +18,7 @@ import sys
 import time
 import urllib.request
 
-ZF = os.environ.get("ZF_BIN", "/work/zenforge/target/release/zenforge")
+ZF = os.environ.get("ZF_BIN", "/work/gesta/target/release/gesta")
 ROOT = "/tmp/zf_tls_bench"
 PORT = 8793
 TOKEN = "tls-bench-token-0123456789abcdef"
@@ -91,7 +91,7 @@ def main():
     run("init", cwd=server)
     write(server, "app.py", "print('hello')\n")
     commit(server, "seed")
-    with open(os.path.join(server, ".zenforge", "auth"), "w") as fh:
+    with open(os.path.join(server, ".gesta", "auth"), "w") as fh:
         fh.write(f"{TOKEN}:write:tester\n")
 
     proc = subprocess.Popen(
@@ -112,8 +112,8 @@ def main():
             print((err or "")[:400])
             return 1
 
-        cert_path = os.path.join(server, ".zenforge", "cert.pem")
-        key_path = os.path.join(server, ".zenforge", "key.pem")
+        cert_path = os.path.join(server, ".gesta", "cert.pem")
+        key_path = os.path.join(server, ".gesta", "key.pem")
         record("a self-signed certificate and key were generated",
                os.path.exists(cert_path) and os.path.exists(key_path))
 

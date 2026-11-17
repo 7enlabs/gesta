@@ -1,4 +1,4 @@
-//! Minimal HTTP/1.1 transport so a ZenForge repository can be served and
+//! Minimal HTTP/1.1 transport so a repository can be served and
 //! reached over a network.
 //!
 //! Written on `std::net` on purpose: no TLS stack, no async runtime, no
@@ -418,7 +418,7 @@ pub fn serve_tls(
     let listener = TcpListener::bind((bind.as_str(), port))
         .map_err(|e| bad(format!("cannot bind {}:{}: {}", bind, port, e)))?;
     let local = listener.local_addr()?;
-    println!("zenforge listening on https://{}", local);
+    println!("gesta listening on https://{}", local);
     println!("certificate: {}", cert.display());
     println!("fingerprint: {}", crate::tls::fingerprint_of(cert)?);
     println!("repository: {}", root.display());
@@ -426,7 +426,7 @@ pub fn serve_tls(
         println!("access: {} token(s) configured", auth.token_count());
     } else {
         return Err(bad(format!(
-            "refusing to serve TLS on {} without tokens: add entries to .zenforge/auth",
+            "refusing to serve TLS on {} without tokens: add entries to .gesta/auth",
             bind
         )));
     }
@@ -472,7 +472,7 @@ pub fn serve(root: PathBuf, bind: String, port: u16, auth: Auth) -> ZResult<()> 
     let listener = TcpListener::bind((bind.as_str(), port))
         .map_err(|e| bad(format!("cannot bind {}:{}: {}", bind, port, e)))?;
     let local = listener.local_addr()?;
-    println!("zenforge listening on http://{}", local);
+    println!("gesta listening on http://{}", local);
     println!("repository: {}", root.display());
     if auth.required {
         println!("access: {} token(s) configured", auth.token_count());
@@ -480,7 +480,7 @@ pub fn serve(root: PathBuf, bind: String, port: u16, auth: Auth) -> ZResult<()> 
         println!("access: open, loopback only");
     } else {
         return Err(bad(format!(
-            "refusing to serve {} without tokens: add entries to .zenforge/auth, or bind 127.0.0.1",
+            "refusing to serve {} without tokens: add entries to .gesta/auth, or bind 127.0.0.1",
             bind
         )));
     }
@@ -961,13 +961,14 @@ fn receive_bundle(root: &Path, branch: &str, body: &[u8], who: &str) -> Result<S
     Ok(format!("applied {}\nhead {}\n", applied, head))
 }
 
-/// Append one line to `.zenforge/access.log`, recording who did what.
+/// Append one line to the access log in the repository directory, recording who
+/// did what.
 ///
 /// The server is the only place that knows the authenticated identity, so the
 /// audit trail has to be written here rather than on the client.
 pub fn log_access(root: &Path, who: &str, action: &str, branch: &str, detail: &str) {
     use std::io::Write;
-    let path = root.join(crate::ZF_DIR).join("access.log");
+    let path = crate::repo_dir(root).join("access.log");
     let line = format!(
         "{}\t{}\t{}\t{}\t{}\n",
         chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),

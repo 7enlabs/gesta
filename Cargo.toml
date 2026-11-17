@@ -1,12 +1,12 @@
 [package]
-name = "zenforge"
+name = "gesta"
 version = "0.5.1"
 edition = "2021"
 description = "Source control for AI agents"
 license = "MIT"
 
 [[bin]]
-name = "zenforge"
+name = "gesta"
 path = "src/main.rs"
 
 [dependencies]

@@ -14,8 +14,8 @@ import re
 import subprocess
 import sys
 
-ZF_DIR = "/work/zenforge"
-ZF = os.path.join(ZF_DIR, "target/release/zenforge")
+ZF_DIR = "/work/gesta"
+ZF = os.path.join(ZF_DIR, "target/release/gesta")
 BUGHUNTER = os.environ.get("BUGHUNTER_DIR", "/work/hermes-health/sec/bughunter")
 results = []
 
@@ -166,7 +166,7 @@ def main():
 
     if want("suites"):
         suites = [
-            "replace_git", "http_remote", "http_auth", "mcp_json", "api_changeset",
+            "e2e", "http_remote", "http_auth", "mcp_json", "api_changeset",
             "concurrency", "conflicts", "sparse", "tls",
         ]
         failed = []

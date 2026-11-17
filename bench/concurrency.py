@@ -15,7 +15,7 @@ import sqlite3
 import subprocess
 import sys
 
-ZF = os.environ.get("ZF_BIN", "/work/zenforge/target/release/zenforge")
+ZF = os.environ.get("ZF_BIN", "/work/gesta/target/release/gesta")
 ROOT = "/tmp/zf_concurrency"
 WORKERS = 20
 results = []
@@ -71,7 +71,7 @@ def main():
     record(f"{WORKERS} parallel snapshots all succeed", not errors,
            "\n".join(errors[:3]))
 
-    db = os.path.join(repo, ".zenforge", "zenforge.db")
+    db = os.path.join(repo, ".gesta", "gesta.db")
     conn = sqlite3.connect(db)
     created = conn.execute("SELECT COUNT(*) FROM changesets").fetchone()[0]
     record("every snapshot produced a distinct changeset", created == WORKERS,

@@ -22,12 +22,12 @@ pub const PROTOCOL_VERSION: &str = "2026-07-28";
 pub fn tool_definitions() -> Json {
     Json::arr(vec![
         tool(
-            "zenforge_status",
+            "gesta_status",
             "Repository state: current branch, head changeset, pending changesets and the files that differ from the head.",
             Json::obj(vec![("type", Json::str("object")), ("properties", Json::obj(vec![]))]),
         ),
         tool(
-            "zenforge_log",
+            "gesta_log",
             "List changesets, newest first.",
             Json::obj(vec![
                 ("type", Json::str("object")),
@@ -41,7 +41,7 @@ pub fn tool_definitions() -> Json {
             ]),
         ),
         tool(
-            "zenforge_read_file",
+            "gesta_read_file",
             "Read a file from the repository without checking it out. Pass a changeset or branch to read an older version.",
             Json::obj(vec![
                 ("type", Json::str("object")),
@@ -56,7 +56,7 @@ pub fn tool_definitions() -> Json {
             ]),
         ),
         tool(
-            "zenforge_blame",
+            "gesta_blame",
             "Line ownership for a file: which changeset and author introduced each line.",
             Json::obj(vec![
                 ("type", Json::str("object")),
@@ -68,7 +68,7 @@ pub fn tool_definitions() -> Json {
             ]),
         ),
         tool(
-            "zenforge_diff",
+            "gesta_diff",
             "Structured diff for one changeset, or for the working tree against the current branch.",
             Json::obj(vec![
                 ("type", Json::str("object")),
@@ -81,7 +81,7 @@ pub fn tool_definitions() -> Json {
             ]),
         ),
         tool(
-            "zenforge_merge_conflicts",
+            "gesta_merge_conflicts",
             "Report what merging a branch would conflict on, with both sides and line numbers, without touching anything.",
             Json::obj(vec![
                 ("type", Json::str("object")),
@@ -96,8 +96,8 @@ pub fn tool_definitions() -> Json {
             ]),
         ),
         tool(
-            "zenforge_create_changeset",
-            "Snapshot the working tree as a pending changeset. Nothing is committed until zenforge_commit.",
+            "gesta_create_changeset",
+            "Snapshot the working tree as a pending changeset. Nothing is committed until gesta_commit.",
             Json::obj(vec![
                 ("type", Json::str("object")),
                 (
@@ -111,13 +111,13 @@ pub fn tool_definitions() -> Json {
             ]),
         ),
         tool(
-            "zenforge_commit",
+            "gesta_commit",
             "Commit a pending changeset and move the branch head.",
             Json::obj(vec![
                 ("type", Json::str("object")),
                 (
                     "properties",
-                    Json::obj(vec![("id", Json::obj(vec![("type", Json::str("string")), ("description", Json::str("Changeset id returned by zenforge_create_changeset."))]))]),
+                    Json::obj(vec![("id", Json::obj(vec![("type", Json::str("string")), ("description", Json::str("Changeset id returned by gesta_create_changeset."))]))]),
                 ),
                 ("required", Json::arr(vec![Json::str("id")])),
             ]),
@@ -221,7 +221,7 @@ fn initialize_result() -> Json {
         (
             "serverInfo",
             Json::obj(vec![
-                ("name", Json::str("zenforge")),
+                ("name", Json::str("gesta")),
                 ("version", Json::str(env!("CARGO_PKG_VERSION"))),
             ]),
         ),
@@ -239,15 +239,21 @@ fn call_tool(root: &Path, params: &Json) -> Result<Json, ToolError> {
     let conn = store::open_db(root).map_err(|e| (-32603, e.to_string()))?;
     store::init_schema(&conn).map_err(|e| (-32603, e.to_string()))?;
 
+    // Tools are named for the project. A client configured before the rename
+    // still sends the old prefix, so it is mapped onto the same handler rather
+    // than failing with "unknown tool".
+    let name = name.strip_prefix("zenforge_").map(|rest| format!("gesta_{}", rest)).unwrap_or(name.to_string());
+    let name = name.as_str();
+
     let value = match name {
-        "zenforge_status" => tool_status(&conn),
-        "zenforge_log" => tool_log(&conn, &args),
-        "zenforge_read_file" => tool_read_file(&conn, &args),
-        "zenforge_blame" => tool_blame(&conn, &args),
-        "zenforge_diff" => tool_diff(&conn, root, &args),
-        "zenforge_merge_conflicts" => tool_merge_conflicts(&conn, root, &args),
-        "zenforge_create_changeset" => tool_create_changeset(&conn, root, &args),
-        "zenforge_commit" => tool_commit(&conn, &args),
+        "gesta_status" => tool_status(&conn),
+        "gesta_log" => tool_log(&conn, &args),
+        "gesta_read_file" => tool_read_file(&conn, &args),
+        "gesta_blame" => tool_blame(&conn, &args),
+        "gesta_diff" => tool_diff(&conn, root, &args),
+        "gesta_merge_conflicts" => tool_merge_conflicts(&conn, root, &args),
+        "gesta_create_changeset" => tool_create_changeset(&conn, root, &args),
+        "gesta_commit" => tool_commit(&conn, &args),
         other => return Err((-32602, format!("unknown tool: {}", other))),
     }
     .map_err(|e| (-32603, e))?;
@@ -497,9 +503,9 @@ mod tests {
     fn tmp_repo(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("zf_mcp_{}_{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
-        // The database lives inside .zenforge/, so that directory has to exist
-        // before open_db, exactly as `zenforge init` would leave it.
-        std::fs::create_dir_all(d.join(crate::ZF_DIR)).unwrap();
+        // The database lives inside the repository directory, so that directory has
+        // to exist before open_db, exactly as `gesta init` would leave it.
+        std::fs::create_dir_all(crate::repo_dir(&d)).unwrap();
         let conn = store::open_db(&d).unwrap();
         store::init_schema(&conn).unwrap();
         conn.execute(
@@ -525,7 +531,7 @@ mod tests {
             Some(PROTOCOL_VERSION)
         );
         let info = field(result, "serverInfo").unwrap();
-        assert_eq!(json::as_str(field(info, "name").unwrap()), Some("zenforge"));
+        assert_eq!(json::as_str(field(info, "name").unwrap()), Some("gesta"));
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -575,7 +581,7 @@ mod tests {
         let d = tmp_repo("status");
         let r = rpc(
             &d,
-            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"zenforge_status","arguments":{}}}"#,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"gesta_status","arguments":{}}}"#,
         );
         let sc = field(field(&r, "result").unwrap(), "structuredContent").unwrap();
         assert_eq!(json::as_str(field(sc, "branch").unwrap()), Some("main"));
@@ -590,13 +596,13 @@ mod tests {
 
         let r = rpc(
             &d,
-            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"zenforge_create_changeset","arguments":{"message":"first","author":"tester"}}}"#,
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"gesta_create_changeset","arguments":{"message":"first","author":"tester"}}}"#,
         );
         let sc = field(field(&r, "result").unwrap(), "structuredContent").unwrap();
         let id = json::as_str(field(sc, "id").unwrap()).unwrap().to_string();
 
         let call = format!(
-            r#"{{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{{"name":"zenforge_commit","arguments":{{"id":"{}"}}}}}}"#,
+            r#"{{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{{"name":"gesta_commit","arguments":{{"id":"{}"}}}}}}"#,
             id
         );
         let r = rpc(&d, &call);
@@ -621,7 +627,7 @@ mod tests {
 
         let r = rpc(
             &d,
-            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"zenforge_read_file","arguments":{"path":"a.txt"}}}"#,
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"gesta_read_file","arguments":{"path":"a.txt"}}}"#,
         );
         let sc = field(field(&r, "result").unwrap(), "structuredContent").unwrap();
         assert_eq!(json::as_str(field(sc, "content").unwrap()), Some("line one\n"));

@@ -2,7 +2,10 @@
 /target
 **/*.rs.bk
 
-# ZenForge repository state (a repo inside a repo)
+# Repository state lives in the project directory
+.gesta/
+# The name used before the rename, still ignored so an old directory
+# in this repository cannot be committed
 .zenforge/
 *.db
 *.db-wal

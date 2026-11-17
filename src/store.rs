@@ -9,10 +9,10 @@ use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use crate::{bad, now, ZResult, ZF_DB, ZF_DIR};
+use crate::{bad, now, repo_db, ZResult};
 
 pub fn db_path(root: &Path) -> PathBuf {
-    root.join(ZF_DIR).join(ZF_DB)
+    repo_db(root)
 }
 
 pub fn open_db(root: &Path) -> ZResult<Connection> {

@@ -3,10 +3,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::ZF_DIR;
+use crate::{LEGACY_DIR, ZF_DIR};
 
 /// Directory names never descended into, regardless of ignore rules.
-const SKIP_DIRS: &[&str] = &[ZF_DIR, ".git", ".hg", ".svn", "node_modules", "target", ".venv", "venv", "dist", "build", "__pycache__"];
+const SKIP_DIRS: &[&str] = &[ZF_DIR, LEGACY_DIR, ".git", ".hg", ".svn", "node_modules", "target", ".venv", "venv", "dist", "build", "__pycache__"];
 
 /// A gitignore-style pattern.
 ///
@@ -216,7 +216,7 @@ pub const DEFAULT_IGNORES: &[&str] = &[
     "*.swp",
     "*.tmp",
     "*~",
-    "/.zenforge/",
+    "/.gesta/", "/.zenforge/",
     "/.git/",
 ];
 
@@ -384,7 +384,7 @@ mod tests {
     fn defaults_ignore_os_noise_but_not_source() {
         let r = IgnoreRules::with_defaults(&[]);
         assert!(r.is_ignored(".DS_Store", false));
-        assert!(!r.is_ignored("src/.zenforge/x", false)); // nested, not the repo dir
+        assert!(!r.is_ignored("src/.gesta/x", false)); // nested, not the repo dir
         assert!(!r.is_ignored("src/main.rs", false));
     }
 
@@ -406,11 +406,11 @@ mod tests {
     #[test]
     fn scan_prunes_vendor_dirs_and_ignored_paths() {
         let tmp = tmpdir("scan");
-        for d in [".zenforge", "target", "node_modules", "src", "secret"] {
+        for d in [".gesta", "target", "node_modules", "src", "secret"] {
             fs::create_dir_all(tmp.join(d)).unwrap();
         }
         fs::write(tmp.join("src/a.rs"), "fn main(){}").unwrap();
-        fs::write(tmp.join(".zenforge/db"), "x").unwrap();
+        fs::write(tmp.join(".gesta/db"), "x").unwrap();
         fs::write(tmp.join("target/bin"), "x").unwrap();
         fs::write(tmp.join("node_modules/m.js"), "x").unwrap();
         fs::write(tmp.join("secret/key.pem"), "PRIVATE").unwrap();

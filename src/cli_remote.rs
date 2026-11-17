@@ -16,7 +16,7 @@ use crate::store::{
     object_store_bytes, open_db, set_state,
 };
 use crate::worktree::IgnoreRules;
-use crate::{bad, now, open_repo, ZResult, ZF_DIR};
+use crate::{bad, now, open_repo, repo_dir, ZResult};
 
 // remotes.
 
@@ -118,7 +118,7 @@ pub fn cmd_push(remote_name: &str, branch: &str) -> ZResult<()> {
     let path = remote::resolve_remote(&url);
 
     // The remote must already exist as a bare repository.
-    if !path.join(ZF_DIR).is_dir() {
+    if !crate::repo_dir(&path).is_dir() {
         remote::init_bare(&path, branch)?;
         println!("created remote repository at {}", path.display());
     }
@@ -189,8 +189,8 @@ pub fn cmd_pull(remote_name: &str, branch: &str, author: &str) -> ZResult<()> {
 
 pub fn cmd_clone(url: &str, dir: &str, token: Option<&str>, pin: Option<&str>) -> ZResult<()> {
     let target = Path::new(dir);
-    if target.join(ZF_DIR).is_dir() {
-        return Err(bad(format!("{} already contains a zenforge repository", dir)));
+    if crate::repo_dir(target).is_dir() {
+        return Err(bad(format!("{} already contains a repository", dir)));
     }
     fs::create_dir_all(target)?;
 
@@ -199,8 +199,8 @@ pub fn cmd_clone(url: &str, dir: &str, token: Option<&str>, pin: Option<&str>) -
     }
 
     let remote_path = remote::resolve_remote(url);
-    if !remote_path.join(ZF_DIR).is_dir() {
-        return Err(bad(format!("no zenforge repository at {}", remote_path.display())));
+    if !crate::repo_dir(&remote_path).is_dir() {
+        return Err(bad(format!("no repository at {}", remote_path.display())));
     }
     let remote_conn = open_db(&remote_path)?;
     let branch: String = remote_conn
@@ -213,7 +213,7 @@ pub fn cmd_clone(url: &str, dir: &str, token: Option<&str>, pin: Option<&str>) -
     let bundle = remote::build_bundle(&remote_conn, &branch, &HashSet::new())?;
     let received = remote::Bundle::decode(&bundle.encode()?)?;
 
-    let zf = target.join(ZF_DIR);
+    let zf = repo_dir(target);
     fs::create_dir_all(&zf)?;
     let conn = open_db(target)?;
     init_schema(&conn)?;
@@ -665,7 +665,7 @@ fn clone_http(url: &str, target: &Path, token: Option<&str>, pin: Option<&str>) 
     }
     let bundle = remote::Bundle::decode(&body)?;
 
-    let zf = target.join(ZF_DIR);
+    let zf = repo_dir(target);
     fs::create_dir_all(&zf)?;
     let conn = open_db(target)?;
     init_schema(&conn)?;
@@ -690,7 +690,7 @@ fn clone_http(url: &str, target: &Path, token: Option<&str>, pin: Option<&str>) 
 
 /// Serve this repository over HTTP.
 ///
-/// Tokens come from `.zenforge/auth`, one `token:role:name` per line. Without
+/// Tokens come from `.gesta/auth`, one `token:role:name` per line. Without
 /// that file the server only binds to loopback, so an open port with no
 /// password is never the accidental default.
 pub fn cmd_serve(
@@ -717,9 +717,9 @@ pub fn cmd_serve(
         #[cfg(feature = "tls")]
         Some("self-signed") => {
             // A generated certificate is for a private network. Writing it under
-            // .zenforge/ keeps it with the repository and out of a changeset,
+            // The repository directory keeps it with the code and out of a changeset,
             // since that directory is never tracked.
-            let dir = root.join(ZF_DIR);
+            let dir = repo_dir(&root);
             let (cert, key_path, fp) = crate::tls::generate_self_signed(bind, &dir)?;
             println!("generated {} and {}", cert.display(), key_path.display());
             println!("pin this on clients with --pin {}", fp);
@@ -750,7 +750,7 @@ pub fn cmd_serve(
 }
 
 fn read_auth_file(root: &Path) -> ZResult<Vec<String>> {
-    let path = root.join(ZF_DIR).join("auth");
+    let path = repo_dir(root).join("auth");
     match fs::read_to_string(&path) {
         Ok(text) => Ok(text.lines().map(|l| l.to_string()).collect()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
@@ -758,7 +758,7 @@ fn read_auth_file(root: &Path) -> ZResult<Vec<String>> {
     }
 }
 
-/// Add a token to `.zenforge/auth`. The token is generated, never typed by the
+/// Add a token to `.gesta/auth`. The token is generated, never typed by the
 /// user, and printed once.
 pub fn cmd_token_add(role: &str, name: &str, hashed: bool) -> ZResult<()> {
     let (root, _conn) = open_repo()?;
@@ -771,7 +771,7 @@ pub fn cmd_token_add(role: &str, name: &str, hashed: bool) -> ZResult<()> {
         return Err(bad("token name must be non-empty and must not contain ':'"));
     }
     let token = auth::generate_token(32)?;
-    let path = root.join(ZF_DIR).join("auth");
+    let path = repo_dir(&root).join("auth");
     let mut existing = read_auth_file(&root)?;
 
     // `--hashed` writes only the digest: the file then cannot be replayed as a
@@ -790,7 +790,7 @@ pub fn cmd_token_add(role: &str, name: &str, hashed: bool) -> ZResult<()> {
     if hashed {
         println!("\nStored as a SHA-256 digest: this token cannot be recovered from the file.");
     } else {
-        println!("\nStored in clear in .zenforge/auth, which is never tracked by zenforge.");
+        println!("\nStored in clear in .gesta/auth, which is never tracked.");
     }
     println!("Give it to the client once. `token list` shows only the last four characters.");
     Ok(())
@@ -799,7 +799,7 @@ pub fn cmd_token_add(role: &str, name: &str, hashed: bool) -> ZResult<()> {
 /// Remove a token by name or by its last four characters.
 pub fn cmd_token_remove(selector: &str) -> ZResult<()> {
     let (root, _conn) = open_repo()?;
-    let path = root.join(ZF_DIR).join("auth");
+    let path = repo_dir(&root).join("auth");
     let entries = read_auth_file(&root)?;
     if entries.is_empty() {
         return Err(bad("no tokens configured"));
@@ -839,7 +839,7 @@ pub fn cmd_token_remove(selector: &str) -> ZResult<()> {
     }
     fs::write(&path, kept.join("\n") + if kept.is_empty() { "" } else { "\n" })?;
     println!("removed {} token(s) matching {:?}", removed, selector);
-    println!("Restart `zenforge serve` for the change to take effect.");
+    println!("Restart `gesta serve` for the change to take effect.");
     Ok(())
 }
 

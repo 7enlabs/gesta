@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Compare ZenForge and git on a file edited many times.
+"""Compare history size against a baseline on a file edited many times.
 
 Both systems get the same history: a 558 KB file, one line changed, fifty
 commits. git is run in the same directory tree so both see the same bytes on
 disk. This is the case delta compression exists for.
 
-Run: python3 bench/delta_vs_git.py
+Run: python3 bench/history_size.py
 """
 
 import os
@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import sys
 
-ZF = os.environ.get("ZF_BIN", "/work/zenforge/target/release/zenforge")
+ZF = os.environ.get("ZF_BIN", "/work/gesta/target/release/gesta")
 ROOT = "/tmp/zf_vs_git"
 EDIT_COUNT = 50
 results = []
@@ -62,7 +62,7 @@ def main():
     shutil.rmtree(ROOT, ignore_errors=True)
     os.makedirs(ROOT)
 
-    # ZenForge run.
+    # gesta run.
     zf_dir = os.path.join(ROOT, "zf")
     os.makedirs(zf_dir)
     run([ZF, "init"], cwd=zf_dir)
@@ -78,7 +78,7 @@ def main():
             if w.startswith("cs"):
                 run([ZF, "changeset", "commit", w], cwd=zf_dir)
                 break
-    zf_bytes = size_of(os.path.join(zf_dir, ".zenforge", "zenforge.db"))
+    g_bytes = size_of(os.path.join(zf_dir, ".gesta", "gesta.db"))
     zf_stats = run([ZF, "stats"], cwd=zf_dir)[1]
 
     # git run, same bytes.
@@ -92,8 +92,8 @@ def main():
         run(["git", "commit", "-q", "-m", f"v{v}"], cwd=git_dir)
     git_bytes = size_of(os.path.join(git_dir, ".git"))
 
-    ratio = zf_bytes / git_bytes if git_bytes else 0
-    print(f"ZenForge database: {zf_bytes/1024:.0f} KB")
+    ratio = g_bytes / git_bytes if git_bytes else 0
+    print(f"gesta database: {g_bytes/1024:.0f} KB")
     print(f"git .git:          {git_bytes/1024:.0f} KB")
     print(f"ratio:             {ratio:.2f}x git")
     for line in zf_stats.split("\n"):
@@ -103,8 +103,8 @@ def main():
     record("the delta keeps history to a sane multiple of git",
            ratio < 4.0, f"{ratio:.2f}x, which is worse than a packfile should be")
     record("the delta beats storing every version whole",
-           zf_bytes < 1504 * 1024,
-           f"{zf_bytes/1024:.0f} KB, was 1504 KB before deltas")
+           g_bytes < 1504 * 1024,
+           f"{g_bytes/1024:.0f} KB, was 1504 KB before deltas")
     record("stats reports the delta bytes rather than hiding them",
            "in deltas" in zf_stats and "deltas:" in zf_stats, zf_stats[:200])
 

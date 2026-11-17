@@ -120,7 +120,7 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 }
 
 impl Auth {
-    /// Build from `.zenforge/auth` entries.
+    /// Build from the `auth` file inside the repository directory.
     ///
     /// Two forms are accepted, and the file may mix them:
     ///

@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import sys
 
-ZF = os.environ.get("ZF_BIN", "/work/zenforge/target/release/zenforge")
+ZF = os.environ.get("ZF_BIN", "/work/gesta/target/release/gesta")
 ROOT = "/tmp/zf_conflicts"
 results = []
 
@@ -159,7 +159,7 @@ def main():
     msgs = [
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
         {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-         "params": {"name": "zenforge_merge_conflicts",
+         "params": {"name": "gesta_merge_conflicts",
                     "arguments": {"source": "feature", "target": "main"}}},
     ]
     payload = "\n".join(json.dumps(m) for m in msgs) + "\n"

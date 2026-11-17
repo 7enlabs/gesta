@@ -16,7 +16,7 @@ import time
 import urllib.error
 import urllib.request
 
-ZF = os.environ.get("ZF_BIN", "/work/zenforge/target/release/zenforge")
+ZF = os.environ.get("ZF_BIN", "/work/gesta/target/release/gesta")
 ROOT = "/tmp/zf_api"
 PORT = 8791
 BASE = f"http://127.0.0.1:{PORT}"
@@ -85,7 +85,7 @@ def main():
     # Two tokens: full write, and one limited to docs/.
     admin = "admintoken-0123456789abcdef"
     docsonly = "doctoken-0123456789abcdef"
-    auth_file = os.path.join(repo, ".zenforge", "auth")
+    auth_file = os.path.join(repo, ".gesta", "auth")
     with open(auth_file, "w") as fh:
         fh.write(f"{admin}:write:admin:src/**\n")
         fh.write(f"{admin}:write:admin\n")
@@ -196,7 +196,7 @@ def main():
         record("the deleted file is gone from the branch", st == 404, f"{st} {body[:150]}")
 
         # The access log must record who did what.
-        log_path = os.path.join(repo, ".zenforge", "access.log")
+        log_path = os.path.join(repo, ".gesta", "access.log")
         logged = ""
         if os.path.exists(log_path):
             with open(log_path) as fh:

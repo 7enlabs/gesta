@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import sys
 
-ZF = os.environ.get("ZF_BIN", "/work/zenforge/target/release/zenforge")
+ZF = os.environ.get("ZF_BIN", "/work/gesta/target/release/gesta")
 ROOT = "/tmp/zf_mcp"
 results = []
 
@@ -97,7 +97,7 @@ def main():
                 "jsonrpc": "2.0",
                 "id": 3,
                 "method": "tools/call",
-                "params": {"name": "zenforge_status", "arguments": {}},
+                "params": {"name": "gesta_status", "arguments": {}},
             },
         ],
     )
@@ -110,16 +110,16 @@ def main():
     result = init.get("result", {})
     record("initialize reports protocol version and identity",
            result.get("protocolVersion") is not None
-           and result.get("serverInfo", {}).get("name") == "zenforge",
+           and result.get("serverInfo", {}).get("name") == "gesta",
            json.dumps(init)[:250])
 
     tools_resp = by_id.get(2, {}).get("result", {})
     tools = tools_resp.get("tools", [])
     names = [t.get("name") for t in tools]
     expected = {
-        "zenforge_status", "zenforge_log", "zenforge_read_file",
-        "zenforge_blame", "zenforge_diff", "zenforge_create_changeset",
-        "zenforge_commit",
+        "gesta_status", "gesta_log", "gesta_read_file",
+        "gesta_blame", "gesta_diff", "gesta_create_changeset",
+        "gesta_commit",
     }
     record("tools/list returns the full set with schemas",
            expected.issubset(set(names)) and all("inputSchema" in t for t in tools),
@@ -138,7 +138,7 @@ def main():
         repo,
         [{
             "jsonrpc": "2.0", "id": 10, "method": "tools/call",
-            "params": {"name": "zenforge_read_file", "arguments": {"path": "src/main.rs"}},
+            "params": {"name": "gesta_read_file", "arguments": {"path": "src/main.rs"}},
         }],
     )
     body = responses[0].get("result", {}).get("structuredContent", {}) if responses else {}
@@ -156,7 +156,7 @@ def main():
         [{
             "jsonrpc": "2.0", "id": 20, "method": "tools/call",
             "params": {
-                "name": "zenforge_create_changeset",
+                "name": "gesta_create_changeset",
                 "arguments": {"message": "add lib", "author": "mcp-client"},
             },
         }],
@@ -170,7 +170,7 @@ def main():
             repo,
             [{
                 "jsonrpc": "2.0", "id": 21, "method": "tools/call",
-                "params": {"name": "zenforge_commit", "arguments": {"id": cid}},
+                "params": {"name": "gesta_commit", "arguments": {"id": cid}},
             }],
         )
         committed = responses[0].get("result", {}).get("structuredContent", {}) if responses else {}
@@ -182,7 +182,7 @@ def main():
         repo,
         [{
             "jsonrpc": "2.0", "id": 30, "method": "tools/call",
-            "params": {"name": "zenforge_read_file", "arguments": {"path": "nope.txt"}},
+            "params": {"name": "gesta_read_file", "arguments": {"path": "nope.txt"}},
         }],
     )
     has_error = bool(responses) and "error" in responses[0]

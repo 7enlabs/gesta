@@ -17,7 +17,7 @@ import time
 import urllib.error
 import urllib.request
 
-ZF = os.environ.get("ZF_BIN", "/work/zenforge/target/release/zenforge")
+ZF = os.environ.get("ZF_BIN", "/work/gesta/target/release/gesta")
 ROOT = "/tmp/zf_auth"
 results = []
 
@@ -124,8 +124,8 @@ def main():
             break
     record("a second token can be read only", rc == 0 and read_token is not None and read_token != write_token, out[:200])
 
-    auth_file = read(origin, ".zenforge/auth")
-    record("tokens are stored in clear in .zenforge/auth",
+    auth_file = read(origin, ".gesta/auth")
+    record("tokens are stored in clear in .gesta/auth",
            write_token in auth_file and "write" in auth_file, auth_file.replace(write_token or "", "<tok>"))
 
     rc, out = run("remote", "token", "list", cwd=origin)

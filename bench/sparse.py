@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import sys
 
-ZF = os.environ.get("ZF_BIN", "/work/zenforge/target/release/zenforge")
+ZF = os.environ.get("ZF_BIN", "/work/gesta/target/release/gesta")
 ROOT = "/tmp/zf_sparse"
 results = []
 

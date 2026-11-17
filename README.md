@@ -1,6 +1,6 @@
-# ZenForge
+# gesta
 
-[![repo](https://img.shields.io/badge/github-zencli%2Fzenforge-181717?logo=github)](https://github.com/zencli/zenforge)
+[![repo](https://img.shields.io/badge/github-zencli%2Fgesta-181717?logo=github)](https://github.com/zencli/gesta)
 
 Source control for AI agents. Changesets live in SQLite, objects are content addressed and compressed, blame and history are derived on commit. One Rust binary, no daemon.
 
@@ -8,15 +8,13 @@ Source control for AI agents. Changesets live in SQLite, objects are content add
 
 Git assumes a human working copy. You clone everything, stage, commit, push. An agent reads one file, writes one file, and does that thousands of times a day, so a full clone is wasted work and a full round trip per edit is wasted time.
 
-ZenForge keeps the repository server side and answers questions about it directly. An agent can commit without ever holding the whole tree.
-
-Anthropic's Scion follows the same idea at monorepo scale.
+gesta keeps the repository server side and answers questions about it directly. An agent can commit without ever holding the whole tree.
 
 ## Install
 
 ```bash
-cd zenforge && cargo build --release
-# Binary: target/release/zenforge (~3.3 MB)
+cargo build --release
+# Binary: target/release/gesta
 ```
 
 Needs Rust. Dependencies: rusqlite (bundled SQLite), clap, sha2, hex, chrono, flate2.
@@ -25,18 +23,18 @@ Needs Rust. Dependencies: rusqlite (bundled SQLite), clap, sha2, hex, chrono, fl
 
 ```bash
 cd my-project
-zenforge init
-zenforge changeset create "Add feature" --author agent
-zenforge changeset commit cs1a2b3c4
-zenforge log
-zenforge blame src/main.rs
+gesta init
+gesta changeset create "Add feature" --author agent
+gesta changeset commit cs1a2b3c4
+gesta log
+gesta blame src/main.rs
 ```
 
 ## Commands
 
 | Command | Description |
 |---|---|
-| `init [--bare]` | Create `.zenforge/` with the SQLite database |
+| `init [--bare]` | Create `.gesta/` with the SQLite database |
 | `status` | Branch, HEAD, pending changesets, added/modified/deleted files |
 | `diff [--changeset <id>] [--name-only]` | Working tree diff, or one changeset's diff |
 | `log [--limit N] [--oneline]` | Changesets, newest first |
@@ -70,7 +68,7 @@ Every read command takes `--json` (status, log, blame, history, diff, tag, ops, 
 
 ## Storage
 
-One file: `.zenforge/zenforge.db` (SQLite, WAL mode). No loose objects, no packfiles, no index to rebuild.
+One file: `.gesta/gesta.db` (SQLite, WAL mode). No loose objects, no packfiles, no index to rebuild.
 
 | Table | Purpose |
 |---|---|
@@ -109,13 +107,13 @@ A repository can serve itself and another machine can clone, push and pull over 
 
 ```bash
 # machine holding the repository
-zenforge serve --bind 0.0.0.0 --port 8787
+gesta serve --bind 0.0.0.0 --port 8787
 
 # another machine
-zenforge remote clone http://server:8787 path/to/project
-zenforge remote add origin http://server:8787
-zenforge remote push origin
-zenforge remote pull origin
+gesta remote clone http://server:8787 path/to/project
+gesta remote add origin http://server:8787
+gesta remote push origin
+gesta remote pull origin
 ```
 
 Endpoints: `GET /v1/health`, `GET /v1/branches`, `GET /v1/bundle?branch=X&have=...`, `POST /v1/bundle?branch=X`, `GET /v1/file?path=&rev=`, `POST /v1/changeset`.
@@ -128,18 +126,18 @@ A push that would move the server's branch to a head not containing its current 
 
 ```bash
 # a private network: generate one and pin its fingerprint
-zenforge serve --bind 0.0.0.0 --port 8787 --tls self-signed
+gesta serve --bind 0.0.0.0 --port 8787 --tls self-signed
 # prints: pin this on clients with --pin 9f2c...
 
 # a certificate you already have
-zenforge serve --bind 0.0.0.0 --port 8787 --tls /etc/zf/cert.pem --key /etc/zf/key.pem
+gesta serve --bind 0.0.0.0 --port 8787 --tls /etc/zf/cert.pem --key /etc/zf/key.pem
 ```
 
 A client verifies against the public roots by default, so a real certificate needs no flag. For a self-signed one, pin the fingerprint once:
 
 ```bash
-zenforge remote clone https://server:8787 project --token <token> --pin <fingerprint>
-zenforge remote add origin https://server:8787 --token <token> --pin <fingerprint>
+gesta remote clone https://server:8787 project --token <token> --pin <fingerprint>
+gesta remote add origin https://server:8787 --token <token> --pin <fingerprint>
 ```
 
 The pin is stored with the remote, so a later push needs no flag. It is trust on first use made explicit, not "ignore certificate errors": the handshake still has to prove possession of the key that matches the pinned certificate, and a different certificate fails with the two fingerprints printed.
@@ -154,15 +152,15 @@ The server has two roles. A read token may clone and pull. A write token may als
 
 ```bash
 # on the serving machine
-zenforge remote token add write alice --hashed
+gesta remote token add write alice --hashed
 # prints the token once; only its digest is stored
 
 # on a client
-zenforge remote clone http://server:8787 project --token <token>
-zenforge remote add origin http://server:8787 --token <token>
+gesta remote clone http://server:8787 project --token <token>
+gesta remote add origin http://server:8787 --token <token>
 ```
 
-Tokens live in `.zenforge/auth`, one entry per line, in either form:
+Tokens live in `.gesta/auth`, one entry per line, in either form:
 
 ```text
 <token>:<role>:<name>              token in clear, hashed when loaded
@@ -171,7 +169,7 @@ sha256:<digest>:<role>:<name>      only the digest on disk
 
 `--hashed` writes the second form. A leaked file then cannot be replayed, because presenting the digest does not authenticate; only its preimage does. A test pins that, and another pins that a malformed digest line never matches anything.
 
-`.zenforge/` is never tracked by ZenForge, so tokens cannot reach a changeset.
+`.gesta/` is never tracked, so tokens cannot reach a changeset.
 
 With no tokens configured the server refuses to bind to a non-loopback address. `0.0.0.0` without tokens exits with an error instead of serving an open port. A failed authentication waits 200 ms before answering, which blunts online guessing.
 
@@ -185,17 +183,17 @@ An empty scope means every path. A pattern without a slash matches the file name
 
 ## MCP server
 
-`zenforge mcp` speaks JSON-RPC 2.0 on stdin and stdout, one message per line, which is the stdio transport of the Model Context Protocol. A client discovers seven tools:
+`gesta mcp` speaks JSON-RPC 2.0 on stdin and stdout, one message per line, which is the stdio transport of the Model Context Protocol. A client discovers seven tools:
 
 | Tool | Returns |
 |---|---|
-| `zenforge_status` | branch, head, pending changesets, tracked path count |
-| `zenforge_log` | changesets newest first, with limit and branch |
-| `zenforge_read_file` | file content at a changeset or branch, without a checkout |
-| `zenforge_blame` | one entry per line: line number, changeset, author |
-| `zenforge_diff` | structured hunks for a changeset, or the working tree |
-| `zenforge_create_changeset` | a pending changeset from the working tree |
-| `zenforge_commit` | commits a pending changeset, moves the head |
+| `gesta_status` | branch, head, pending changesets, tracked path count |
+| `gesta_log` | changesets newest first, with limit and branch |
+| `gesta_read_file` | file content at a changeset or branch, without a checkout |
+| `gesta_blame` | one entry per line: line number, changeset, author |
+| `gesta_diff` | structured hunks for a changeset, or the working tree |
+| `gesta_create_changeset` | a pending changeset from the working tree |
+| `gesta_commit` | commits a pending changeset, moves the head |
 
 Every result carries `structuredContent` with the JSON and the same text in `content`, so a client that only reads `content` still gets the data. A failing tool returns a JSON-RPC error with the reason, never a crash: unknown method is `-32601`, malformed JSON is `-32700`.
 
@@ -223,9 +221,9 @@ The comparison base is the tree the branch will have once every pending changese
 A monorepo can be tens of gigabytes, and an agent that needs one module should not pay for the rest.
 
 ```bash
-zenforge sparse set crates/api docs/**
-zenforge sparse list
-zenforge sparse clear
+gesta sparse set crates/api docs/**
+gesta sparse list
+gesta sparse clear
 ```
 
 A directory prefix selects its subtree, `**` crosses separators, and a pattern with no slash matches a file name at any depth.
@@ -237,12 +235,12 @@ The failure mode that matters is not "fewer files on disk". A file that is in th
 Markers are readable by a person and awkward for an agent. `branch conflicts` reports the same conflict as data, without touching the working tree:
 
 ```bash
-zenforge branch conflicts feature --target main
+gesta branch conflicts feature --target main
 ```
 
 Each file carries `ours`, `theirs` and `base` in full, plus one entry per conflicting region with `ours_start`, `ours_end`, `theirs_start`, `theirs_end`, the lines from each side, and three lines of context either way. An agent can choose per region and write the answer directly.
 
-The same shape comes from `branch merge --json` and from the MCP tool `zenforge_merge_conflicts`.
+The same shape comes from `branch merge --json` and from the MCP tool `gesta_merge_conflicts`.
 
 ## Delta compression
 
@@ -365,7 +363,7 @@ src/tls.rs         TLS server and client, certificate pinning
 
 Build environment: Docker container `hermes-workspace`, Rust 1.100.0, image `hermes-workspace-rust:latest`.
 
-The source lives on the host at `D:/Hermes/zenforge/` and is mounted into the container at `/work/zenforge`, so recreating the container does not lose it.
+The source lives on the host at `D:/Hermes/gesta/` and is mounted into the container at `/work/gesta`, so recreating the container does not lose it.
 
 ## Correctness guarantees
 

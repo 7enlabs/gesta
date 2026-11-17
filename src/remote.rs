@@ -15,7 +15,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use crate::store::{branch_head, get_object, hash_content, put_object, ancestors, open_db, init_schema};
-use crate::{bad, now, ZResult, ZF_DIR};
+use crate::{bad, now, repo_dir, ZResult};
 
 /// Everything a peer needs to catch up on one branch.
 pub struct Bundle {
@@ -49,7 +49,7 @@ impl Bundle {
     /// Text keeps the format inspectable and avoids a JSON dependency.
     pub fn encode(&self) -> ZResult<Vec<u8>> {
         let mut s = String::new();
-        s.push_str("zenforge-bundle 1\n");
+        s.push_str("gesta-bundle 1\n");
         s.push_str(&format!("branch\t{}\n", self.branch));
         s.push_str(&format!("head\t{}\n", self.head.clone().unwrap_or_else(|| "-".into())));
         for c in &self.changesets {
@@ -89,11 +89,13 @@ impl Bundle {
         let mut dec = ZlibDecoder::new(bytes);
         let mut text = String::new();
         dec.read_to_string(&mut text)
-            .map_err(|e| bad(format!("bundle is not valid zenforge data: {}", e)))?;
+            .map_err(|e| bad(format!("bundle is not valid repository data: {}", e)))?;
 
         let mut lines = text.lines();
         match lines.next() {
-            Some("zenforge-bundle 1") => {}
+            // Bundles written before the rename carry the old header. Refusing them
+        // would strand every archive made by an earlier build.
+        Some("gesta-bundle 1") | Some("zenforge-bundle 1") => {}
             _ => return Err(bad("unrecognised bundle header")),
         }
 
@@ -402,9 +404,9 @@ pub fn resolve_remote(url: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(s)
 }
 
-/// Initialise a bare repository at `path` (just a .zenforge directory with a db).
+/// Initialise a bare repository at `path` (just a repository directory with a db).
 pub fn init_bare(path: &Path, branch: &str) -> ZResult<()> {
-    let zf = path.join(ZF_DIR);
+    let zf = repo_dir(path);
     fs::create_dir_all(&zf)?;
     let conn = open_db(path)?;
     init_schema(&conn)?;

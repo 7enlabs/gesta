@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Prove the HTTP remote works over a real socket, not an in-memory shortcut.
 
-Starts `zenforge serve` on a free port, then clones, pushes and pulls between
+Starts `gesta serve` on a free port, then clones, pushes and pulls between
 two real directories through http://127.0.0.1. Every assertion checks the
 observable result (files on disk, branch heads), never just an exit code.
 
@@ -16,7 +16,7 @@ import sys
 import time
 import urllib.request
 
-ZF = os.environ.get("ZF_BIN", "/work/zenforge/target/release/zenforge")
+ZF = os.environ.get("ZF_BIN", "/work/gesta/target/release/gesta")
 ROOT = "/tmp/zf_http"
 results = []
 
@@ -183,7 +183,7 @@ def main():
             status = e.code
         record("unknown branch returns 404", status == 404, f"status={status}")
 
-        # --- https is a real transport now. A public host without a ZenForge
+        # --- https is a real transport now. A public host without a gesta
         # server must produce a clean failure, not a hang or a TLS error.
         rc, out = run("remote", "clone", "https://example.com/repo",
                       os.path.join(ROOT, "x"), cwd=ROOT)
@@ -195,7 +195,7 @@ def main():
         # local repository rather than being mistaken for a host name.
         rc, out = run("remote", "clone", "example.com", os.path.join(ROOT, "y"), cwd=ROOT)
         record("a bare path is treated as local, not as a host",
-               rc != 0 and "no zenforge repository at" in out, out[:200])
+               rc != 0 and "no repository at" in out, out[:200])
 
         # --- a scheme that is neither http nor https is refused ---
         rc, out = run("remote", "clone", "ftp://example.com/repo",

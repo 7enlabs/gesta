@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 
-ZF = os.environ.get("ZF_BIN", "/work/zenforge/target/release/zenforge")
+ZF = os.environ.get("ZF_BIN", "/work/gesta/target/release/gesta")
 ROOT = "/tmp/zf_bench"
 
 
@@ -121,7 +121,7 @@ def bench_size_vs_git():
 
     zf = workload("cmp_zf", False)
     gt = workload("cmp_git", True)
-    print(f"  ZenForge : {zf / 1024:.0f} KB")
+    print(f"  gesta : {zf / 1024:.0f} KB")
     print(f"  git      : {gt / 1024:.0f} KB")
     print(f"  ratio    : {zf / gt:.1f}x   (target after compression: 2-3x)")
 
@@ -201,7 +201,7 @@ def bench_orphan_objects():
             fh.write(f"version {v}\n")
         new_changeset(d, f"v{v}")  # created, never committed
     print("  objects|changesets|files:",
-          sqlite_int(os.path.join(d, ".zenforge", "zenforge.db"),
+          sqlite_int(os.path.join(d, ".gesta", "gesta.db"),
                      "SELECT (SELECT COUNT(*) FROM objects), (SELECT COUNT(*) FROM changesets), "
                      "(SELECT COUNT(*) FROM changeset_files);"))
     print("  all 5 objects stay on disk although nothing was committed")
@@ -219,7 +219,7 @@ def bench_missing_commands():
 
 def main():
     if not shutil.which(ZF) and not os.path.exists(ZF):
-        sys.exit(f"zenforge binary not found: {ZF}")
+        sys.exit(f"gesta binary not found: {ZF}")
     os.makedirs(ROOT, exist_ok=True)
     bench_speed()
     bench_size_vs_git()

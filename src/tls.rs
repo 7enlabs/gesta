@@ -400,7 +400,7 @@ pub fn generate_self_signed(host: &str, dir: &Path) -> ZResult<(std::path::PathB
     let mut params = CertificateParams::default();
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, host);
-    dn.push(DnType::OrganizationName, "ZenForge");
+    dn.push(DnType::OrganizationName, "gesta");
     params.distinguished_name = dn;
     params.subject_alt_names = vec![
         SanType::DnsName(host.to_string().try_into().map_err(|_| bad("bad host name"))?),

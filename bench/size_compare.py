@@ -1,7 +1,7 @@
 
 import subprocess, os, shutil, re
 
-ZF = "/work/zenforge/target/release/zenforge"
+ZF = "/work/gesta/target/release/gesta"
 N = 500
 base = [f"line {i}: some content padding padding padding" for i in range(N)]
 
@@ -32,13 +32,13 @@ def workload(root, use_git):
             subprocess.run([ZF,"changeset","commit",cs], capture_output=True, check=True)
     # Only the repository metadata counts. Summing the working tree would count
     # the same file twice and say nothing about how the history is stored.
-    target = ".git" if use_git else ".zenforge"
+    target = ".git" if use_git else ".gesta"
     total = sum(os.path.getsize(os.path.join(dp,f)) for dp,_,fs in os.walk(target) for f in fs)
     return total
 
 zf = workload("/tmp/zf_cmp2", False); os.chdir("/")
 gt = workload("/tmp/git_cmp2", True); os.chdir("/")
-print(f"ZenForge: {zf/1024:.0f} KB")
+print(f"gesta: {zf/1024:.0f} KB")
 print(f"git     : {gt/1024:.0f} KB")
 print(f"ratio   : {zf/gt:.2f}x  (truoc khi nen: 8.9x)")
 
@@ -60,4 +60,4 @@ def many(root, use_git):
 
 z2 = many("/tmp/zf_many2", False); os.chdir("/")
 g2 = many("/tmp/git_many2", True); os.chdir("/")
-print(f"\n1000 file nho: ZenForge {z2//1024} KB vs git {g2//1024} KB = {z2/g2:.2f}x")
+print(f"\n1000 file nho: gesta {z2//1024} KB vs git {g2//1024} KB = {z2/g2:.2f}x")

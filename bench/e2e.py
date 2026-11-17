@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""End-to-end check: does ZenForge actually replace git for daily work?
+"""End-to-end check: does the tool cover daily source control work?
 
 Every check runs the real binary against real directories. A check is only PASS
 when the observable outcome is correct, not when the command merely exits 0.
 
-Run: python3 bench/replace_git.py
+Run: python3 bench/e2e.py
 """
 
 import os
@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import sys
 
-ZF = os.environ.get("ZF_BIN", "/work/zenforge/target/release/zenforge")
+ZF = os.environ.get("ZF_BIN", "/work/gesta/target/release/gesta")
 ROOT = "/tmp/zf_replace"
 results = []
 
@@ -252,7 +252,7 @@ def c14_fsck_clean_and_detects_corruption():
     rc, out = run("fsck", cwd=d)
     clean = rc == 0 and "consistent" in out
     # Corrupt: point a changeset_file at a hash that does not exist.
-    db = os.path.join(d, ".zenforge", "zenforge.db")
+    db = os.path.join(d, ".gesta", "gesta.db")
     subprocess.run(
         ["sqlite3", db, "UPDATE changeset_files SET new_hash='" + "0" * 64 + "' WHERE path='f.txt'"],
         check=True,
@@ -364,7 +364,7 @@ def main():
     if not os.path.exists(ZF):
         sys.exit(f"binary not found: {ZF}")
     os.makedirs(ROOT, exist_ok=True)
-    print("== Can ZenForge replace git for daily work? ==\n")
+    print("== Can gesta replace git for daily work? ==\n")
     for fn in [
         c1_commit_and_log,
         c2_diff_shows_working_changes,
