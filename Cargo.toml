@@ -1,6 +1,6 @@
 [package]
 name = "zenforge"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Source control for AI agents"
 license = "MIT"
@@ -15,6 +15,7 @@ clap = { version = "4.5", features = ["derive"] }
 sha2 = "0.10"
 hex = "0.4"
 chrono = "0.4"
+flate2 = "1.0"
 
 [profile.release]
 opt-level = 3

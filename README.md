@@ -33,22 +33,29 @@ zenforge blame src/main.rs
 
 | Command | Description |
 |---|---|
-| `init` | Create `.zenforge/` with SQLite database |
-| `status` | Branch, HEAD, pending changesets, working-tree diff |
-| `log [--limit N]` | Changesets newest first |
-| `changeset create <msg> --author <a>` | Snapshot working tree as pending changeset |
-| `changeset commit <id>` | Commit one changeset, update branch head |
+| `init [--bare]` | Create `.zenforge/` with SQLite database |
+| `status` | Branch, HEAD, pending changesets, added/modified/deleted |
+| `diff [--changeset <id>] [--name-only]` | Working-tree diff, or a changeset's diff |
+| `log [--limit N] [--oneline]` | Changesets, newest first |
+| `changeset create <msg> --author <a>` | Snapshot the working tree |
+| `changeset commit <id>` | Commit one changeset, move the branch head |
+| `changeset commit-all` | Commit every pending changeset in order |
 | `changeset apply <id>` | Commit this and all earlier pending changesets |
-| `changeset diff <id>` | Line-level diff for a changeset |
+| `changeset diff <id>` | Line diff for one changeset |
 | `changeset list` | Pending changesets |
 | `blame <file>` | Which changeset introduced each line |
-| `history <file>` | Version chain with hash, time, author, message |
-| `checkout <file> [--changeset <id>]` | Write a file back from a changeset |
-| `branch create <name> [--from <b>]` | Create branch at another branch's head |
-| `branch list` | All branches, current marked `*` |
-| `branch switch <name>` | Change current branch |
-| `branch merge <src> --target <dst>` | Fast-forward target with source's unreached changesets |
-| `branch info <name>` | Head, origin, reachable changeset count |
+| `history <file>` | Version chain with hash, time, author |
+| `show [<rev>:]<file>` | File content at a changeset or branch |
+| `checkout <file \| .> [--changeset <id>]` | Materialise files from history |
+| `restore <file \| .>` | Discard uncommitted changes |
+| `undo` | Undo the last operation |
+| `ops [--limit N]` | Operation log |
+| `tag <name> [--list]` | Named pointer to a changeset |
+| `branch create/list/switch/delete/merge/info` | Branch operations |
+| `remote add/list/push/pull/clone` | Remote sync |
+| `fsck [--prune]` | Verify integrity, optionally drop orphan objects |
+| `stats` | Object counts and compression ratio |
+| `ignore add/list/remove` | Ignore patterns |
 
 ## Storage
 
@@ -148,21 +155,42 @@ src/worktree.rs   file scanning and UTF-8 reads
 
 24 unit tests, `cargo clippy` clean, `aislop` 100/100.
 
-## Known gaps
+## Status: v0.3.0
 
-`docs/upgrade-plan.md` holds the measured upgrade plan. `bench/bench.py` reproduces every number in it. The headline findings on v0.2.0:
+Twenty end-to-end checks run the real binary against real directories
+(`bench/replace_git.py`). All twenty pass, and the suite exists because every one
+of them failed at some point.
 
-| Gap | Measured |
+| Capability | State |
 |---|---|
-| `branch merge` moves the head but does not write files to disk, and never raises a conflict | head and working copy diverge silently |
-| `blame` attributes by line content, so duplicates get the wrong author | a line added by agentB is credited to agentA |
-| Stores full file content per version, no compression | 9.0x the disk of git on the same history |
-| No `undo`, `revert`, `gc`, `fsck` | none of them exist |
-| Pending changesets never release their objects | no garbage collection |
+| Commit, log, diff, restore, show | works |
+| Deleted files tracked | works |
+| `.gitignore` / `.zenignore` respected | works |
+| Three-way merge with conflict detection | works, refuses to commit on conflict |
+| Branch switch materialises the target tree | works |
+| `undo` on the operation log | works |
+| Tags | works |
+| `clone` / `push` / `pull` over a bundle format | works |
+| `fsck` (missing objects, dangling parents, orphan objects) | works |
+| Concurrent snapshots from 8 processes | works, unique ids |
 
-Fix order: safe merge, then sequence-based blame, then compression, then `fsck`, then an operation log for `undo`, then `gc`, then an MCP server.
+Storage, measured on 21 versions of a 42 KB file: **2.63x the disk of git**, down
+from 8.9x before compression. Small-file-heavy trees are 4.3x, because per-row
+overhead dominates when each object is a few dozen bytes.
 
-## Measuring
+### What still is not git
+
+- **No HTTP or SSH transport.** `clone`/`push`/`pull` work over a filesystem path
+  (or `file://`). Two machines need a shared directory or a manual copy of the
+  bundle. This is the biggest remaining gap for real collaboration.
+- **No `.gitattributes`, hooks, submodules, or LFS.**
+- **Blame is line-sequence based, not line-identity based.** A moved line keeps
+  its author; a line edited and moved in the same commit does not.
+- **No rebase or cherry-pick.**
+- **Merge conflicts are not interactively resolvable**; you edit the files and
+  commit the result.
+
+## Measuring## Measuring
 
 ```bash
 docker exec -i hermes-workspace bash -c 'cd /work/zenforge && python3 bench/bench.py'

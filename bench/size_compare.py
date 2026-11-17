@@ -1,0 +1,60 @@
+
+import subprocess, os, shutil
+
+ZF = "/work/zenforge/target/release/zenforge"
+N = 500
+base = [f"line {i}: some content padding padding padding" for i in range(N)]
+
+def workload(root, use_git):
+    shutil.rmtree(root, ignore_errors=True); os.makedirs(root); os.chdir(root)
+    if use_git:
+        subprocess.run(["git","init","-q"], check=True)
+        subprocess.run(["git","config","user.email","a@b"], check=True)
+        subprocess.run(["git","config","user.name","a"], check=True)
+    else:
+        subprocess.run([ZF,"init"], capture_output=True, check=True)
+    lines = list(base)
+    open("big.txt","w").write("\n".join(lines)+"\n")
+    if use_git:
+        subprocess.run(["git","add","-A"], check=True); subprocess.run(["git","commit","-qm","v0"], check=True)
+    else:
+        o = subprocess.run([ZF,"changeset","create","v0","--author","b"], capture_output=True, text=True).stdout
+        cs = [w for w in o.split() if w.startswith("cs")][0]
+        subprocess.run([ZF,"changeset","commit",cs], capture_output=True, check=True)
+    for r in range(1,31):
+        lines[200] = f"line 200: EDITED round {r}"
+        open("big.txt","w").write("\n".join(lines)+"\n")
+        if use_git:
+            subprocess.run(["git","add","-A"], check=True); subprocess.run(["git","commit","-qm",f"e{r}"], check=True)
+        else:
+            o = subprocess.run([ZF,"changeset","create",f"e{r}","--author","b"], capture_output=True, text=True).stdout
+            cs = [w for w in o.split() if w.startswith("cs")][0]
+            subprocess.run([ZF,"changeset","commit",cs], capture_output=True, check=True)
+    total = sum(os.path.getsize(os.path.join(dp,f)) for dp,_,fs in os.walk(".") for f in fs)
+    return total
+
+zf = workload("/tmp/zf_cmp2", False); os.chdir("/")
+gt = workload("/tmp/git_cmp2", True); os.chdir("/")
+print(f"ZenForge: {zf/1024:.0f} KB")
+print(f"git     : {gt/1024:.0f} KB")
+print(f"ratio   : {zf/gt:.2f}x  (truoc khi nen: 8.9x)")
+
+# 1000 file
+def many(root, use_git):
+    shutil.rmtree(root, ignore_errors=True); os.makedirs(root); os.chdir(root)
+    if use_git:
+        subprocess.run(["git","init","-q"], check=True); subprocess.run(["git","config","user.email","a@b"]); subprocess.run(["git","config","user.name","a"])
+    else:
+        subprocess.run([ZF,"init"], capture_output=True)
+    for i in range(1000): open(f"f{i}.txt","w").write(f"content {i}\n")
+    if use_git:
+        subprocess.run(["git","add","-A"]); subprocess.run(["git","commit","-qm","x"])
+    else:
+        o = subprocess.run([ZF,"changeset","create","x","--author","b"], capture_output=True, text=True).stdout
+        cs = [w for w in o.split() if w.startswith("cs")][0]
+        subprocess.run([ZF,"changeset","commit",cs], capture_output=True)
+    return sum(os.path.getsize(os.path.join(dp,f)) for dp,_,fs in os.walk(".") for f in fs)
+
+z2 = many("/tmp/zf_many2", False); os.chdir("/")
+g2 = many("/tmp/git_many2", True); os.chdir("/")
+print(f"\n1000 file nho: ZenForge {z2//1024} KB vs git {g2//1024} KB = {z2/g2:.2f}x")

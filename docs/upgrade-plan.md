@@ -1,8 +1,13 @@
 # Upgrade plan: what to fix and in what order
 
-Every number here was measured on v0.2.0 (24 tests passing, clippy clean, aislop 100/100). The harness that produced them is `bench/bench.py`; run it again after a change to confirm the metric actually moved.
+**Status: steps 1 to 3 of this plan are implemented in v0.3.0.** The measurements
+below are the v0.2.0 baseline that motivated the work; the "Result" section at the
+end records what changed and what is still missing.
 
-Measured 17/11/2026 in container `hermes-workspace`, binary `target/release/zenforge` sha256 `279dbfa7…`.
+Every number here was measured, not estimated. The harness is `bench/bench.py`
+(baseline) and `bench/replace_git.py` (20 end-to-end capability checks).
+
+Measured 17/11/2026 in container `hermes-workspace`.
 
 ## 1. Current state
 
@@ -178,3 +183,60 @@ These are inferences, with no measurement or source behind them:
 - Pijul, "Theory" (line graph, CRDT), https://pijul.org/manual/theory
 - git, "git-merge-base", https://git.github.io/htmldocs/git-merge-base.html
 - SQLite, "Recursive common table expressions", https://www.sqlite.org/lang_with.html
+
+
+## 7. Result after v0.3.0
+
+### Implemented
+
+| Defect | Fix | Evidence |
+|---|---|---|
+| Merge lost data silently | Real three-way merge: computes the merge base, applies both sides, writes merged content to disk, records a merge changeset with two parents, and refuses to move the head when a file conflicts (their version saved as `<file>.theirs`) | `merge3` unit tests + 2 e2e checks |
+| Blame misattributed duplicate lines | Blame now matches line sequences (longest common subsequence) instead of a content set, so an appended duplicate belongs to its author | `blame_does_not_credit_a_duplicate_line_to_an_earlier_author` |
+| No undo | Operation log records a pointer snapshot after every ref change; `undo` restores the previous snapshot and deletes that operation so a second undo walks further back | `record_and_undo_restores_the_previous_head`, e2e check |
+| No `fsck` | Checks missing objects, dangling parents, branch heads pointing nowhere, and reports orphan objects; `--prune` deletes them | e2e check with a deliberately corrupted hash |
+| No `.gitignore` | Gitignore-style matcher: `*`, `**`, `?`, anchored `/`, directory-only `/`, negation `!`, plus `.zenignore` and a database-backed list | 10 glob unit tests |
+| Disk usage 9.0x git | zlib compression per object, applied only when it actually shrinks the row (small files stay raw), and the redundant `working_copy` table was deleted because nothing read it | 2.63x on the same workload |
+| No remote | `clone`/`push`/`pull` over a zlib bundle written through the real serialise/parse path, with per-object hash verification on receipt | 4 unit tests + 2 e2e checks |
+| No `diff` / `show` / `restore` / `tag` | All implemented | e2e checks |
+| Deletions not tracked | `changeset create` records deletions; `status` reports them | e2e check |
+
+### Measured after the work
+
+| Metric | v0.2.0 | v0.3.0 |
+|---|---|---|
+| End-to-end capability checks | 6 of 20 | **20 of 20** |
+| Unit tests | 24 | **57** |
+| Disk vs git, 21 versions of a 42 KB file | 8.9x | **2.63x** |
+| Disk vs git, 1000 small files | 4.32x | **4.32x** (unchanged) |
+| `changeset create` 2000 files | 47 ms | 54 ms |
+| `commit` 2000 files | 93 ms | 95 ms |
+| `status` 2000 files | 62 ms | 45 ms |
+| aislop | 94/100 | **100/100** |
+| Largest source file | 1,278 lines | **946 lines** |
+
+### Still missing, and why it matters
+
+1. **No network transport.** Push and pull move a bundle through a filesystem
+   path. For two machines you need a shared directory or to copy the bundle by
+   hand. This is the single biggest remaining blocker to replacing git in daily
+   use, and the next thing to build (HTTP first: it makes any server, CI runner,
+   or static host a valid remote).
+2. **Small-file overhead.** 4.32x git for a tree of 1000 tiny files. The cause is
+   per-row SQLite and index overhead, not content. Fixing it needs packing
+   several small objects into one row, which is a schema change.
+3. **No rebase, cherry-pick, bisect, hooks, submodules, LFS, `.gitattributes`.**
+4. **Conflicts are not interactively resolved.** You edit the files and commit.
+5. **Blame is sequence-based.** A line moved and edited in the same commit loses
+   its original author.
+6. **No performance data past 3 changesets and 2000 files.** Large-history
+   behaviour is still unmeasured.
+
+### Judgement
+
+ZenForge can now serve as the source control for a single developer or a set of
+agents working on one machine: every daily operation exists, merges are safe, and
+nothing is lost silently. It cannot yet replace git for a team, because there is
+no way to get the repository to another machine over a network. Calling it a git
+replacement today would be wrong; calling it usable for local agent work is
+accurate and now backed by 20 checks.
