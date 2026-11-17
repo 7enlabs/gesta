@@ -56,6 +56,9 @@ gesta blame src/main.rs
 | `hook list` | Which hooks are installed |
 | `hook install <name> [--file F]` | Write a hook, reading stdin when no file is given |
 | `hook remove <name>` | Remove a hook |
+| `rebase <onto> [--branch B]` | Replay a branch's changesets onto another point |
+| `rebase --continue` | Finish a stopped rebase using what is on disk |
+| `rebase --abort` | Put the branch back where the rebase started |
 | `cherry-pick <id> [--onto B]` | Apply one changeset's change onto a branch |
 | `bisect start <good> <bad>` | Begin a search for the changeset that introduced a fault |
 | `bisect good \| bad` | Answer about the changeset under test |
@@ -75,6 +78,18 @@ gesta blame src/main.rs
 | `fsck [--prune]` | Verify integrity, optionally drop orphan objects |
 | `stats` | Object counts and compression ratio |
 | `ignore add/list/remove` | Ignore patterns |
+
+### Rebase
+
+`rebase` replays each changeset of one branch onto another point. Each step is a
+cherry-pick, so the merge logic is the one already tested; what is new is the
+state between steps.
+
+A rebase can stop part way when a pick conflicts. The state is stored, so
+`--continue` and `--abort` work from a later command. Nothing is written to the
+branch until a step succeeds, `--abort` returns the branch to where it started
+rather than to the last successful step, and the original changesets are never
+modified, so the old history stays readable.
 
 ### Cherry-pick
 

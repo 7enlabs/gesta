@@ -1410,3 +1410,60 @@ pub fn cmd_cherry_pick(source: &str, onto: Option<&str>, author: &str) -> ZResul
         }
     }
 }
+
+pub fn cmd_rebase(
+    onto: Option<&str>,
+    branch: Option<&str>,
+    author: &str,
+    do_continue: bool,
+    do_abort: bool,
+) -> ZResult<()> {
+    let (root, conn) = open_repo()?;
+
+    if do_abort {
+        let name = crate::rebase::abort(&conn, &root)?;
+        println!("rebase aborted, {} is back where it started", name);
+        return Ok(());
+    }
+
+    if do_continue {
+        report_rebase(crate::rebase::continue_after_resolution(&conn, &root, author)?);
+        return Ok(());
+    }
+
+    let onto = onto.ok_or_else(|| {
+        bad("rebase needs a point to move onto, or --continue / --abort".to_string())
+    })?;
+    let target = match branch {
+        Some(b) => b.to_string(),
+        None => current_branch(&conn)?,
+    };
+    let progress = crate::rebase::start(&conn, &root, &target, onto, author)?;
+    report_rebase(progress);
+    Ok(())
+}
+
+fn report_rebase(p: crate::rebase::Progress) {
+    use crate::rebase::Progress;
+    match p {
+        Progress::Nothing => {
+            println!("nothing to rebase: the base already contains this branch");
+        }
+        Progress::Done(ids) if ids.is_empty() => {
+            println!("rebase finished: nothing needed recording");
+        }
+        Progress::Done(ids) => {
+            println!("rebased {} changeset(s) onto the new base", ids.len());
+        }
+        Progress::Stopped { conflicts } => {
+            println!("rebase stopped: {} file(s) conflict", conflicts.len());
+            for c in &conflicts {
+                println!("  {}", c);
+            }
+            println!();
+            println!("resolve them, then:");
+            println!("  gesta rebase --continue   keeps the resolution as a changeset");
+            println!("  gesta rebase --abort      puts the branch back");
+        }
+    }
+}

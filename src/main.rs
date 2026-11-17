@@ -19,6 +19,7 @@ mod mcp;
 mod merge;
 mod ops;
 mod remote;
+mod rebase;
 mod repo;
 mod sparse;
 mod stash;
@@ -194,6 +195,23 @@ enum Cmd {
     Restore {
         /// File or `.` to restore the whole working tree
         file: String,
+    },
+    /// Replay this branch's changesets onto another point
+    Rebase {
+        /// Branch or changeset to replay onto. Not needed with --continue or
+        /// --abort, which work from the saved state.
+        onto: Option<String>,
+        /// Branch to rebase. Defaults to the current branch.
+        #[arg(long)]
+        branch: Option<String>,
+        #[arg(long, default_value = "agent")]
+        author: String,
+        /// Finish a stopped rebase using what is on disk
+        #[arg(long)]
+        continue_: bool,
+        /// Put the branch back where the rebase started
+        #[arg(long = "abort")]
+        abort: bool,
     },
     /// Apply the change one changeset made onto the current branch
     CherryPick {
@@ -529,6 +547,9 @@ fn run() -> ZResult<()> {
         Cmd::Branch { sub } if json => cli::cmd_branch_json(sub),
         Cmd::Changeset { sub } if json => cli::cmd_changeset_json(sub),
         Cmd::Sparse { sub } => cli::cmd_sparse(sub),
+        Cmd::Rebase { onto, branch, author, continue_, abort } => {
+            cli::cmd_rebase(onto.as_deref(), branch.as_deref(), &author, continue_, abort)
+        }
         Cmd::CherryPick { source, onto, author } => cli::cmd_cherry_pick(&source, onto.as_deref(), &author),
         Cmd::Bisect { sub } => cli::cmd_bisect(sub),
         Cmd::Stash { sub } => cli::cmd_stash(sub, json),

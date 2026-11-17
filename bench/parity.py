@@ -329,8 +329,92 @@ def main():
         "MAIN-ONLY" in open(os.path.join(cp, "f.txt")).read(),
     )
 
-    # 13. Things a daily user will look for and not find.
-    for missing in ("rebase", "submodule"):
+    # 13. Rebase replays a branch onto another point, and can stop mid-way.
+    rbd = os.path.join(ROOT, "rebase")
+    os.makedirs(rbd)
+    sh(f"{GESTA} init", cwd=rbd)
+    with open(os.path.join(rbd, "f.txt"), "w") as fh:
+        fh.write("a\nb\nc\n")
+    r = sh(f"{GESTA} changeset create base --author bench", cwd=rbd)
+    m = re.search(r"\b(cs[0-9a-f]{6,})\b", r.stdout)
+    if m:
+        sh(f"{GESTA} changeset commit {m.group(1)}", cwd=rbd)
+
+    sh(f"{GESTA} branch create feat", cwd=rbd)
+    sh(f"{GESTA} branch switch feat", cwd=rbd)
+    with open(os.path.join(rbd, "f.txt"), "w") as fh:
+        fh.write("a\nb\nc\nFEATURE\n")
+    r = sh(f"{GESTA} changeset create sidework --author bench", cwd=rbd)
+    m = re.search(r"\b(cs[0-9a-f]{6,})\b", r.stdout)
+    side_id = m.group(1) if m else None
+    if side_id:
+        sh(f"{GESTA} changeset commit {side_id}", cwd=rbd)
+
+    sh(f"{GESTA} branch switch main", cwd=rbd)
+    with open(os.path.join(rbd, "f.txt"), "w") as fh:
+        fh.write("a\nMAIN-EDIT\nc\n")
+    r = sh(f"{GESTA} changeset create mainwork --author bench", cwd=rbd)
+    m = re.search(r"\b(cs[0-9a-f]{6,})\b", r.stdout)
+    if m:
+        sh(f"{GESTA} changeset commit {m.group(1)}", cwd=rbd)
+
+    r = sh(f"{GESTA} rebase main --branch feat", cwd=rbd)
+    check("rebase finishes a clean replay", r.returncode == 0, r.stdout + r.stderr)
+    sh(f"{GESTA} branch switch feat", cwd=rbd)
+    body = open(os.path.join(rbd, "f.txt")).read()
+    check("the rebase kept both changes", "MAIN-EDIT" in body and "FEATURE" in body, body)
+    sh(f"{GESTA} branch switch main", cwd=rbd)
+
+    # A conflicting rebase must stop, and --abort must put the branch back.
+    with open(os.path.join(rbd, "f.txt"), "w") as fh:
+        fh.write("a\nSIDE2\nc\n")
+    sh(f"{GESTA} branch switch feat", cwd=rbd)
+    with open(os.path.join(rbd, "f.txt"), "w") as fh:
+        fh.write("a\nSIDE3\nc\n")
+    r = sh(f"{GESTA} changeset create side2 --author bench", cwd=rbd)
+    m = re.search(r"\b(cs[0-9a-f]{6,})\b", r.stdout)
+    if m:
+        sh(f"{GESTA} changeset commit {m.group(1)}", cwd=rbd)
+    sh(f"{GESTA} branch switch main", cwd=rbd)
+    with open(os.path.join(rbd, "f.txt"), "w") as fh:
+        fh.write("a\nMAIN2\nc\n")
+    r = sh(f"{GESTA} changeset create main2 --author bench", cwd=rbd)
+    m = re.search(r"\b(cs[0-9a-f]{6,})\b", r.stdout)
+    if m:
+        sh(f"{GESTA} changeset commit {m.group(1)}", cwd=rbd)
+
+    r = sh(f"{GESTA} rebase main --branch feat", cwd=rbd)
+    check("a conflicting rebase stops", "stopped" in r.stdout, r.stdout + r.stderr)
+    r = sh(f"{GESTA} rebase --abort", cwd=rbd)
+    check("rebase abort succeeds without needing a target", r.returncode == 0, r.stdout + r.stderr)
+    sh(f"{GESTA} branch switch feat", cwd=rbd)
+    body = open(os.path.join(rbd, "f.txt")).read()
+    check("abort put the branch back", "SIDE3" in body, body)
+    # A second rebase must be accepted, which only happens when the state was
+    # cleared. Asking the binary is the check; there is no other observable.
+    r = sh(f"{GESTA} rebase main --branch feat", cwd=rbd)
+    check(
+        "abort cleared the saved state",
+        "already running" not in r.stdout,
+        r.stdout + r.stderr,
+    )
+    sh(f"{GESTA} rebase --abort", cwd=rbd)
+
+    # Continue after resolving a conflict records the resolution.
+    sh(f"{GESTA} branch switch main", cwd=rbd)
+    sh(f"{GESTA} rebase main --branch feat", cwd=rbd)
+    sh(f"{GESTA} branch switch feat", cwd=rbd)
+    with open(os.path.join(rbd, "f.txt"), "w") as fh:
+        fh.write("a\nRESOLVED\nc\n")
+    r = sh(f"{GESTA} rebase --continue", cwd=rbd)
+    check("rebase continue reports the resolution", r.returncode == 0 and "rebased" in r.stdout, r.stdout + r.stderr)
+    body = open(os.path.join(rbd, "f.txt")).read()
+    check("the resolution is on disk", "RESOLVED" in body, body)
+    log = sh(f"{GESTA} log --limit 1", cwd=rbd).stdout
+    check("the resolution was recorded", "rebase" in log, log)
+
+    # 14. Things a daily user will look for and not find.
+    for missing in ("submodule",):
         r = sh(f"{GESTA} {missing} --help", cwd=repo)
         check(f"{missing} is absent (known gap)", r.returncode != 0)
 
