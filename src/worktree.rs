@@ -221,14 +221,22 @@ pub const DEFAULT_IGNORES: &[&str] = &[
 ];
 
 /// Walk `root` and return every regular file that belongs to the repository,
-/// sorted, with `root`-relative paths. Honours the ignore rules.
-pub fn scan_files(root: &Path, rules: &IgnoreRules) -> std::io::Result<Vec<PathBuf>> {
+/// together with the metadata the walk already had to fetch. Sorted, with
+/// `root`-relative paths, honouring the ignore rules.
+///
+/// Callers that need size or mtime used to stat every file a second time after
+/// a path-only walk. On a 2000 file repository that is 2000 extra syscalls for
+/// information the directory entry already carried.
+pub fn scan_files_with_meta(
+    root: &Path,
+    rules: &IgnoreRules,
+) -> std::io::Result<Vec<(PathBuf, fs::Metadata)>> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = match fs::read_dir(&dir) {
             Ok(e) => e,
-            Err(_) => continue, // unreadable directory: skip, do not abort the scan
+            Err(_) => continue,
         };
         for entry in entries {
             let entry = match entry {
@@ -254,11 +262,16 @@ pub fn scan_files(root: &Path, rules: &IgnoreRules) -> std::io::Result<Vec<PathB
                 if rules.is_ignored(&rel, false) {
                     continue;
                 }
-                out.push(path);
+                // entry.metadata() does not follow extra symlinks and on most
+                // filesystems costs nothing beyond what read_dir returned.
+                match entry.metadata() {
+                    Ok(m) => out.push((path, m)),
+                    Err(_) => continue,
+                }
             }
         }
     }
-    out.sort();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
 }
 
@@ -408,7 +421,11 @@ mod tests {
             "secret/".to_string(),
             ".env".to_string(),
         ]);
-        let got: Vec<String> = scan_files(&tmp, &r).unwrap().iter().map(|p| rel_path(&tmp, p)).collect();
+        let got: Vec<String> = scan_files_with_meta(&tmp, &r)
+            .unwrap()
+            .iter()
+            .map(|(p, _)| rel_path(&tmp, p))
+            .collect();
         assert_eq!(got, vec!["app.rs", "src/a.rs"], "ignored paths must not be tracked");
         let _ = fs::remove_dir_all(&tmp);
     }

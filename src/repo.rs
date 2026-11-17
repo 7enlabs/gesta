@@ -155,7 +155,18 @@ pub fn create_changeset(
         seen.insert(f.rel.clone());
         let old_hash = committed.get(&f.rel).cloned();
         if old_hash.as_deref() != Some(f.hash.as_str()) {
-            changes.push((f.rel, old_hash, f.hash, f.content));
+            // Only a changed file needs its bytes. A stat cache hit returns an
+            // empty body, so read it here rather than opening every file in the
+            // tree on every snapshot.
+            let content = if f.content.is_empty() {
+                match crate::worktree::read_file(&root.join(&f.rel)) {
+                    crate::worktree::ReadOutcome::Text(c) => c,
+                    _ => continue,
+                }
+            } else {
+                f.content
+            };
+            changes.push((f.rel, old_hash, f.hash, content));
         }
     }
     let skipped = scanned.skipped_binary;

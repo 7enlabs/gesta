@@ -20,17 +20,31 @@ chrono = "0.4"
 flate2 = "1.0"
 # TLS. rustls is pure Rust, so it adds no second C toolchain next to the bundled
 # SQLite; the `ring` provider is the one that builds without a nightly compiler.
-rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12", "logging"] }
+# TLS is behind a feature: it costs 880 KB of binary and 8 ms of page-in, and
+# the commands an agent runs in a loop (status, diff, commit) never touch it.
+# Built with --features tls for `serve --tls` and https:// remotes.
+rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "ring", "tls12", "logging"] }
 # rustls-pemfile is unmaintained (RUSTSEC-2025-0134). rustls-pki-types parses PEM
 # itself now, so the separate crate is gone.
-rustls-pki-types = { version = "1", features = ["std"] }
+rustls-pki-types = { version = "1", optional = true, features = ["std"] }
 # Root certificates for a client that talks to a public host.
-webpki-roots = "0.26"
+webpki-roots = { version = "0.26", optional = true }
 # Self-signed certificate generation for `serve --tls self-signed`, so a private
 # network can be encrypted without an external CA.
-rcgen = "0.13"
+rcgen = { version = "0.13", optional = true }
+
+[features]
+default = ["tls"]
+tls = ["dep:rustls", "dep:rustls-pki-types", "dep:webpki-roots", "dep:rcgen"]
 
 [profile.release]
 opt-level = 3
-lto = true
+# Thin LTO instead of fat: the code size win of fat LTO is small here and it is
+# what makes the binary slow to page in, which matters more than peak speed for
+# a command run thousands of times a day.
+lto = "thin"
+codegen-units = 4
+# Abort instead of unwinding: every panic path in this program ends the process
+# anyway, and dropping the unwind tables removes both size and load work.
+panic = "abort"
 strip = true

@@ -291,7 +291,7 @@ pub fn request_with_pin(
     url: &str,
     body: Option<&[u8]>,
     token: Option<&str>,
-    pin: Option<&str>,
+    #[allow(unused_variables)] pin: Option<&str>,
 ) -> ZResult<(u16, Vec<u8>)> {
     let u = parse_http_url(url)?;
     let timeout = Duration::from_secs(120);
@@ -301,19 +301,26 @@ pub fn request_with_pin(
     // only the socket differs.
     let mut raw: Vec<u8> = Vec::new();
     if u.tls {
-        let mut stream = crate::tls::connect(&u.host, u.port, pin, timeout)?;
-        stream.write_all(head.as_bytes())?;
-        if let Some(b) = body {
-            stream.write_all(b)?;
-        }
-        stream.flush()?;
-        if let Err(e) = stream.read_to_end(&mut raw) {
-            // A server that closes without close_notify leaves a complete
-            // response that rustls refuses to hand over quietly. If bytes
-            // arrived and the document is whole, say so instead of failing.
-            let complete = find_subslice(&raw, b"\r\n\r\n").is_some();
-            if !(complete && is_eof_error(&e)) {
-                return Err(bad(format!("reading the response failed: {}", e)));
+        #[cfg(not(feature = "tls"))]
+        return Err(bad(
+            "this build has no TLS support: rebuild with --features tls, or use http:// on a trusted network",
+        ));
+        #[cfg(feature = "tls")]
+        {
+            let mut stream = crate::tls::connect(&u.host, u.port, pin, timeout)?;
+            stream.write_all(head.as_bytes())?;
+            if let Some(b) = body {
+                stream.write_all(b)?;
+            }
+            stream.flush()?;
+            if let Err(e) = stream.read_to_end(&mut raw) {
+                // A server that closes without close_notify leaves a complete
+                // response that rustls refuses to hand over quietly. If bytes
+                // arrived and the document is whole, say so instead of failing.
+                let complete = find_subslice(&raw, b"\r\n\r\n").is_some();
+                if !(complete && is_eof_error(&e)) {
+                    return Err(bad(format!("reading the response failed: {}", e)));
+                }
             }
         }
     } else {
@@ -359,6 +366,7 @@ pub fn request_with_pin(
 
 /// Assemble the request header block for either transport.
 /// Is this the "peer closed without close_notify" case?
+#[cfg(feature = "tls")]
 fn is_eof_error(e: &std::io::Error) -> bool {
     let text = e.to_string();
     text.contains("close_notify") || text.contains("UnexpectedEof")
@@ -397,6 +405,7 @@ fn build_request_head(
 /// The request and response handling is shared with the plaintext server: only
 /// the socket differs. A repository served with a certificate is meant to leave
 /// loopback, so a bind without tokens is still refused.
+#[cfg(feature = "tls")]
 pub fn serve_tls(
     root: PathBuf,
     bind: String,
@@ -445,6 +454,7 @@ pub fn serve_tls(
     Ok(())
 }
 
+#[cfg(feature = "tls")]
 fn handle_tls_connection(mut stream: crate::tls::TlsStream, root: &Path, auth: &Auth) -> ZResult<()> {
     let resp = match read_request_generic(&mut stream) {
         Ok(req) => route(root, &req, auth),

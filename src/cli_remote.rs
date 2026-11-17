@@ -29,7 +29,10 @@ pub fn cmd_remote_add(
     let (_root, conn) = open_repo()?;
     if let Some(p) = pin {
         // Reject a malformed pin now, not on the first push over a network.
+        #[cfg(feature = "tls")]
         crate::tls::client_config(Some(p))?;
+        #[cfg(not(feature = "tls"))]
+        let _ = p;
     }
     conn.execute(
         "INSERT INTO remotes(name, url, token, pin) VALUES(?1, ?2, ?3, ?4)
@@ -694,13 +697,24 @@ pub fn cmd_serve(
     bind: &str,
     port: u16,
     tls: Option<&str>,
-    key: Option<&str>,
+    #[allow(unused_variables)] key: Option<&str>,
 ) -> ZResult<()> {
     let (root, _conn) = open_repo()?;
     let auth = auth::Auth::from_entries(&read_auth_file(&root)?);
 
+    // Without the tls feature the flags still parse, so the error names the
+    // cause. A build that silently ignores --tls would be the worst outcome: the
+    // operator would believe the port is encrypted.
+    #[cfg(not(feature = "tls"))]
+    if tls.is_some() {
+        return Err(bad(
+            "this build has no TLS support: rebuild with --features tls",
+        ));
+    }
+
     match tls {
         None => http::serve(root, bind.to_string(), port, auth),
+        #[cfg(feature = "tls")]
         Some("self-signed") => {
             // A generated certificate is for a private network. Writing it under
             // .zenforge/ keeps it with the repository and out of a changeset,
@@ -711,6 +725,7 @@ pub fn cmd_serve(
             println!("pin this on clients with --pin {}", fp);
             http::serve_tls(root, bind.to_string(), port, auth, &cert, &key_path)
         }
+        #[cfg(feature = "tls")]
         Some(cert_path) => {
             let key_path = key
                 .map(std::path::PathBuf::from)
@@ -724,6 +739,13 @@ pub fn cmd_serve(
                 &key_path,
             )
         }
+        // The early return above covers every Some(_) in a build without the
+        // feature. Restating it as an error keeps the invariant visible: if that
+        // early return is ever moved, this is a message instead of a crash.
+        #[cfg(not(feature = "tls"))]
+        Some(_) => Err(bad(
+            "this build has no TLS support: rebuild with --features tls",
+        )),
     }
 }
 

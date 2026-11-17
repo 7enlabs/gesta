@@ -20,6 +20,7 @@ mod remote;
 mod repo;
 mod sparse;
 mod store;
+#[cfg(feature = "tls")]
 mod tls;
 mod worktree;
 

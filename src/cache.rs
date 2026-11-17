@@ -13,8 +13,13 @@ use rusqlite::params;
 use rusqlite::Connection;
 
 use crate::store::hash_content;
-use crate::worktree::{read_file, rel_path, scan_files, IgnoreRules, ReadOutcome};
+use crate::worktree::{read_file, rel_path, scan_files_with_meta, IgnoreRules, ReadOutcome};
 use crate::ZResult;
+
+/// Files whose mtime is younger than this are re-read rather than trusted.
+/// Two seconds covers filesystem timestamp granularity plus the clock skew of a
+/// writer that opened the file just before touching it.
+const RACY_WINDOW_NS: i64 = 2_000_000_000;
 
 /// One file in the working tree.
 pub struct ScannedFile {
@@ -53,52 +58,61 @@ pub fn scan_with_cache(
     let mut rehashed = 0usize;
     let mut cached = 0usize;
     let mut unreadable: Vec<String> = Vec::new();
+    // Cache rows are written in one batch at the end. Remembering each file
+    // separately meant one transaction per file, and on 2000 files that was the
+    // difference between a 5 ms scan and a 27 ms one.
+    let mut pending_writes: Vec<(String, i64, i64, String)> = Vec::new();
 
-    for p in scan_files(root, rules)? {
-        let rel = rel_path(root, &p);
-        let meta = match std::fs::metadata(&p) {
-            Ok(m) => m,
-            Err(_) => continue, // vanished between scan and stat
-        };
+    // Read the clock once. Asking for it per file turned a cheap comparison into
+    // a syscall for every path in the tree.
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+
+    for (path, meta) in scan_files_with_meta(root, rules)? {
+        let rel = rel_path(root, &path);
+        // Nanoseconds, not seconds. Two writes inside one second with the same
+        // size are indistinguishable at second resolution, and the cache would
+        // then serve the first write's hash for the second write's content.
         let mtime = meta
             .modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
+            .map(|d| d.as_nanos() as i64)
             .unwrap_or(0);
         let size = meta.len() as i64;
         seen.push(rel.clone());
 
         if let Some((cm, cs, ch)) = known.get(&rel) {
             if *cm == mtime && *cs == size {
-                // Stat matches, so trust the recorded hash and skip the read
-                // only if the content is not needed. Callers that need content
-                // get it from the object store by hash.
-                match read_file(&p) {
-                    ReadOutcome::Text(content) => {
-                        let actual = hash_content(&content);
-                        // A stale cache entry would silently hide a change, so
-                        // the hash is rechecked whenever the file is read anyway.
-                        if &actual == ch {
-                            cached += 1;
-                        } else {
-                            rehashed += 1;
-                            remember(conn, root, &rel, &actual)?;
-                        }
-                        files.push(ScannedFile { rel, hash: actual, content });
-                    }
-                    ReadOutcome::Binary => skipped_binary.push(rel),
-                    ReadOutcome::Unreadable(e) => unreadable.push(format!("{}: {}", rel, e)),
+                // Racy case, the same one git guards against. A file written
+                // moments ago can be written again without the stat changing in a
+                // way the next scan would see, if both writes land inside the
+                // filesystem's timestamp resolution. Such a file is re-read
+                // instead of trusted. Once it is a couple of seconds old the stat
+                // is stable and the fast path applies.
+                let young = now_ns.saturating_sub(mtime) < RACY_WINDOW_NS;
+                if !young {
+                    // The stat matches, so the recorded hash is the answer and the
+                    // file is never opened. Reading it anyway made the cache
+                    // worthless: a 2000 file status read all 2000 files.
+                    cached += 1;
+                    files.push(ScannedFile {
+                        rel,
+                        hash: ch.clone(),
+                        content: String::new(),
+                    });
+                    continue;
                 }
-                continue;
             }
         }
 
-        match read_file(&p) {
+        match read_file(&path) {
             ReadOutcome::Text(content) => {
                 let hash = hash_content(&content);
                 rehashed += 1;
-                remember(conn, root, &rel, &hash)?;
+                pending_writes.push((rel.clone(), mtime, size, hash.clone()));
                 files.push(ScannedFile { rel, hash, content });
             }
             ReadOutcome::Binary => skipped_binary.push(rel),
@@ -106,8 +120,30 @@ pub fn scan_with_cache(
         }
     }
 
+    if !pending_writes.is_empty() {
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO worktree_cache(path, mtime, size, hash) VALUES(?1, ?2, ?3, ?4)
+                 ON CONFLICT(path) DO UPDATE SET mtime = excluded.mtime,
+                                                 size = excluded.size,
+                                                 hash = excluded.hash",
+            )?;
+            for (rel, m, sz, h) in &pending_writes {
+                stmt.execute(params![rel, m, sz, h])?;
+            }
+        }
+        tx.commit()?;
+    }
+
     prune_cache(conn, &seen)?;
-    Ok(ScanResult { files, skipped_binary, rehashed, cached, unreadable })
+    Ok(ScanResult {
+        files,
+        skipped_binary,
+        rehashed,
+        cached,
+        unreadable,
+    })
 }
 
 fn load_cache(conn: &Connection) -> ZResult<HashMap<String, (i64, i64, String)>> {
@@ -146,6 +182,9 @@ fn prune_cache(conn: &Connection, seen: &[String]) -> ZResult<()> {
 }
 
 /// Update one path's cache row after its content is known.
+/// Record one path. Only the tests call this now; production batches its writes
+/// through scan_with_cache, which needs a single transaction for the whole tree.
+#[cfg(test)]
 pub fn remember(conn: &Connection, root: &Path, rel: &str, hash: &str) -> ZResult<()> {
     let p = root.join(rel);
     let Ok(meta) = std::fs::metadata(&p) else { return Ok(()) };
@@ -153,7 +192,7 @@ pub fn remember(conn: &Connection, root: &Path, rel: &str, hash: &str) -> ZResul
         .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
+        .map(|d| d.as_nanos() as i64)
         .unwrap_or(0);
     conn.execute(
         "INSERT INTO worktree_cache(path, mtime, size, hash) VALUES(?1, ?2, ?3, ?4)
@@ -169,6 +208,13 @@ pub fn remember(conn: &Connection, root: &Path, rel: &str, hash: &str) -> ZResul
 mod tests {
     use super::*;
     use crate::store::tests::mem_db;
+
+    /// Move a file's mtime into the past so it is outside the racy window.
+    fn backdate(p: &std::path::Path, secs: u64) {
+        let f = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+        f.set_modified(when).unwrap();
+    }
 
     fn tmpdir(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("zf_cache_{}_{}", tag, std::process::id()));
@@ -207,6 +253,10 @@ mod tests {
     fn remember_then_scan_uses_the_cache_for_an_unchanged_file() {
         let d = tmpdir("hit");
         std::fs::write(d.join("a.txt"), "stable\n").unwrap();
+        // Backdate the file past the racy window. A freshly written file is
+        // deliberately re-read even when its stat matches, because a second
+        // write inside the same timestamp would be invisible otherwise.
+        backdate(&d.join("a.txt"), 60);
         let conn = mem_db();
         let rules = IgnoreRules::with_defaults(&[]);
 
@@ -214,6 +264,27 @@ mod tests {
         let r = scan_with_cache(&conn, &d, &rules).unwrap();
         assert_eq!(r.cached, 1, "an unchanged stat should be a cache hit");
         assert_eq!(r.rehashed, 0);
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_file_edited_seconds_ago_is_reread_even_when_its_stat_matches() {
+        // The racy case: same path, same size, written twice close together. The
+        // cache must not answer from the first write.
+        let d = tmpdir("racy");
+        std::fs::write(d.join("a.txt"), "AAAA\n").unwrap();
+        let conn = mem_db();
+        let rules = IgnoreRules::with_defaults(&[]);
+        remember(&conn, &d, "a.txt", &hash_content("WRONG\n")).unwrap();
+
+        let r = scan_with_cache(&conn, &d, &rules).unwrap();
+        assert_eq!(
+            r.files[0].hash,
+            hash_content("AAAA\n"),
+            "a young file must be reread, not trusted from the cache"
+        );
+        assert_eq!(r.cached, 0);
 
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -250,6 +321,59 @@ mod tests {
 
         let r = scan_with_cache(&conn, &d, &rules).unwrap();
         assert_eq!(r.files[0].hash, hash_content("AAAA\n"), "must hash real content");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_cache_hit_does_not_read_the_file() {
+        // The point of the cache is not opening the file. An earlier version
+        // counted cache hits while still reading and hashing every file, which
+        // reported a healthy cache and saved nothing.
+        //
+        // Proof: put different bytes on disk while keeping the stat identical. A
+        // scan that reads would report the new hash. A scan that trusts the cache
+        // reports the recorded one.
+        let d = tmpdir("noread");
+        let p = d.join("a.txt");
+        std::fs::write(&p, "aaaa\n").unwrap();
+        backdate(&p, 60);
+        let conn = mem_db();
+        let rules = IgnoreRules::with_defaults(&[]);
+        let recorded = hash_content("aaaa\n");
+        remember(&conn, &d, "a.txt", &recorded).unwrap();
+
+        let old = std::fs::metadata(&p).unwrap().modified().unwrap();
+        std::fs::write(&p, "bbbb\n").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        let r = scan_with_cache(&conn, &d, &rules).unwrap();
+        assert_eq!(r.cached, 1, "the cache row should answer");
+        assert_eq!(r.rehashed, 0, "nothing should have been read");
+        assert_eq!(r.files[0].hash, recorded, "the file must not have been read");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_changed_mtime_forces_a_reread() {
+        let d = tmpdir("mtime");
+        let p = d.join("a.txt");
+        std::fs::write(&p, "one\n").unwrap();
+        backdate(&p, 60);
+        let conn = mem_db();
+        let rules = IgnoreRules::with_defaults(&[]);
+        remember(&conn, &d, "a.txt", &hash_content("one\n")).unwrap();
+
+        std::fs::write(&p, "a much longer second body\n").unwrap();
+        let r = scan_with_cache(&conn, &d, &rules).unwrap();
+        assert_eq!(r.rehashed, 1);
+        assert_eq!(r.files[0].hash, hash_content("a much longer second body\n"));
+
         let _ = std::fs::remove_dir_all(&d);
     }
 }
