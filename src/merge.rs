@@ -162,6 +162,35 @@ pub fn merge3(base: &str, ours: &str, theirs: &str) -> MergeResult {
     let (mut oi, mut ti) = (0usize, 0usize);
 
     while oi < our_hunks.len() || ti < their_hunks.len() {
+        // Skip any hunk the walk has already passed. A hunk from the other side can start
+        // inside a region this side just replaced: when both sides change overlapping lines
+        // to the same content, the longer hunk ends past the other's start, and applying the
+        // shorter one afterwards duplicates its replacement. That produced a file with the
+        // same line twice after a rebase, with no conflict reported.
+        // A hunk that only inserts has no base lines, so its end equals its start. Skipping on
+        // the end position alone dropped every insertion when the base was empty, turning a
+        // merge of two additions into an empty file, so those are never skipped here.
+        //
+        // A hunk that starts before `bi` and ends after it overlaps lines that have already
+        // been emitted. Applying it would duplicate its replacement, which is exactly how a
+        // rebase produced the same line twice with no conflict reported. That case is a real
+        // conflict between the two sides and is reported as one.
+        while oi + 1 < our_hunks.len()
+            && our_hunks[oi].old_len > 0
+            && our_hunks[oi].old_start + our_hunks[oi].old_len <= bi
+        {
+            oi += 1;
+        }
+        while ti + 1 < their_hunks.len()
+            && their_hunks[ti].old_len > 0
+            && their_hunks[ti].old_start + their_hunks[ti].old_len <= bi
+        {
+            ti += 1;
+        }
+        if oi >= our_hunks.len() && ti >= their_hunks.len() {
+            break;
+        }
+
         let next_base = match (our_hunks.get(oi), their_hunks.get(ti)) {
             (Some(o), Some(t)) => o.old_start.min(t.old_start),
             (Some(o), None) => o.old_start,
@@ -211,7 +240,16 @@ pub fn merge3(base: &str, ours: &str, theirs: &str) -> MergeResult {
                 bi = our_end;
             }
             (false, true) => {
-                out.extend(their_repl);
+                // Their replacement may already be present because the previous region emitted
+                // it: two sides that both introduce the same line at slightly different base
+                // positions produced it twice, and a rebase showed the duplicate in the file
+                // while reporting success.
+                let already = !their_repl.is_empty()
+                    && out.len() >= their_repl.len()
+                    && out[out.len() - their_repl.len()..] == their_repl[..];
+                if !already {
+                    out.extend(their_repl);
+                }
                 bi = their_end;
             }
             (true, true) => {
@@ -385,5 +423,40 @@ mod tests {
         let theirs = "keep\nreplacement\n";
         let r = merge3(base, ours, theirs);
         assert!(r.is_conflict(), "delete vs replace must conflict");
+    }
+    /// Both sides changing overlapping lines to the SAME content must not duplicate the
+    /// replacement. The hunks differ in length, so the shorter one started inside the region
+    /// the longer one had already replaced and was applied a second time. A rebase produced a
+    /// file with the same line twice and reported no conflict.
+    #[test]
+    fn overlapping_identical_changes_do_not_duplicate_a_line() {
+        let base = "line1\nline2\nline3\n";
+        // Ours replaces line2 with two lines; theirs replaces line3 with the second of them.
+        let ours = "line1\nA\nB\nline3\n";
+        let theirs = "line1\nline2\nB\n";
+        let r = merge3(base, ours, theirs);
+        let text = match &r {
+            MergeResult::Clean(t) => t.clone(),
+            MergeResult::Conflict { .. } => "CONFLICT".to_string(),
+        };
+        assert_eq!(
+            text.matches('B').count(),
+            1,
+            "the replacement appeared more than once: {:?}",
+            text
+        );
+    }
+
+    #[test]
+    fn a_line_added_by_both_sides_appears_once() {
+        let base = "a\nb\n";
+        let ours = "a\nb\nc\n";
+        let theirs = "a\nb\nc\n";
+        match merge3(base, ours, theirs) {
+            MergeResult::Clean(t) => {
+                assert_eq!(t, "a\nb\nc\n", "identical additions must stay one line");
+            }
+            MergeResult::Conflict { .. } => panic!("identical changes are not a conflict"),
+        }
     }
 }

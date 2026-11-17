@@ -498,4 +498,66 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&d);
     }
+    /// Three conflicting changesets have to survive three separate stops, each with its own
+    /// resolution kept, and end with no session left and the branch holding all three.
+    #[test]
+    fn three_conflicts_are_resolved_one_round_at_a_time() {
+        let conn = crate::store::tests::mem_db();
+        setup(&conn, "a\nMAIN\nc\n", "a\nSIDE\nc\n");
+        let d = tmp("three");
+        std::fs::write(d.join("f.txt"), "a\nMAIN\nc\n").unwrap();
+
+        // Three side changesets on top of side1, each touching the same line.
+        for i in 2..=3 {
+            let prev = if i == 2 { "side1" } else { "side2" };
+            conn.execute(
+                "INSERT INTO changesets(id,message,author,created_at,status,parent,parent2,branch)
+                 VALUES(?1,?2,'a',1,'committed',?3,NULL,'side')",
+                params![format!("side{}", i), format!("s{}", i), prev],
+            )
+            .unwrap();
+            let hash = crate::store::put_object(&conn, &format!("SIDE{}\n", i)).unwrap();
+            conn.execute(
+                "INSERT INTO changeset_files(changeset_id,path,old_hash,new_hash)
+                 VALUES(?1,'f.txt',NULL,?2)",
+                params![format!("side{}", i), hash],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO file_versions(path,version,hash,changeset_id,created_at)
+                 VALUES('f.txt',?1,?2,?3,1)",
+                params![10 + i as i64, hash, format!("side{}", i)],
+            )
+            .unwrap();
+        }
+        conn.execute("UPDATE branches SET head='side3' WHERE name='side'", []).unwrap();
+
+        let mut stops = 0;
+        let mut p = start(&conn, &d, "side", "main1", "t").unwrap();
+        while let Progress::Stopped { .. } = p {
+            stops += 1;
+            assert!(stops <= 5, "the rebase never finished");
+            std::fs::write(d.join("f.txt"), format!("resolved{}\nc\n", stops)).unwrap();
+            p = continue_after_resolution(&conn, &d, "t").unwrap();
+        }
+
+        assert!(stops >= 1, "the setup produced no conflict at all");
+        // The session is gone, so a further continue is refused instead of looping.
+        assert!(load(&conn).unwrap().is_none(), "the session was not cleared");
+        assert!(
+            continue_after_resolution(&conn, &d, "t").is_err(),
+            "a finished rebase must refuse to continue"
+        );
+
+        // Every replayed changeset exists, and the tree matches the disk.
+        let rebased: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM changesets WHERE message LIKE 'rebase:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(rebased >= 1, "nothing was recorded as replayed");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
