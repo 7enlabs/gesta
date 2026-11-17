@@ -13,6 +13,7 @@
 //!                                          would move the branch backwards
 
 use std::collections::HashSet;
+use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -39,6 +40,11 @@ pub struct Request {
 }
 
 impl Request {
+    /// The body as UTF-8 text, or `None` when it is not valid UTF-8.
+    pub fn body_text(&self) -> Option<String> {
+        String::from_utf8(self.body.clone()).ok()
+    }
+
     pub fn param(&self, key: &str) -> Option<&str> {
         self.query.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
     }
@@ -58,6 +64,15 @@ impl Response {
             reason: "OK",
             content_type: "text/plain; charset=utf-8",
             body: s.into().into_bytes(),
+        }
+    }
+
+    pub fn ok_json(v: crate::json::Json) -> Response {
+        Response {
+            status: 200,
+            reason: "OK",
+            content_type: "application/json; charset=utf-8",
+            body: v.render().into_bytes(),
         }
     }
 
@@ -426,10 +441,14 @@ pub fn route(root: &Path, req: &Request, auth: &Auth) -> Response {
     let needed = match (req.method.as_str(), path) {
         ("GET", "/v1/health") => None,
         (_, p) if p.starts_with("/v1/bundle") && req.method == "POST" => Some(Role::Write),
+        (_, "/v1/changeset") if req.method == "POST" => Some(Role::Write),
+        (_, "/v1/changeset") if req.method == "GET" || req.method == "HEAD" => Some(Role::Read),
         (_, p) if p.starts_with("/v1/") => Some(Role::Read),
         _ => None,
     };
 
+    let mut who = "anonymous".to_string();
+    let mut grant: Option<crate::auth::Grant> = None;
     if let Some(needed) = needed {
         if auth.required {
             let presented = req
@@ -444,7 +463,10 @@ pub fn route(root: &Path, req: &Request, auth: &Auth) -> Response {
                         .map(|s| Box::leak(s.into_boxed_str()) as &str)
                 });
             match presented.and_then(|p| auth.authenticate(p)) {
-                Some((_, role)) if Auth::allows(role, needed) => {}
+                Some(g) if Auth::allows(g.role, needed) => {
+                    who = g.name.clone();
+                    grant = Some(g);
+                }
                 Some(_) => {
                     return Response::error(
                         403,
@@ -479,14 +501,105 @@ pub fn route(root: &Path, req: &Request, auth: &Auth) -> Response {
                 .map(|h| h.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect())
                 .unwrap_or_default();
             match fetch_bundle(root, branch, &have) {
-                Ok(Some(bytes)) => Response::ok_binary(bytes),
+                Ok(Some(bytes)) => {
+                    log_access(root, &who, "bundle", branch, &format!("{} bytes", bytes.len()));
+                    Response::ok_binary(bytes)
+                }
                 Ok(None) => Response::error(404, "Not Found", format!("no branch {}", branch)),
                 Err(e) => Response::error(500, "Internal Server Error", e.to_string()),
             }
         }
+        ("GET", "/v1/file") => {
+            let path = match req.param("path") {
+                Some(p) => crate::normalise(p),
+                None => return Response::error(400, "Bad Request", "path is required"),
+            };
+            let conn = match crate::store::open_db(root) {
+                Ok(c) => c,
+                Err(e) => return Response::error(500, "Internal Server Error", e.to_string()),
+            };
+            let rev = match req.param("rev") {
+                Some(r) => r.to_string(),
+                None => {
+                    // No rev means "what the branch looks like right now", which
+                    // includes changesets still queued. Reading only the head
+                    // would make a file written by an API call invisible until
+                    // somebody committed it.
+                    let branch = match crate::store::current_branch(&conn) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            return Response::error(500, "Internal Server Error", e.to_string())
+                        }
+                    };
+                    let pending: Option<String> = conn
+                        .query_row(
+                            "SELECT id FROM changesets
+                             WHERE branch = ?1 AND status = 'pending'
+                             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                            rusqlite::params![branch],
+                            |r| r.get(0),
+                        )
+                        .ok();
+                    pending.unwrap_or(branch)
+                }
+            };
+            // A caller may name a branch, a tag or a changeset.
+            let resolved = match crate::store::resolve_rev(&conn, &rev) {
+                Ok(Some(h)) => h,
+                Ok(None) => {
+                    return Response::error(
+                        404,
+                        "Not Found",
+                        format!("no such branch, tag or changeset: {}", rev),
+                    )
+                }
+                Err(e) => return Response::error(500, "Internal Server Error", e.to_string()),
+            };
+            match crate::store::hash_at_point(&conn, &path, &resolved) {
+                Ok(Some(hash)) => match crate::store::get_object(&conn, &hash) {
+                    Ok(content) => {
+                        log_access(root, &who, "file", &path, &format!("{} bytes", content.len()));
+                        Response::ok_text(content)
+                    }
+                    Err(e) => Response::error(500, "Internal Server Error", e.to_string()),
+                },
+                Ok(None) => Response::error(
+                    404,
+                    "Not Found",
+                    format!("{} does not exist at {}", path, rev),
+                ),
+                Err(e) => Response::error(500, "Internal Server Error", e.to_string()),
+            }
+        }
+        ("POST", "/v1/changeset") => {
+            let body = match req.body_text() {
+                Some(b) => b,
+                None => return Response::error(400, "Bad Request", "body must be UTF-8 JSON"),
+            };
+            let payload = match crate::json::parse(&body) {
+                Ok(v) => v,
+                Err(e) => return Response::error(400, "Bad Request", format!("bad JSON: {}", e)),
+            };
+            match create_changeset_from_json(root, &payload, &who, grant.as_ref()) {
+                Ok(v) => {
+                    // `who` is the authenticated token name, which is the only
+                    // identity worth auditing. The author the client claims is
+                    // recorded in the detail, next to it, and never instead.
+                    let claimed = crate::json::field(&payload, "author")
+                        .and_then(crate::json::as_str)
+                        .unwrap_or("-");
+                    let detail = format!("claimed_author={} {}", claimed, v.render());
+                    log_access(root, &who, "changeset", "-", &detail);
+                    Response::ok_json(v)
+                }
+                Err(ChangeErr::Bad(msg)) => Response::error(400, "Bad Request", msg),
+                Err(ChangeErr::Denied(msg)) => Response::error(403, "Forbidden", msg),
+                Err(ChangeErr::Internal(msg)) => Response::error(500, "Internal Server Error", msg),
+            }
+        }
         ("POST", "/v1/bundle") => {
             let branch = req.param("branch").unwrap_or("main");
-            match receive_bundle(root, branch, &req.body) {
+            match receive_bundle(root, branch, &req.body, &who) {
                 Ok(msg) => Response::ok_text(msg),
                 Err(ApplyError::Rejected(msg)) => Response::error(409, "Conflict", msg),
                 Err(ApplyError::Other(e)) => Response::error(400, "Bad Request", e.to_string()),
@@ -506,6 +619,114 @@ fn decode_basic_token(value: &str) -> Option<String> {
     let text = String::from_utf8(raw).ok()?;
     let (_user, token) = text.split_once(':')?;
     Some(token.to_string())
+}
+
+
+/// Why a changeset request was refused.
+enum ChangeErr {
+    Bad(String),
+    Denied(String),
+    Internal(String),
+}
+
+/// Build a changeset straight from a JSON body, with no working copy.
+///
+/// This is the server side of "commit in memory": an agent running in a sandbox
+/// sends `{branch, message, author, files: [{path, content}], delete: [path]}` and
+/// the server writes blobs and a changeset without touching a checkout. Paths are
+/// checked against the token's scope, so a token limited to `src/**` cannot write
+/// outside it.
+fn create_changeset_from_json(
+    root: &Path,
+    payload: &crate::json::Json,
+    who: &str,
+    grant: Option<&crate::auth::Grant>,
+) -> Result<crate::json::Json, ChangeErr> {
+    use crate::json::{self, field, Json};
+
+    let conn = crate::store::open_db(root).map_err(|e| ChangeErr::Internal(e.to_string()))?;
+    crate::store::init_schema(&conn).map_err(|e| ChangeErr::Internal(e.to_string()))?;
+
+    let message = field(payload, "message")
+        .and_then(json::as_str)
+        .ok_or_else(|| ChangeErr::Bad("message is required".into()))?;
+    let author = field(payload, "author").and_then(json::as_str).unwrap_or(who);
+    let branch = field(payload, "branch").and_then(json::as_str).unwrap_or("main");
+    let commit = field(payload, "commit").map(|v| matches!(v, Json::Bool(true))).unwrap_or(false);
+
+    let mut files: Vec<(String, String)> = Vec::new();
+    if let Some(Json::Arr(items)) = field(payload, "files") {
+        for item in items {
+            let path = field(item, "path")
+                .and_then(json::as_str)
+                .ok_or_else(|| ChangeErr::Bad("every file needs a path".into()))?;
+            let content = field(item, "content")
+                .and_then(json::as_str)
+                .ok_or_else(|| ChangeErr::Bad(format!("{} needs content", path)))?;
+            let path = crate::normalise(path);
+            if path.is_empty() || path.starts_with('/') || path.split('/').any(|s| s == "..") {
+                return Err(ChangeErr::Bad(format!("unsafe path {:?}", path)));
+            }
+            if let Some(g) = grant {
+                if !g.permits(&path) {
+                    return Err(ChangeErr::Denied(format!(
+                        "token {} may not write {}",
+                        g.name, path
+                    )));
+                }
+            }
+            files.push((path, content.to_string()));
+        }
+    }
+
+    let mut delete: Vec<String> = Vec::new();
+    if let Some(Json::Arr(items)) = field(payload, "delete") {
+        for item in items {
+            let path = json::as_str(item)
+                .ok_or_else(|| ChangeErr::Bad("delete entries must be strings".into()))?;
+            let path = crate::normalise(path);
+            if let Some(g) = grant {
+                if !g.permits(&path) {
+                    return Err(ChangeErr::Denied(format!(
+                        "token {} may not delete {}",
+                        g.name, path
+                    )));
+                }
+            }
+            delete.push(path);
+        }
+    }
+
+    if files.is_empty() && delete.is_empty() {
+        return Err(ChangeErr::Bad("nothing to do: send files or delete".into()));
+    }
+
+    let result = crate::store::with_retry(|| {
+        crate::content::changeset_from_content(&conn, message, author, branch, &files, &delete)
+    })
+    .map_err(|e| ChangeErr::Internal(e.to_string()))?;
+
+    let mut out = vec![
+        ("id", Json::str(result.id.clone())),
+        ("branch", Json::str(branch.to_string())),
+        ("files", Json::int(result.paths.len() as i64)),
+        ("paths", Json::arr(result.paths.iter().cloned().map(Json::str).collect())),
+        (
+            "skipped",
+            Json::arr(result.skipped.iter().cloned().map(Json::str).collect()),
+        ),
+    ];
+
+    if commit {
+        let id = result.id.clone();
+        let n = crate::store::with_retry(|| crate::repo::commit_one(&conn, &id))
+            .map_err(|e| ChangeErr::Internal(e.to_string()))?;
+        out.push(("committed", Json::Bool(n > 0)));
+    } else {
+        out.push(("committed", Json::Bool(false)));
+    }
+
+    Ok(Json::obj(out))
 }
 
 fn list_branches(root: &Path) -> ZResult<String> {
@@ -549,7 +770,7 @@ impl From<rusqlite::Error> for ApplyError {
     }
 }
 
-fn receive_bundle(root: &Path, branch: &str, body: &[u8]) -> Result<String, ApplyError> {
+fn receive_bundle(root: &Path, branch: &str, body: &[u8], who: &str) -> Result<String, ApplyError> {
     let conn = open_db(root)?;
     init_schema(&conn)?;
 
@@ -583,7 +804,34 @@ fn receive_bundle(root: &Path, branch: &str, body: &[u8]) -> Result<String, Appl
     crate::repo::materialise(&conn, root, branch)?;
 
     let head = branch_head(&conn, branch)?.unwrap_or_else(|| "-".into());
+    log_access(
+        root,
+        who,
+        "push",
+        branch,
+        &format!("{} changesets, head {}", applied, head),
+    );
     Ok(format!("applied {}\nhead {}\n", applied, head))
+}
+
+/// Append one line to `.zenforge/access.log`, recording who did what.
+///
+/// The server is the only place that knows the authenticated identity, so the
+/// audit trail has to be written here rather than on the client.
+pub fn log_access(root: &Path, who: &str, action: &str, branch: &str, detail: &str) {
+    use std::io::Write;
+    let path = root.join(crate::ZF_DIR).join("access.log");
+    let line = format!(
+        "{}\t{}\t{}\t{}\t{}\n",
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        who,
+        action,
+        branch,
+        detail
+    );
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(line.as_bytes());
+    }
 }
 
 /// URL a client should hit for a given repository base and branch.

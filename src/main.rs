@@ -4,9 +4,14 @@
 //! and history, three-way merge, remote sync, and an operation log for undo.
 
 mod auth;
+mod cache;
 mod cli;
 mod cli_remote;
+mod content;
+mod history;
 mod http;
+mod json;
+mod mcp;
 mod merge;
 mod ops;
 mod remote;
@@ -43,7 +48,7 @@ pub fn normalise(file: &str) -> String {
     file.replace('\\', "/")
 }
 
-fn repo_root() -> ZResult<PathBuf> {
+pub fn repo_root() -> ZResult<PathBuf> {
     let mut cur = std::env::current_dir()?;
     loop {
         if cur.join(ZF_DIR).is_dir() {
@@ -70,6 +75,9 @@ fn open_repo() -> ZResult<(PathBuf, rusqlite::Connection)> {
 #[derive(Parser)]
 #[command(name = "zenforge", version, about = "Source control for AI agents")]
 struct Cli {
+    /// Print machine-readable JSON instead of text
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -129,6 +137,14 @@ enum Cmd {
     },
     /// Undo the last operation (like git reset but reversible both ways)
     Undo,
+    /// Undo the effect of one changeset by recording a new one
+    Revert {
+        id: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long, default_value = "agent")]
+        author: String,
+    },
     /// Show the operation log
     Ops {
         #[arg(long, default_value_t = 20)]
@@ -152,6 +168,8 @@ enum Cmd {
         #[command(subcommand)]
         sub: RemoteCmd,
     },
+    /// Run an MCP server on stdio, exposing the repository as tools
+    Mcp,
     /// Serve this repository over HTTP
     Serve {
         #[arg(long, default_value = "127.0.0.1")]
@@ -269,6 +287,8 @@ enum TokenCmd {
     },
     /// List configured tokens without revealing them
     List,
+    /// Remove a token by name or by its last four characters
+    Remove { selector: String },
 }
 
 #[derive(Subcommand)]
@@ -290,7 +310,17 @@ fn main() {
 
 fn run() -> ZResult<()> {
     let cli = Cli::parse();
+    let json = cli.json;
     match cli.cmd {
+        Cmd::Status if json => cli::cmd_status_json(),
+        Cmd::Log { limit, .. } if json => cli::cmd_log_json(limit),
+        Cmd::Blame { file } if json => cli::cmd_blame_json(&file),
+        Cmd::History { file } if json => cli::cmd_history_json(&file),
+        Cmd::Diff { changeset, .. } if json => cli::cmd_diff_json(changeset.as_deref()),
+        Cmd::Tag { .. } if json => cli::cmd_tag_json(),
+        Cmd::Ops { limit } if json => cli::cmd_ops_json(limit),
+        Cmd::Branch { sub } if json => cli::cmd_branch_json(sub),
+        Cmd::Changeset { sub } if json => cli::cmd_changeset_json(sub),
         Cmd::Init { bare } => cli::cmd_init(bare),
         Cmd::Status => cli::cmd_status(),
         Cmd::Diff { changeset, name_only } => cli::cmd_diff(changeset.as_deref(), name_only),
@@ -309,6 +339,9 @@ fn run() -> ZResult<()> {
         Cmd::Checkout { file, changeset } => cli::cmd_checkout(&file, changeset.as_deref()),
         Cmd::Restore { file } => cli::cmd_restore(&file),
         Cmd::Undo => cli::cmd_undo(),
+        Cmd::Revert { id, reason, author } => {
+            cli::cmd_revert(&id, reason.as_deref(), &author)
+        }
         Cmd::Ops { limit } => cli::cmd_ops(limit),
         Cmd::Tag { name, changeset, list } => cli::cmd_tag(&name, changeset.as_deref(), list),
         Cmd::Branch { sub } => match sub {
@@ -327,6 +360,7 @@ fn run() -> ZResult<()> {
             RemoteCmd::Token { sub } => match sub {
                 TokenCmd::Add { role, name, hashed } => cli_remote::cmd_token_add(&role, &name, hashed),
                 TokenCmd::List => cli_remote::cmd_token_list(),
+                TokenCmd::Remove { selector } => cli_remote::cmd_token_remove(&selector),
             },
             RemoteCmd::Push { remote, branch } => cli_remote::cmd_push(&remote, &branch),
             RemoteCmd::Pull { remote, branch, author } => cli_remote::cmd_pull(&remote, &branch, &author),
@@ -334,6 +368,7 @@ fn run() -> ZResult<()> {
                 cli_remote::cmd_clone(&url, &dir, token.as_deref())
             }
         },
+        Cmd::Mcp => cli::cmd_mcp(),
         Cmd::Serve { bind, port } => cli_remote::cmd_serve(&bind, port),
         Cmd::Fsck { prune } => cli_remote::cmd_fsck(prune),
         Cmd::Stats => cli_remote::cmd_stats(),

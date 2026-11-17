@@ -327,6 +327,11 @@ pub fn cmd_stats() -> ZResult<()> {
     println!("blame rows:  {}", blame);
     println!("branches:    {}", branches);
     println!("tags:        {}", tags);
+
+    let cache_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM worktree_cache", [], |r| r.get(0))
+        .unwrap_or(0);
+    println!("stat cache:  {} path(s)", cache_count);
     Ok(())
 }
 
@@ -671,6 +676,53 @@ pub fn cmd_token_add(role: &str, name: &str, hashed: bool) -> ZResult<()> {
         println!("\nStored in clear in .zenforge/auth, which is never tracked by zenforge.");
     }
     println!("Give it to the client once. `token list` shows only the last four characters.");
+    Ok(())
+}
+
+/// Remove a token by name or by its last four characters.
+pub fn cmd_token_remove(selector: &str) -> ZResult<()> {
+    let (root, _conn) = open_repo()?;
+    let path = root.join(ZF_DIR).join("auth");
+    let entries = read_auth_file(&root)?;
+    if entries.is_empty() {
+        return Err(bad("no tokens configured"));
+    }
+
+    let mut kept: Vec<String> = Vec::new();
+    let mut removed = 0usize;
+    for line in entries {
+        let l = line.trim();
+        if l.is_empty() || l.starts_with('#') {
+            kept.push(line);
+            continue;
+        }
+        // Both forms end with `<role>:<name>`, so the name is the last field
+        // either way; only the identifier before it differs.
+        let (name, id) = if let Some(rest) = l.strip_prefix("sha256:") {
+            let mut parts = rest.splitn(3, ':');
+            let digest = parts.next().unwrap_or("").to_string();
+            let _role = parts.next();
+            (parts.next().unwrap_or("").to_string(), digest)
+        } else {
+            let mut parts = l.splitn(3, ':');
+            let token = parts.next().unwrap_or("").to_string();
+            let _role = parts.next();
+            (parts.next().unwrap_or("").to_string(), token)
+        };
+        let tail: String = id.chars().rev().take(4).collect::<String>().chars().rev().collect();
+        if name == selector || tail == selector {
+            removed += 1;
+            continue;
+        }
+        kept.push(line);
+    }
+
+    if removed == 0 {
+        return Err(bad(format!("no token matches {:?}", selector)));
+    }
+    fs::write(&path, kept.join("\n") + if kept.is_empty() { "" } else { "\n" })?;
+    println!("removed {} token(s) matching {:?}", removed, selector);
+    println!("Restart `zenforge serve` for the change to take effect.");
     Ok(())
 }
 

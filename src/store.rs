@@ -21,9 +21,51 @@ pub fn open_db(root: &Path) -> ZResult<Connection> {
         "PRAGMA journal_mode=WAL;
          PRAGMA synchronous=NORMAL;
          PRAGMA foreign_keys=ON;
-         PRAGMA busy_timeout=10000;",
+         PRAGMA busy_timeout=30000;",
     )?;
     Ok(conn)
+}
+
+/// Is this error SQLite refusing a write because another connection holds the
+/// write lock?
+pub fn is_busy(e: &rusqlite::Error) -> bool {
+    match e {
+        rusqlite::Error::SqliteFailure(f, _) => {
+            matches!(
+                f.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+        }
+        _ => false,
+    }
+}
+
+/// Run `f`, retrying while SQLite reports the database as busy.
+///
+/// `busy_timeout` covers a reader waiting for a writer. It does not cover two
+/// writers arriving at once from different processes: SQLite returns SQLITE_BUSY
+/// immediately for a write-write conflict when a transaction has already started
+/// reading. Retrying with a growing pause is what makes concurrent commits work;
+/// without it, 20 parallel commits produced 19 failures.
+pub fn with_retry<T>(mut f: impl FnMut() -> ZResult<T>) -> ZResult<T> {
+    let mut paused = std::time::Duration::from_millis(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                let busy = e
+                    .downcast_ref::<rusqlite::Error>()
+                    .map(is_busy)
+                    .unwrap_or(false);
+                if !busy || std::time::Instant::now() >= deadline {
+                    return Err(e);
+                }
+                std::thread::sleep(paused);
+                paused = (paused * 2).min(std::time::Duration::from_millis(250));
+            }
+        }
+    }
 }
 
 pub fn init_schema(conn: &Connection) -> ZResult<()> {
@@ -106,6 +148,12 @@ pub fn init_schema(conn: &Connection) -> ZResult<()> {
             changeset_id TEXT NOT NULL,
             updated_at   INTEGER NOT NULL,
             PRIMARY KEY (remote, branch)
+        );
+        CREATE TABLE IF NOT EXISTS worktree_cache (
+            path  TEXT PRIMARY KEY,
+            mtime INTEGER NOT NULL,
+            size  INTEGER NOT NULL,
+            hash  TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS repo_state (
             key   TEXT PRIMARY KEY,
@@ -334,38 +382,64 @@ pub fn merge_base(conn: &Connection, a: &str, b: &str) -> ZResult<Option<String>
     Ok(best.map(|(id, _)| id))
 }
 
-/// Committed content hash for `path` introduced by exactly this changeset.
-pub fn hash_at(conn: &Connection, path: &str, changeset: &str) -> ZResult<Option<String>> {
-    Ok(conn
-        .query_row(
-            "SELECT hash FROM file_versions WHERE path = ?1 AND changeset_id = ?2
-             ORDER BY version DESC LIMIT 1",
-            params![path, changeset],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()?)
+/// Resolve a revision name to a changeset id.
+///
+/// A person writes `main:file.txt`, an agent sends `{"rev":"main"}`, and both
+/// mean "the head of that branch". A changeset id means that changeset. Trying
+/// the branch first and the id second covers both, and returning `None` lets the
+/// caller produce one clear error instead of two nested ones.
+///
+/// This existed as a bug first: `show main:x` passed the branch name into a
+/// function that only walked changesets, so a file that was plainly in the head
+/// tree was reported missing.
+pub fn resolve_rev(conn: &Connection, rev: &str) -> ZResult<Option<String>> {
+    if let Ok(Some(head)) = branch_head(conn, rev) {
+        return Ok(Some(head));
+    }
+    let exists: Option<String> = conn
+        .query_row("SELECT id FROM changesets WHERE id = ?1", params![rev], |r| r.get(0))
+        .optional()?;
+    if exists.is_some() {
+        return Ok(exists);
+    }
+    // A tag is also a valid revision.
+    let tagged: Option<String> = conn
+        .query_row("SELECT changeset_id FROM tags WHERE name = ?1", params![rev], |r| r.get(0))
+        .optional()?;
+    Ok(tagged)
 }
 
 /// Content hash for `path` as of `changeset`, walking its ancestry.
+///
+/// `changeset_files` is the source of truth, not `file_versions`: a deletion
+/// writes a row with `new_hash IS NULL` and no version row, so a lookup that
+/// only consulted versions would resurrect deleted files. This is the same rule
+/// `tree_at` follows.
 pub fn hash_at_point(conn: &Connection, path: &str, changeset: &str) -> ZResult<Option<String>> {
-    let mut seen = HashSet::new();
-    let mut stack = vec![changeset.to_string()];
-    while let Some(cur) = stack.pop() {
-        if !seen.insert(cur.clone()) {
-            continue;
-        }
-        if let Some(h) = hash_at(conn, path, &cur)? {
-            return Ok(Some(h));
-        }
-        let (p1, p2) = parents_of(conn, &cur)?;
-        if let Some(p) = p1 {
-            stack.push(p);
-        }
-        if let Some(p) = p2 {
-            stack.push(p);
-        }
+    let reachable = ancestors(conn, changeset)?;
+    if reachable.is_empty() {
+        return Ok(None);
     }
-    Ok(None)
+    let placeholders = vec!["?"; reachable.len()].join(",");
+    let sql = format!(
+        "SELECT cf.new_hash FROM changeset_files cf
+         JOIN changesets cs ON cs.id = cf.changeset_id
+         WHERE cf.path = ? AND cf.changeset_id IN ({})
+         ORDER BY cs.created_at DESC, cs.rowid DESC LIMIT 1",
+        placeholders
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(reachable.len() + 1);
+    params.push(&path);
+    for id in &reachable {
+        params.push(id);
+    }
+    // A row with a NULL new_hash means the path was deleted at that point, and
+    // returning None is exactly right for that case.
+    let found: Option<Option<String>> = stmt
+        .query_row(params.as_slice(), |r| r.get::<_, Option<String>>(0))
+        .optional()?;
+    Ok(found.flatten())
 }
 
 /// Latest committed content hash for `path` on `branch`.
@@ -584,6 +658,14 @@ pub(crate) mod tests {
                 params![ver, hash, id],
             )
             .unwrap();
+            // hash_at_point reads changeset_files, so a fixture that only wrote
+            // file_versions would not describe a real repository.
+            conn.execute(
+                "INSERT INTO changeset_files(changeset_id, path, old_hash, new_hash)
+                 VALUES(?1, 'f.txt', NULL, ?2)",
+                params![id, hash],
+            )
+            .unwrap();
         }
 
         conn.execute("UPDATE branches SET head='cs2' WHERE name='main'", []).unwrap();
@@ -596,5 +678,115 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(latest_hash(&conn, "f.txt", "pinned").unwrap().as_deref(), Some(h1.as_str()));
         assert_eq!(latest_hash(&conn, "absent.txt", "main").unwrap(), None);
+    }
+
+    #[test]
+    fn a_busy_error_is_recognised() {
+        // Shaped like the error SQLite raises when another process holds the
+        // write lock. Recognising it is what lets the retry loop help.
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(5), // SQLITE_BUSY
+            Some("database is locked".to_string()),
+        );
+        assert!(is_busy(&busy));
+
+        let other = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(1), // SQLITE_ERROR
+            Some("no such table".to_string()),
+        );
+        assert!(!is_busy(&other));
+
+        assert!(!is_busy(&rusqlite::Error::QueryReturnedNoRows));
+    }
+
+    #[test]
+    fn with_retry_passes_a_success_through() {
+        let mut calls = 0;
+        let v = with_retry(|| {
+            calls += 1;
+            Ok(7)
+        })
+        .unwrap();
+        assert_eq!(v, 7);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn with_retry_gives_up_on_an_error_that_is_not_busy() {
+        let mut calls = 0;
+        let r: ZResult<()> = with_retry(|| {
+            calls += 1;
+            Err(bad("no such column".to_string()))
+        });
+        assert!(r.is_err());
+        assert_eq!(calls, 1, "a non-busy error must not be retried");
+    }
+
+    #[test]
+    fn with_retry_retries_a_busy_error_then_succeeds() {
+        let mut calls = 0;
+        let v = with_retry(|| {
+            calls += 1;
+            if calls < 4 {
+                Err(Box::new(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(5),
+                    Some("database is locked".to_string()),
+                )) as Box<dyn std::error::Error + Send + Sync>)
+            } else {
+                Ok(calls)
+            }
+        })
+        .unwrap();
+        assert_eq!(v, 4);
+        assert_eq!(calls, 4);
+    }
+
+    #[test]
+    fn resolve_rev_accepts_a_branch_name() {
+        // `show main:file.txt` passes "main". A resolver that only knew
+        // changeset ids answered "file does not exist" for a file that was in
+        // the head tree, which is how this was found.
+        let conn = mem_db();
+        let h = put_object(&conn, "x\n").unwrap();
+        conn.execute(
+            "INSERT INTO changesets(id, message, author, created_at, status, parent, branch)
+             VALUES('cs1', 'm', 'a', 1, 'committed', NULL, 'main')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO changeset_files(changeset_id, path, old_hash, new_hash)
+             VALUES('cs1', 'x.txt', NULL, ?1)",
+            params![h],
+        )
+        .unwrap();
+        conn.execute("UPDATE branches SET head='cs1' WHERE name='main'", []).unwrap();
+
+        assert_eq!(resolve_rev(&conn, "main").unwrap().as_deref(), Some("cs1"));
+    }
+
+    #[test]
+    fn resolve_rev_accepts_a_changeset_id_and_a_tag() {
+        let conn = mem_db();
+        conn.execute(
+            "INSERT INTO changesets(id, message, author, created_at, status, parent, branch)
+             VALUES('cs9', 'm', 'a', 1, 'committed', NULL, 'main')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tags(name, changeset_id, created_at) VALUES('v1', 'cs9', 1)",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(resolve_rev(&conn, "cs9").unwrap().as_deref(), Some("cs9"));
+        assert_eq!(resolve_rev(&conn, "v1").unwrap().as_deref(), Some("cs9"));
+    }
+
+    #[test]
+    fn resolve_rev_reports_an_unknown_name() {
+        let conn = mem_db();
+        assert_eq!(resolve_rev(&conn, "nowhere").unwrap(), None);
     }
 }

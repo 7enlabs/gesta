@@ -1,8 +1,10 @@
 //! Access control for the HTTP remote.
 //!
-//! Two roles: a read token may clone and pull, a write token may also push. When
-//! the server has no tokens configured it refuses to bind to anything except a
-//! loopback address, so an open port is never the accidental default.
+//! Two roles: a read token may clone and pull, a write token may also push. A
+//! token may also carry a comma-separated list of path globs; a write that
+//! touches a path outside that list is refused. When the server has no tokens
+//! configured it refuses to bind to anything except a loopback address, so an
+//! open port is never the accidental default.
 
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -17,8 +19,87 @@ pub enum Role {
 /// Token store. Tokens are kept as SHA-256 digests, never in clear text, so a
 /// leaked config file does not leak working credentials.
 pub struct Auth {
-    tokens: HashMap<String, (String, Role)>,
+    tokens: HashMap<String, Grant>,
     pub required: bool,
+}
+
+/// One authenticated token: who it is, what it may do, and where.
+#[derive(Debug, Clone)]
+pub struct Grant {
+    pub name: String,
+    pub role: Role,
+    /// Glob patterns for the paths this token may write. Empty means every path,
+    /// which is what an entry without a scope field grants.
+    pub scope: Vec<String>,
+}
+
+impl Grant {
+    /// Is a write to `path` inside this grant's scope?
+    ///
+    /// An empty scope means unrestricted. A pattern without a slash matches the
+    /// file name at any depth, so `*.md` covers `docs/a.md` and `a.md`, which is
+    /// what a person writing the pattern usually means.
+    pub fn permits(&self, path: &str) -> bool {
+        if self.scope.is_empty() {
+            return true;
+        }
+        let name = path.rsplit('/').next().unwrap_or(path);
+        self.scope.iter().any(|pat| {
+            glob_match(pat, path) || (!pat.contains('/') && glob_match(pat, name))
+        })
+    }
+}
+
+/// Match one glob pattern. Supports `*` inside a segment and `**` across
+/// segments, plus `?` for a single character.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    fn go(p: &[char], t: &[char]) -> bool {
+        if p.is_empty() {
+            return t.is_empty();
+        }
+        if p[0] == '*' && p.len() > 1 && p[1] == '*' {
+            // `**` crosses directory separators; the leading `/` in `**/x` is
+            // optional so `**/a.md` also matches a top level `a.md`.
+            let rest = &p[2..];
+            let rest = if rest.first() == Some(&'/') { &rest[1..] } else { rest };
+            for skip in 0..=t.len() {
+                if go(rest, &t[skip..]) {
+                    return true;
+                }
+                if skip < t.len() && t[skip] == '/' {
+                    continue;
+                }
+            }
+            // Simple fallback: try every suffix.
+            for skip in 0..=t.len() {
+                if go(rest, &t[skip..]) {
+                    return true;
+                }
+            }
+            false
+        } else if p[0] == '*' {
+            let rest = &p[1..];
+            if go(rest, t) {
+                return true;
+            }
+            for skip in 0..t.len() {
+                if t[skip] == '/' {
+                    return false; // a single `*` does not cross a separator
+                }
+                if go(rest, &t[skip + 1..]) {
+                    return true;
+                }
+            }
+            false
+        } else if p[0] == '?' {
+            !t.is_empty() && t[0] != '/' && go(&p[1..], &t[1..])
+        } else {
+            !t.is_empty() && p[0] == t[0] && go(&p[1..], &t[1..])
+        }
+    }
+    let p: Vec<char> = pattern.chars().collect();
+    let x: Vec<char> = text.chars().collect();
+    go(&p, &x)
 }
 
 impl Auth {
@@ -44,29 +125,40 @@ impl Auth {
             // `sha256:<digest>:<role>:<name>` has four fields, the clear form
             // has three, so the digest marker has to be handled first.
             if let Some(rest) = line.strip_prefix("sha256:") {
-                let mut parts = rest.splitn(3, ':');
-                let (Some(digest_hex), Some(role), name) =
-                    (parts.next(), parts.next(), parts.next().unwrap_or("unnamed"))
-                else {
+                let mut parts = rest.splitn(4, ':');
+                let (Some(digest_hex), Some(role)) = (parts.next(), parts.next()) else {
                     continue;
                 };
+                let name = parts.next().unwrap_or("unnamed");
+                let scope = parts.next().unwrap_or("");
                 let digest_hex = digest_hex.trim().to_ascii_lowercase();
                 if digest_hex.len() != 64 || !digest_hex.chars().all(|c| c.is_ascii_hexdigit()) {
                     continue; // a malformed digest must never match anything
                 }
                 let role = parse_role(role);
-                tokens.insert(digest_hex, (name.trim().to_string(), role));
+                tokens.insert(
+                    digest_hex,
+                    Grant {
+                        name: name.trim().to_string(),
+                        role,
+                        scope: parse_scope(scope),
+                    },
+                );
                 continue;
             }
 
-            let mut parts = line.splitn(3, ':');
+            let mut parts = line.splitn(4, ':');
             let token = match parts.next() {
                 Some(t) if !t.trim().is_empty() => t.trim().to_string(),
                 _ => continue,
             };
             let role = parse_role(parts.next().unwrap_or("read"));
             let name = parts.next().unwrap_or("unnamed").trim().to_string();
-            tokens.insert(digest(&token), (name, role));
+            let scope = parts.next().unwrap_or("");
+            tokens.insert(
+                digest(&token),
+                Grant { name, role, scope: parse_scope(scope) },
+            );
         }
         Auth { required: !tokens.is_empty(), tokens }
     }
@@ -76,7 +168,7 @@ impl Auth {
     }
 
     /// Resolve a presented token to a role, or `None` when it is unknown.
-    pub fn authenticate(&self, presented: &str) -> Option<(String, Role)> {
+    pub fn authenticate(&self, presented: &str) -> Option<Grant> {
         self.tokens.get(&digest(presented)).cloned()
     }
 
@@ -84,6 +176,14 @@ impl Auth {
     pub fn allows(role: Role, needed: Role) -> bool {
         role >= needed
     }
+}
+
+fn parse_scope(s: &str) -> Vec<String> {
+    s.split(',')
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty() && *p != "*")
+        .map(|p| p.trim_start_matches("./").to_string())
+        .collect()
 }
 
 fn parse_role(s: &str) -> Role {
@@ -133,13 +233,13 @@ mod tests {
         let a = Auth::from_entries(&["abc123:write:alice".to_string(), "def456:read:bob".to_string()]);
         assert_eq!(a.token_count(), 2);
 
-        let (name, role) = a.authenticate("abc123").unwrap();
-        assert_eq!(name, "alice");
-        assert_eq!(role, Role::Write);
+        let g = a.authenticate("abc123").unwrap();
+        assert_eq!(g.name, "alice");
+        assert_eq!(g.role, Role::Write);
 
-        let (name, role) = a.authenticate("def456").unwrap();
-        assert_eq!(name, "bob");
-        assert_eq!(role, Role::Read);
+        let g = a.authenticate("def456").unwrap();
+        assert_eq!(g.name, "bob");
+        assert_eq!(g.role, Role::Read);
     }
 
     #[test]
@@ -152,8 +252,8 @@ mod tests {
     #[test]
     fn a_line_without_a_role_defaults_to_read() {
         let a = Auth::from_entries(&["tokenonly".to_string()]);
-        let (_, role) = a.authenticate("tokenonly").unwrap();
-        assert_eq!(role, Role::Read, "a malformed entry must not grant write");
+        let g = a.authenticate("tokenonly").unwrap();
+        assert_eq!(g.role, Role::Read, "a malformed entry must not grant write");
     }
 
     #[test]
@@ -197,9 +297,9 @@ mod tests {
         let token = "s3cret-token-value";
         let line = format!("sha256:{}:write:carol", digest(token));
         let a = Auth::from_entries(&[line]);
-        let (name, role) = a.authenticate(token).unwrap();
-        assert_eq!(name, "carol");
-        assert_eq!(role, Role::Write);
+        let g = a.authenticate(token).unwrap();
+        assert_eq!(g.name, "carol");
+        assert_eq!(g.role, Role::Write);
         assert!(a.authenticate("wrong").is_none());
     }
 
@@ -227,8 +327,8 @@ mod tests {
             format!("sha256:{}:write:h", digest(secret)),
         ]);
         assert_eq!(a.token_count(), 2);
-        assert_eq!(a.authenticate("plain").unwrap().1, Role::Read);
-        assert_eq!(a.authenticate(secret).unwrap().1, Role::Write);
+        assert_eq!(a.authenticate("plain").unwrap().role, Role::Read);
+        assert_eq!(a.authenticate(secret).unwrap().role, Role::Write);
     }
 
     #[test]

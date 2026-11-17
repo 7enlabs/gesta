@@ -9,7 +9,7 @@ use crate::store::{
     branch_head, current_branch, get_object, hash_at_point, hash_content, latest_hash,
     merge_base, new_changeset_id, put_object,
 };
-use crate::worktree::{read_file, rel_path, scan_files, IgnoreRules, ReadOutcome};
+use crate::worktree::IgnoreRules;
 use crate::{bad, now, ZResult, ZF_DIR};
 
 /// Files loaded from the repository's ignore configuration.
@@ -52,6 +52,9 @@ pub struct WorktreeDelta {
     pub deleted: Vec<String>,
     pub unchanged: usize,
     pub skipped_binary: Vec<String>,
+    /// Files served from the stat cache, and files that had to be re-hashed.
+    pub cached: usize,
+    pub rehashed: usize,
 }
 
 /// Compare the working tree to `branch`.
@@ -63,6 +66,8 @@ pub fn diff_worktree(conn: &Connection, root: &Path, branch: &str) -> ZResult<Wo
         deleted: Vec::new(),
         unchanged: 0,
         skipped_binary: Vec::new(),
+        cached: 0,
+        rehashed: 0,
     };
     let mut seen = std::collections::HashSet::new();
 
@@ -70,24 +75,25 @@ pub fn diff_worktree(conn: &Connection, root: &Path, branch: &str) -> ZResult<Wo
     // each lookup re-walked the whole parent chain.
     let committed = committed_tree(conn, branch)?;
 
-    for p in scan_files(root, &rules)? {
-        let rel = rel_path(root, &p);
-        match read_file(&p) {
-            ReadOutcome::Text(content) => {
-                seen.insert(rel.clone());
-                let new_hash = hash_content(&content);
-                match committed.get(&rel) {
-                    None => d.added.push(rel),
-                    Some(old) if old != &new_hash => d.modified.push(rel),
-                    Some(_) => d.unchanged += 1,
-                }
-            }
-            ReadOutcome::Binary => d.skipped_binary.push(rel),
-            ReadOutcome::Unreadable(e) => {
-                return Err(bad(format!("cannot read {}: {}", rel, e)));
-            }
+    // The scan uses the stat cache, so an unchanged file is not re-read from
+    // disk and re-hashed on every `status`.
+    let scanned = crate::cache::scan_with_cache(conn, root, &rules)?;
+    for f in &scanned.files {
+        seen.insert(f.rel.clone());
+        match committed.get(&f.rel) {
+            None => d.added.push(f.rel.clone()),
+            Some(old) if old != &f.hash => d.modified.push(f.rel.clone()),
+            Some(_) => d.unchanged += 1,
         }
     }
+    if let Some(first) = scanned.unreadable.first() {
+        // A file that cannot be read cannot be compared, so reporting it as
+        // unchanged or missing would be a lie either way.
+        return Err(bad(format!("cannot read {} ({} more)", first, scanned.unreadable.len() - 1)));
+    }
+    d.skipped_binary = scanned.skipped_binary;
+    d.cached = scanned.cached;
+    d.rehashed = scanned.rehashed;
 
     // Files tracked on the branch but absent from disk.
     let mut tracked: Vec<String> = committed.keys().cloned().collect();
@@ -109,8 +115,7 @@ pub struct NewChangeset {
     pub skipped: Vec<String>,
 }
 
-/// Snapshot the working tree as a pending changeset. `None` when nothing
-/// changed. Deletions of tracked files are recorded too.
+
 pub fn create_changeset(
     conn: &Connection,
     root: &Path,
@@ -122,29 +127,23 @@ pub fn create_changeset(
 
     let mut changes: Vec<(String, Option<String>, String, String)> = Vec::new();
     let mut deleted: Vec<String> = Vec::new();
-    let mut skipped: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
     // One tree lookup for the whole snapshot, not one per file.
     let committed = committed_tree(conn, &branch)?;
 
-    for p in scan_files(root, &rules)? {
-        let rel = rel_path(root, &p);
-        match read_file(&p) {
-            ReadOutcome::Text(content) => {
-                seen.insert(rel.clone());
-                let new_hash = hash_content(&content);
-                let old_hash = committed.get(&rel).cloned();
-                if old_hash.as_deref() != Some(new_hash.as_str()) {
-                    changes.push((rel, old_hash, new_hash, content));
-                }
-            }
-            ReadOutcome::Binary => skipped.push(rel),
-            ReadOutcome::Unreadable(e) => {
-                return Err(bad(format!("cannot read {}: {}", rel, e)));
-            }
+    let scanned = crate::cache::scan_with_cache(conn, root, &rules)?;
+    if let Some(first) = scanned.unreadable.first() {
+        return Err(bad(format!("cannot read {} ({} more)", first, scanned.unreadable.len() - 1)));
+    }
+    for f in scanned.files {
+        seen.insert(f.rel.clone());
+        let old_hash = committed.get(&f.rel).cloned();
+        if old_hash.as_deref() != Some(f.hash.as_str()) {
+            changes.push((f.rel, old_hash, f.hash, f.content));
         }
     }
+    let skipped = scanned.skipped_binary;
 
     let mut tracked: Vec<String> = committed.keys().cloned().collect();
     tracked.sort();
@@ -777,11 +776,11 @@ pub fn restore_worktree(conn: &Connection, root: &Path, branch: &str) -> ZResult
 
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::store::tests::mem_db;
 
-    fn commit_files(conn: &Connection, id: &str, msg: &str, files: &[(&str, &str)]) {
+    pub fn commit_files(conn: &Connection, id: &str, msg: &str, files: &[(&str, &str)]) {
         conn.execute(
             "INSERT INTO changesets(id,message,author,created_at,status,parent,branch)
              VALUES(?1,?2,'a',1,'pending',NULL,'main')",
@@ -1043,4 +1042,9 @@ mod tests {
             .unwrap();
         assert_eq!(parent.as_deref(), Some("cs1"));
     }
+
+
+
+
+
 }

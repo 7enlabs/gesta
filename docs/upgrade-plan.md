@@ -345,3 +345,64 @@ without tokens being refused, and a loopback bind without tokens still working.
 TLS. Credentials travel in clear over plain HTTP, so the proxy is not optional
 beyond a trusted network. Beyond that: no per-branch permissions, no token
 expiry, no revocation command, and no audit log of who pushed what.
+
+## 10. v0.4.1: agent interface, stat cache, concurrent writes
+
+The Scion comparison named five gaps. Three are now closed, one is half closed.
+
+### Closed
+
+| Gap | What was built |
+|---|---|
+| stdout as the only interface | `--json` on every read command, plus `zenforge mcp` speaking JSON-RPC |
+| no way to write without a working copy | `POST /v1/changeset`, blobs written straight into the store |
+| I/O cost grows with tree size | `worktree_cache`, keyed on `(mtime, size)` |
+| write contention under parallel agents | `with_retry` around every mutating command |
+
+### Why the stat cache is shaped that way
+
+The first version had the right columns and the wrong loop: it deleted the whole cache on every scan, so it never served a hit. The second version cached, but still hashed every file, which is the cost the cache exists to avoid. The scan now compares `(mtime, size)` before reading a file, and re-hashes anything it does read, so a stale row cannot hide a change. On 8,000 files with one file edited, 7,999 paths come from the cache and one is re-read.
+
+The residue is honest: a file rewritten within the same second at the same size looks unchanged to the stat check. git has the same weakness in its index, and a changeset creation re-hashes everything it records, so the window only affects what `status` reports, never what a commit contains.
+
+### Why concurrent commits failed
+
+`busy_timeout` was set to 10 s and looked sufficient. It is not, for this case. A reader waiting on a writer is queued by the timeout, but two writes starting at once return `SQLITE_BUSY` immediately once a transaction has begun reading. Twenty parallel `changeset commit` calls produced one success and nineteen `database is locked`.
+
+The fix is not a longer timeout. `store::with_retry` catches only `DatabaseBusy` and `DatabaseLocked`, pauses 5 ms, doubles the pause up to 250 ms, and gives up after 60 s. Anything else propagates at once, so a real SQL error is never retried into a loop. Twenty parallel commits now all succeed, and `fsck` reports a consistent repository afterwards.
+
+### The defect that came out of the remote changeset work
+
+`hash_at_point` read `file_versions`. A deletion writes a row in `changeset_files` with no hash and no row in `file_versions` at all, so the lookup walked past the deletion and returned the last version before it. A deleted file came back. `tree_at` already read `changeset_files` for exactly this reason; `hash_at_point` now does too, and a regression test pins it.
+
+The second defect was the same shape. `changeset_from_content` compared new content against `committed_tree`, the head tree, so a file written into a pending changeset was invisible to the next call. Deleting it answered "nothing to delete". `effective_tree` projects the pending changesets onto the head in creation order, and that projection is now the base for both edits and deletes.
+
+### Verification
+
+| Check | Result |
+|---|---|
+| `cargo test --release` | 129 |
+| `bench/replace_git.py` | 20/20 |
+| `bench/http_remote.py` | 11/11 |
+| `bench/http_auth.py` | 18/18 |
+| `bench/mcp_json.py` | 14/14 |
+| `bench/api_changeset.py` | 13/13 |
+| `bench/concurrency.py` | 8/8 |
+| clippy | 0 warnings |
+| aislop | 88/100, 3 warnings, all `.unwrap()` inside a `#[cfg(test)]` fixture |
+
+### The third defect, found by the concurrency suite
+
+`show main:f19.txt` answered "f19.txt does not exist at main" for a file that was
+in the head tree, on a repository where the database plainly listed all twenty
+paths. The revision argument was passed into a function that only walks changeset
+ids, and a branch name is not one. `resolve_rev` now accepts a branch, a tag or a
+changeset, and the CLI, the HTTP file endpoint and the MCP read tool all use it.
+
+The lesson generalises: every caller that takes a revision was written against
+whichever kind the author had in mind that day. One resolver, used everywhere,
+removes the class.
+
+### Still missing
+
+TLS. Delta compression, so a 500 KB file edited fifty times still stores fifty compressed copies. Sparse checkout, so a monorepo can expose one directory. Conflict output as structured JSON with line numbers, so an agent can resolve without parsing markers. Token expiry and revocation.
