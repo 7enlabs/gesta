@@ -76,6 +76,7 @@ gesta blame src/main.rs
 | `branch create/list/switch/delete/merge/info` | Branch operations |
 | `remote add/list/push/pull/clone` | Remote sync over a path, `http://`, `https://` or `s3://` |
 | `remote clone --depth N` | Take only the newest N changesets, then restore the full working tree |
+| `remote deepen --depth N \| --unshallow` | Take more history, or all of it, without moving the head |
 | `remote ls` | List the branches a bucket holds |
 | `remote token add <role> <name> [--hashed]` | Generate an access token for serving |
 | `remote token list` | Show configured tokens, last four characters only |

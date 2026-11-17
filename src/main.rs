@@ -500,6 +500,21 @@ enum RemoteCmd {
         #[arg(default_value = "origin")]
         remote: String,
     },
+    /// Extend the history of a shallow clone by taking older changesets
+    Deepen {
+        #[arg(long)]
+        depth: Option<usize>,
+        /// Take everything, removing the shallow boundary
+        #[arg(long)]
+        unshallow: bool,
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        #[arg(long, default_value = "main")]
+        branch: String,
+        /// Only report what would be fetched
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Send this repository's branch to a remote
     Push {
         #[arg(default_value = "origin")]
@@ -680,6 +695,9 @@ fn run() -> ZResult<()> {
                 TokenCmd::Remove { selector } => cli_remote::cmd_token_remove(&selector),
             },
             RemoteCmd::Ls { remote } => cli_remote::cmd_remote_ls(&remote),
+            RemoteCmd::Deepen { depth, unshallow, remote, branch, dry_run } => {
+                cli_remote::cmd_deepen(depth, unshallow, &remote, &branch, dry_run)
+            }
             RemoteCmd::Push { remote, branch } => cli_remote::cmd_push(&remote, &branch),
             RemoteCmd::Pull { remote, branch, author } => cli_remote::cmd_pull(&remote, &branch, &author),
             RemoteCmd::Clone { url, dir, token, pin, depth } => {

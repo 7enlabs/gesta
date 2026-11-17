@@ -288,13 +288,31 @@ def main():
                            text=True, env=e)
             shallow_ok = shallow_ok and os.path.exists(s_a) and open(s_a).read() == "hello\n"
 
+            # A shallow clone must be able to take the rest of the history, and the
+            # result has to pass its own integrity check.
+            deep = subprocess.run([ZF, "remote", "deepen", "--unshallow"], cwd=shallow,
+                                  capture_output=True, text=True, env=e)
+            deep_hist = subprocess.run([ZF, "log", "--limit", "50"], cwd=shallow,
+                                       capture_output=True, text=True, env=e).stdout
+            deep_n = deep_hist.count("changeset ")
+            deep_fsck = subprocess.run([ZF, "fsck"], cwd=shallow, capture_output=True,
+                                       text=True, env=e)
+            deep_ok = (
+                deep.returncode == 0
+                and deep_n == 2
+                and deep_fsck.returncode == 0
+                and os.path.exists(s_a)
+                and open(s_a).read() == "hello\n"
+            )
+            shallow_ok = shallow_ok and deep_ok
+
 
             record(
                 "s3 push, idempotent push, shallow clone and listing",
                 listed and shallow_ok and
                 pushed and no_reupload and got == "hello\n" and got2 == "second\n" and n_cs == 2,
                 f"pushed={pushed} no_reupload={no_reupload} a={got!r} b={got2!r} "
-                f"changesets={n_cs} listed={listed} shallow={shallow_ok} "
+                f"changesets={n_cs} listed={listed} shallow={shallow_ok} deep={deep_n} "
                 f"(files={os.path.exists(s_a)},{os.path.exists(s_b)} cs={shallow_n}) "
                 f"clone={clone.stdout.strip()[:100]}{clone.stderr.strip()[:140]}",
             )

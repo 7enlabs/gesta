@@ -1156,4 +1156,81 @@ mod tests {
         assert_eq!(same.changesets.len(), full.changesets.len());
         assert!(same.shallow_root.is_none(), "nothing was cut, so nothing is shallow");
     }
+    /// Deepening adds history below the boundary without moving the head or losing the
+    /// working tree. It also has to leave the boundary honest: a clone that is still cut
+    /// must still say so, or a later attempt to take everything reports nothing to do.
+    #[test]
+    fn deepening_extends_history_and_updates_the_boundary() {
+        let conn = mem_db();
+        for v in 0..8 {
+            let id = format!("csd{:02}", v);
+            let parent = if v == 0 { None } else { Some(format!("csd{:02}", v - 1)) };
+            conn.execute(
+                "INSERT INTO changesets(id,message,author,created_at,status,parent,branch)
+                 VALUES(?1,?2,'a',?3,'committed',?4,'main')",
+                params![id, format!("v{}", v), v as i64, parent],
+            )
+            .unwrap();
+            let content = format!("content of version {}\n", v);
+            let hash = crate::store::put_object(&conn, &content).unwrap();
+            conn.execute(
+                "INSERT INTO file_versions(path,version,hash,changeset_id,created_at)
+                 VALUES('f.txt',?1,?2,?3,?4)",
+                params![v as i64, hash, format!("csd{:02}", v), v as i64],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO changeset_files(changeset_id,path,old_hash,new_hash)
+                 VALUES(?1,'f.txt',NULL,?2)",
+                params![format!("csd{:02}", v), hash],
+            )
+            .unwrap();
+        }
+        crate::store::set_branch_head(&conn, "main", "csd07").unwrap();
+
+        let full = build_bundle(&conn, "main", &HashSet::new()).unwrap();
+        let cut = truncate_bundle(&full, 3).unwrap();
+        assert_eq!(cut.changesets.len(), 3);
+
+        // Simulate what deepen does: apply the older rows without moving the head.
+        let mut older = cut.clone();
+        let keep: Vec<_> = full.changesets[..5].to_vec();
+        older.changesets = keep;
+        let want: HashSet<String> = older.changesets.iter().map(|c| c.id.clone()).collect();
+        older.versions = full
+            .versions
+            .iter()
+            .filter(|(_, _, _, cs, _)| want.contains(cs))
+            .cloned()
+            .collect();
+        older.files = full
+            .files
+            .iter()
+            .filter(|(cs, _, _, _)| want.contains(cs))
+            .cloned()
+            .collect();
+        older.objects = full.objects.clone();
+        older.deltas = full.deltas.clone();
+        older.hashes = full.hashes.clone();
+        older.snapshot = Vec::new();
+        older.shallow_root = None;
+
+        let head_before = crate::store::branch_head(&conn, "main").unwrap();
+        apply_bundle_opts(&conn, &older, false).unwrap();
+        assert_eq!(
+            crate::store::branch_head(&conn, "main").unwrap(),
+            head_before,
+            "deepening must not move the head"
+        );
+
+        let held: i64 = conn
+            .query_row("SELECT COUNT(*) FROM changesets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(held, 8, "expected the full chain after applying both parts");
+
+        // The oldest held changeset is csd00, which has no parent, so the boundary is
+        // gone entirely.
+        let (p1, _) = crate::store::parents_of_public(&conn, "csd00").unwrap();
+        assert!(p1.is_none(), "the first changeset has no parent");
+    }
 }

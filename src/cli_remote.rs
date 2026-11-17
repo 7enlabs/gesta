@@ -1213,3 +1213,182 @@ fn restore_from_snapshot(
     }
     Ok(written)
 }
+
+/// `remote deepen`: take more of the history from a remote.
+///
+/// A shallow clone is otherwise a one way door. Everything it kept works, and asking
+/// about anything older has no answer, which turns "I cloned quickly" into "I cannot
+/// read history" with no way back short of cloning again.
+///
+/// Deepening does not move the branch head and does not touch the working tree: it adds
+/// changesets that sit below the boundary. That matters because it means the command is
+/// safe to run in a repository with uncommitted work.
+pub fn cmd_deepen(
+    depth: Option<usize>,
+    unshallow: bool,
+    remote_name: &str,
+    branch: &str,
+    dry_run: bool,
+) -> ZResult<()> {
+    let (root, conn) = open_repo()?;
+    let url = remote_url(&conn, remote_name)?;
+
+    if !url.starts_with("s3://") {
+        return Err(bad(
+            "deepening is only supported for s3:// remotes, because it needs the whole history in one object"
+                .to_string(),
+        ));
+    }
+    if depth.is_none() && !unshallow {
+        return Err(bad(
+            "say how much history to take: --depth <n> or --unshallow".to_string(),
+        ));
+    }
+
+    let boundaries: Vec<String> = {
+        let mut stmt =
+            conn.prepare("SELECT changeset_id FROM shallow_roots WHERE branch = ?1")?;
+        let rows = stmt.query_map(rusqlite::params![branch], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if boundaries.is_empty() {
+        println!("{} is not shallow, nothing to deepen", branch);
+        return Ok(());
+    }
+
+    let local_count = crate::store::ancestors_bfs(
+        &conn,
+        &branch_head(&conn, branch)?.ok_or_else(|| bad(format!("{} has no head", branch)))?,
+    )?
+    .len();
+
+    let extra = if unshallow {
+        None
+    } else {
+        Some(depth.unwrap_or(0))
+    };
+    let target = match extra {
+        None => usize::MAX,
+        Some(d) => local_count + d,
+    };
+
+    if dry_run {
+        println!(
+            "would take up to {} changeset(s) more for {} ({} held now)",
+            if target == usize::MAX { "all".to_string() } else { target.to_string() },
+            branch,
+            local_count
+        );
+        return Ok(());
+    }
+
+    let (cfg, prefix) = crate::s3::S3Config::from_url(&url)?;
+    let key = crate::s3::key_for(&prefix, branch);
+    let bytes = cfg.get(&key)?.ok_or_else(|| {
+        crate::bad(format!("the bucket has no object at {}", key))
+    })?;
+    let mut bundle = remote::Bundle::decode(&bytes)?;
+
+    let available = bundle.changesets.len();
+    if available < local_count {
+        return Err(bad(format!(
+            "the remote holds {} changeset(s) but this clone has {}, so deepening would lose history",
+            available, local_count
+        )));
+    }
+
+    if target >= available {
+        println!(
+            "the remote holds {} changeset(s), which is all of it; removing the boundary",
+            available
+        );
+    } else {
+        println!(
+            "taking {} of {} changeset(s) from the remote",
+            target, available
+        );
+        // Keep the newest `target`, then apply the rest on top of what is here.
+        let keep_from = available - target;
+        let wanted: std::collections::HashSet<String> = bundle.changesets[keep_from..]
+            .iter()
+            .map(|c| c.id.clone())
+            .collect();
+        let cut_bundle = {
+            let mut b = bundle.clone();
+            b.changesets = b.changesets.split_off(keep_from);
+            b.versions.retain(|(_, _, _, cs, _)| wanted.contains(cs));
+            b.files.retain(|(cs, _, _, _)| wanted.contains(cs));
+            b.snapshot = Vec::new();
+            b.shallow_root = None;
+            b
+        };
+        // Objects and deltas are cheap to carry and hard to filter safely, so the
+        // receiving side keeps them; a duplicate object is ignored on insert.
+        let mut b = cut_bundle;
+        b.objects = bundle.objects.clone();
+        b.deltas = bundle.deltas.clone();
+        b.hashes = bundle.hashes.clone();
+        bundle = b;
+    }
+
+    // `apply_bundle_opts` with move_branch false adds rows without moving the head.
+    let before_head = branch_head(&conn, branch)?.ok_or_else(|| bad("no head".to_string()))?;
+    let before = crate::store::ancestors_bfs(&conn, &before_head)?.len();
+    remote::apply_bundle_opts(&conn, &bundle, false)?;
+
+    // Recompute the boundary from what is actually held now. The first version deleted
+    // the old row and only re-added it when a parent was missing, which left no row at
+    // all when the chain was still cut and made a later `--unshallow` report that there
+    // was nothing to deepen.
+    conn.execute(
+        "DELETE FROM shallow_roots WHERE branch = ?1",
+        rusqlite::params![branch],
+    )?;
+    let head = branch_head(&conn, branch)?.ok_or_else(|| bad("no head".to_string()))?;
+    let chain = crate::store::ancestors_bfs(&conn, &head)?;
+    // Every changeset whose parent is not held is a boundary. Taking the last element of
+    // the chain was wrong: a breadth-first walk is ordered by distance from the head, not
+    // by age, so the last element is not necessarily the oldest and the boundary row was
+    // silently dropped, which made a later `--unshallow` claim there was nothing to do.
+    let mut still_shallow = false;
+    for id in &chain {
+        let (p1, _) = crate::store::parents_of_public(&conn, id)?;
+        if let Some(parent) = p1 {
+            let present: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM changesets WHERE id = ?1",
+                    rusqlite::params![parent],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if present.is_none() {
+                still_shallow = true;
+                conn.execute(
+                    "INSERT OR IGNORE INTO shallow_roots(changeset_id, branch, created_at)
+                     VALUES(?1, ?2, ?3)",
+                    rusqlite::params![id, branch, now()],
+                )?;
+            }
+        }
+    }
+
+    // Deepening adds changesets, so the committed tree has to be rebuilt from the new
+    // history. Skipping this left the tree describing only the changesets the clone
+    // arrived with, and `fsck` reported it as stale with five paths missing.
+    crate::store::refresh_branch_tree(&conn, branch)?;
+
+    let after: i64 = conn.query_row("SELECT COUNT(*) FROM changesets", [], |r| r.get(0))?;
+    let _ = root;
+    println!(
+        "{} now holds {} changeset(s), {} added{}",
+        branch,
+        after,
+        after.saturating_sub(before as i64),
+        if still_shallow {
+            ", still shallow"
+        } else {
+            ", no boundary left"
+        }
+    );
+    Ok(())
+}
