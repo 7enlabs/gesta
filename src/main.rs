@@ -290,6 +290,18 @@ enum Cmd {
         #[command(subcommand)]
         sub: SecretCmd,
     },
+    /// Show a stack of changesets step by step, with a risk read on each
+    Review {
+        /// Start after this revision; everything after it is shown
+        #[arg(long)]
+        from: Option<String>,
+        /// End at this revision. Defaults to the branch head
+        #[arg(long)]
+        to: Option<String>,
+        /// Show only steps at this band or above: low, medium, high
+        #[arg(long)]
+        min_risk: Option<String>,
+    },
     /// Run an MCP server on stdio, exposing the repository as tools
     Mcp,
     /// Serve this repository over HTTP
@@ -672,6 +684,7 @@ fn run() -> ZResult<()> {
             }
         },
         Cmd::Secret { sub } => cli::cmd_secret(sub),
+        Cmd::Review { from, to, min_risk } => cli::cmd_review(from.as_deref(), to.as_deref(), min_risk.as_deref()),
         Cmd::Mcp => cli::cmd_mcp(),
         Cmd::Serve { bind, port, tls, key } => {
             cli_remote::cmd_serve(&bind, port, tls.as_deref(), key.as_deref())

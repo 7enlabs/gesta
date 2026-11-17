@@ -1338,6 +1338,180 @@ fn line_diff(old: &str, new: &str) -> (Vec<String>, Vec<String>) {
     (removed, added)
 }
 
+/// One step of a stack: a changeset, its message, and what it changed.
+pub struct StackStep {
+    pub id: String,
+    pub message: String,
+    pub author: String,
+    pub files: Vec<PathDiff>,
+    pub risk: Risk,
+}
+
+/// A deterministic read on how much attention a change deserves.
+///
+/// This is the shape of what a large code host does with a learned model: score every
+/// change, then send the low scores down an automated path and the high scores to a
+/// person. A model needs training data this tool does not have, so the score here is
+/// built from the things a reviewer looks at first, and every point it awards says
+/// which rule awarded it. A score whose reason cannot be stated is not usable for
+/// routing, because a wrong routing decision becomes unauditable.
+#[derive(Default, Clone)]
+pub struct Risk {
+    pub score: i64,
+    pub reasons: Vec<String>,
+}
+
+impl Risk {
+    fn add(&mut self, points: i64, why: String) {
+        self.score += points;
+        self.reasons.push(format!("+{} {}", points, why));
+    }
+
+    /// The band a score falls in, with the same word a person would use.
+    pub fn band(&self) -> &'static str {
+        match self.score {
+            0..=3 => "low",
+            4..=8 => "medium",
+            _ => "high",
+        }
+    }
+}
+
+/// Score one changeset from what it changed.
+pub fn score_change(conn: &Connection, diffs: &[PathDiff]) -> ZResult<Risk> {
+    let mut r = Risk::default();
+    let lines: usize = diffs.iter().map(|(_, rm, ad)| rm.len() + ad.len()).sum();
+    let touched = diffs.len().max(1);
+    let paths: Vec<&str> = diffs.iter().map(|(p, _, _)| p.as_str()).collect();
+
+    if lines > 400 {
+        r.add(4, format!("{} lines changed", lines));
+    } else if lines > 100 {
+        r.add(2, format!("{} lines changed", lines));
+    }
+    if touched > 20 {
+        r.add(3, format!("{} paths touched", touched));
+    } else if touched > 5 {
+        r.add(1, format!("{} paths touched", touched));
+    }
+
+    let mut has_test = false;
+    let mut has_dep = false;
+    let mut has_binary = false;
+    let mut has_ignore = false;
+    for path in &paths {
+        let lower = path.to_ascii_lowercase();
+        let name = lower.rsplit('/').next().unwrap_or("");
+        if name.contains("test") || name.contains("spec") || lower.contains("/tests/") {
+            has_test = true;
+        }
+        if name == "cargo.toml" || name == "cargo.lock" || name == "package.json"
+            || name == "package-lock.json" || name == "requirements.txt" || name == "go.mod"
+        {
+            has_dep = true;
+        }
+        if lower.contains("vendor/") || lower.contains("node_modules/") {
+            has_ignore = true;
+        }
+    }
+    // A change with no test change is not automatically risky, but a sizeable one is
+    // worth a second look, which is exactly the judgement being encoded.
+    if lines > 50 && !has_test {
+        r.add(2, "sizeable change with no test touched".to_string());
+    }
+    if has_dep {
+        r.add(2, "dependency manifest changed".to_string());
+    }
+    if has_ignore {
+        r.add(1, "vendored or generated path touched".to_string());
+    }
+
+    // The object's own shape: a file that is not text cannot be reviewed line by line.
+    for path in &paths {
+        if let Some(hash) = file_hash_at(conn, path)? {
+            if let Ok(text) = crate::store::get_object(conn, &hash) {
+                if text.contains('\0') {
+                    has_binary = true;
+                }
+            }
+        }
+    }
+    if has_binary {
+        r.add(3, "a binary file changed".to_string());
+    }
+
+    if r.reasons.is_empty() {
+        r.reasons.push("small, text only, tests present or not needed".to_string());
+    }
+    Ok(r)
+}
+
+/// The object hash for a path at the branch head, if the path exists there.
+fn file_hash_at(conn: &Connection, path: &str) -> ZResult<Option<String>> {
+    conn.query_row(
+        "SELECT hash FROM branch_tree WHERE branch = (SELECT value FROM repo_state WHERE key = 'current_branch') AND path = ?1",
+        params![path],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Walk the chain from `from` (exclusive) to `to` (inclusive) and diff each step.
+///
+/// This is the answer to reviewing a stack: the changes arrive as a series of small
+/// steps, and a reviewer wants each step separately, in order, rather than the net
+/// effect. Comparing the endpoints alone loses the intermediate reasoning, which is
+/// most of what there is to review when an agent wrote the change.
+pub fn review_stack(
+    conn: &Connection,
+    from: Option<&str>,
+    to: &str,
+) -> ZResult<Vec<StackStep>> {
+    let head = crate::store::resolve_rev(conn, to)?
+        .ok_or_else(|| bad(format!("no such revision: {}", to)))?;
+
+    // Collect the chain oldest first, stopping at `from`.
+    let stop = match from {
+        Some(f) => crate::store::resolve_rev(conn, f)?,
+        None => None,
+    };
+    let mut chain: Vec<String> = Vec::new();
+    let mut cur = Some(head.clone());
+    while let Some(id) = cur {
+        if Some(&id) == stop.as_ref() {
+            break;
+        }
+        chain.push(id.clone());
+        let (p1, _p2) = crate::store::parents_of_public(conn, &id)?;
+        cur = p1;
+    }
+    chain.reverse();
+
+    let mut out = Vec::new();
+    for id in chain {
+        let (p1, _) = crate::store::parents_of_public(conn, &id)?;
+        let diff = diff_revs(conn, p1.as_deref(), Some(&id))?;
+        let risk = score_change(conn, &diff)?;
+        let (message, author): (String, String) = conn
+            .query_row(
+                "SELECT message, author FROM changesets WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .unwrap_or_else(|| ("(unknown)".to_string(), "(unknown)".to_string()));
+        out.push(StackStep {
+            id,
+            message,
+            author,
+            files: diff,
+            risk,
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -2053,5 +2227,85 @@ pub(crate) mod tests {
         let (removed, added) = line_diff("a\nb\n", "a\nb\nc\n");
         assert!(removed.is_empty(), "an append removes nothing, got {:?}", removed);
         assert_eq!(added, vec!["c".to_string()]);
+    }
+    /// Reviewing a stack is the question an agent-written change raises: what happened,
+    /// in what order, and which steps deserve a person's attention.
+    #[test]
+    fn a_stack_is_reviewed_step_by_step_with_a_risk_read() {
+        let conn = mem_db();
+        commit_files(&conn, "s1", "one", &[("a.txt", "alpha\n")]);
+
+        // A large change to a manifest, which is what the score is meant to catch.
+        let long: String = (0..500).map(|i| format!("line {}\n", i)).collect();
+        commit_files(
+            &conn,
+            "s2",
+            "two",
+            &[("big.txt", &long), ("package.json", "{}\n")],
+        );
+
+        let steps = review_stack(&conn, None, "main").unwrap();
+        assert_eq!(steps.len(), 2, "expected both steps, got {}", steps.len());
+
+        // Oldest first, so the review reads in the order things happened.
+        assert_eq!(steps[0].id, "s1");
+        assert_eq!(steps[1].id, "s2");
+
+        // The small first step scores low, the large one does not.
+        assert_eq!(steps[0].risk.band(), "low", "reasons: {:?}", steps[0].risk.reasons);
+        assert!(
+            steps[1].risk.score >= 4,
+            "a 500 line manifest change scored {}",
+            steps[1].risk.score
+        );
+
+        // Every point is explained, because a score nobody can audit cannot route work.
+        assert!(
+            !steps[1].risk.reasons.is_empty(),
+            "the risk came with no reasons"
+        );
+        assert!(steps[1]
+            .risk
+            .reasons
+            .iter()
+            .any(|r| r.contains("lines changed")));
+
+        // Starting after the first step leaves only the second.
+        let tail = review_stack(&conn, Some("s1"), "main").unwrap();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].id, "s2");
+    }
+
+    #[test]
+    fn a_small_text_change_is_not_flagged() {
+        let conn = mem_db();
+        commit_files(&conn, "t1", "one", &[("a.txt", "alpha\n")]);
+        commit_files(&conn, "t2", "two", &[("a.txt", "alpha changed\n")]);
+        let steps = review_stack(&conn, Some("t1"), "main").unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].risk.score, 0, "reasons: {:?}", steps[0].risk.reasons);
+        assert_eq!(steps[0].risk.band(), "low");
+    }
+
+    #[test]
+    fn a_test_change_does_not_raise_the_score_for_size() {
+        // Changing code and its test together is the normal healthy shape, and the
+        // score must not punish it the way it punishes a large change with no test.
+        let conn = mem_db();
+        commit_files(&conn, "u1", "one", &[("a.txt", "alpha\n")]);
+        let body: String = (0..120).map(|i| format!("v{}\n", i)).collect();
+        commit_files(
+            &conn,
+            "u2",
+            "two",
+            &[("src/lib.rs", &body), ("src/lib_test.rs", "test\n")],
+        );
+        let steps = review_stack(&conn, Some("u1"), "main").unwrap();
+        let reasons = &steps[0].risk.reasons;
+        assert!(
+            !reasons.iter().any(|r| r.contains("no test")),
+            "a change that touched a test was still flagged: {:?}",
+            reasons
+        );
     }
 }

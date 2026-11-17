@@ -1707,3 +1707,72 @@ pub fn cmd_diff_range_json(from: Option<&str>, to: Option<&str>) -> ZResult<()> 
     println!("{}", arr.render());
     Ok(())
 }
+
+/// `gesta review`: a stack of changesets, one step at a time, each with a risk read.
+///
+/// This is the answer to reviewing what an agent produced. A net diff between two
+/// points hides the order things happened in, and the order is most of the reasoning.
+pub fn cmd_review(from: Option<&str>, to: Option<&str>, min_risk: Option<&str>) -> ZResult<()> {
+    let (_root, conn) = open_repo()?;
+    let branch = current_branch(&conn)?;
+    let target = to.unwrap_or(&branch);
+
+    let steps = crate::repo::review_stack(&conn, from, target)?;
+    if steps.is_empty() {
+        println!("nothing between {} and {}", from.unwrap_or("the start"), target);
+        return Ok(());
+    }
+
+    let floor = match min_risk {
+        Some("low") => 0,
+        Some("medium") => 4,
+        Some("high") => 9,
+        Some(other) => {
+            return Err(bad(format!(
+                "unknown risk band: {} (use low, medium or high)",
+                other
+            )))
+        }
+        None => 0,
+    };
+
+    let mut shown = 0usize;
+    let mut hidden = 0usize;
+    for (n, step) in steps.iter().enumerate() {
+        if step.risk.score < floor {
+            hidden += 1;
+            continue;
+        }
+        shown += 1;
+        println!(
+            "\n[{}] {}  {}  ({})",
+            n + 1,
+            &step.id[..step.id.len().min(14)],
+            step.message,
+            step.author
+        );
+        println!(
+            "    risk {} ({})  {} file(s), {}",
+            step.risk.band(),
+            step.risk.score,
+            step.files.len(),
+            step.risk.reasons.join("; ")
+        );
+        for (path, removed, added) in &step.files {
+            println!("    --- {}", path);
+            for l in removed {
+                println!("    -{}", l);
+            }
+            for l in added {
+                println!("    +{}", l);
+            }
+        }
+    }
+    println!(
+        "\n{} step(s) shown, {} below the {} threshold",
+        shown,
+        hidden,
+        min_risk.unwrap_or("low")
+    );
+    Ok(())
+}

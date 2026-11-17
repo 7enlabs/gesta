@@ -322,6 +322,32 @@ def main():
             r.stdout + r.stderr,
         )
 
+    # Reviewing a stack: each step separately, oldest first, with a risk read.
+    r = sh(f"{GESTA} review", cwd=cp)
+    check(
+        "review shows the stack step by step",
+        r.returncode == 0 and r.stdout.count("risk ") >= 2,
+        r.stdout[:300] + r.stderr,
+    )
+    check(
+        "review reports a risk band for each step",
+        "risk low" in r.stdout or "risk medium" in r.stdout or "risk high" in r.stdout,
+        r.stdout[:200],
+    )
+    if base_id:
+        r = sh(f"{GESTA} review --min-risk high", cwd=cp)
+        check(
+            "a risk threshold hides the steps below it",
+            r.returncode == 0 and "below the high threshold" in r.stdout,
+            r.stdout[:200] + r.stderr,
+        )
+    r = sh(f"{GESTA} review --min-risk nonsense", cwd=cp)
+    check(
+        "an unknown risk band is refused",
+        r.returncode != 0 and "unknown risk band" in (r.stdout + r.stderr),
+        r.stdout + r.stderr,
+    )
+
     sh(f"{GESTA} branch switch main", cwd=cp)
     before = open(os.path.join(cp, "f.txt")).read()
     check("the branch does not have the change before picking", "TWO-PICKED" not in before, before)
