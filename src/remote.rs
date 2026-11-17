@@ -383,7 +383,7 @@ pub fn apply_bundle_opts(conn: &Connection, b: &Bundle, move_branch: bool) -> ZR
     )?;
     if move_branch {
         if let Some(head) = &b.head {
-            tx.execute("UPDATE branches SET head = ?1 WHERE name = ?2", params![head, b.branch])?;
+            crate::store::set_branch_head(&tx, &b.branch, head)?;
         }
     }
 

@@ -13,7 +13,7 @@ use rusqlite::params;
 use rusqlite::Connection;
 
 use crate::store::hash_content;
-use crate::worktree::{read_file, rel_path, IgnoreRules, ReadOutcome};
+use crate::worktree::{read_file, IgnoreRules, ReadOutcome};
 use crate::ZResult;
 
 /// Files whose mtime is younger than this are re-read rather than trusted.
@@ -77,10 +77,7 @@ pub fn scan_with_cache(
     // never recorded in this repository's cache either.
     let excluded = crate::subrepo::excluded_paths(conn);
     let walked = crate::worktree::scan_files_excluding(root, rules, &excluded)?;
-    for (path, meta) in walked {
-        // rel_path allocates a String per file. It is needed once, so it is
-        // computed once and moved into the result rather than cloned again.
-        let rel = rel_path(root, &path);
+    for (path, rel, meta) in walked {
         // Nanoseconds, not seconds. Two writes inside one second with the same
         // size are indistinguishable at second resolution, and the cache would
         // then serve the first write's hash for the second write's content.

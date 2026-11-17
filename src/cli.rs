@@ -696,6 +696,10 @@ pub fn cmd_branch_create(name: &str, from: &str) -> ZResult<()> {
         "INSERT INTO branches(name, head, created_at, from_branch) VALUES(?1, ?2, ?3, ?4)",
         rusqlite::params![name, head, now(), from],
     )?;
+    // A new branch points at the same changeset, so it starts with the same
+    // committed tree. Without this the branch reads as an empty tree until its
+    // first commit, and `status` on it reports every file as new.
+    crate::store::refresh_branch_tree(&conn, name)?;
     ops::record(&conn, "branch create", Some(name), Some(from))?;
     println!("created branch {} from {} at {}", name, from, head.unwrap_or_else(|| "(empty)".into()));
     Ok(())
@@ -754,6 +758,12 @@ pub fn cmd_branch_delete(name: &str) -> ZResult<()> {
         return Err(bad(format!("no such branch: {}", name)));
     }
     conn.execute("DELETE FROM branches WHERE name = ?1", rusqlite::params![name])?;
+    // The derived tree goes with the branch. Leaving it behind would make a
+    // branch created later under the same name start with a stale tree.
+    conn.execute(
+        "DELETE FROM branch_tree WHERE branch = ?1",
+        rusqlite::params![name],
+    )?;
     ops::record(&conn, "branch delete", Some(name), None)?;
     println!("deleted branch {}", name);
     Ok(())

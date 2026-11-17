@@ -935,10 +935,7 @@ fn receive_bundle(root: &Path, branch: &str, body: &[u8], who: &str) -> Result<S
         let reachable = ancestors(&conn, incoming)?;
         if incoming != prev && !reachable.iter().any(|a| a == prev) {
             // Roll the ref back; the objects stay but the branch is untouched.
-            conn.execute(
-                "UPDATE branches SET head = ?1 WHERE name = ?2",
-                rusqlite::params![prev, branch],
-            )?;
+            crate::store::set_branch_head(&conn, branch, prev)?;
             return Err(ApplyError::Rejected(format!(
                 "remote branch {} is at {} which the push does not contain; pull first",
                 branch, prev

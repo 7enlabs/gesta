@@ -308,6 +308,54 @@ pub fn cmd_fsck(prune: bool) -> ZResult<()> {
         }
     }
 
+    // The maintained tree must equal a rebuild from history. This is the check
+    // that makes the derived table safe: a writer that moved a head without
+    // refreshing it would make `status` silently report committed files as
+    // changed, and nothing else in the program would notice.
+    let branches_with_heads: Vec<(String, String)> = {
+        let mut stmt = conn.prepare("SELECT name, head FROM branches WHERE head IS NOT NULL")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (name, head) in &branches_with_heads {
+        // Compare as sets of (path, hash). The row counts alone cannot tell a
+        // stale tree from a fresh one: one row against one row with a different
+        // hash is exactly the drift this is looking for.
+        let rebuilt = crate::repo::tree_at(&conn, head)?;
+        let mut stored: Vec<(String, String)> = {
+            let mut stmt =
+                conn.prepare("SELECT path, hash FROM branch_tree WHERE branch = ?1 ORDER BY path")?;
+            let rows = stmt.query_map(rusqlite::params![name], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        stored.sort();
+        let mut expected = rebuilt.clone();
+        expected.sort();
+        if stored != expected {
+            let missing: Vec<&(String, String)> =
+                expected.iter().filter(|e| !stored.contains(e)).collect();
+            let extra: Vec<&(String, String)> =
+                stored.iter().filter(|s| !expected.contains(s)).collect();
+            println!(
+                "STALE tree for branch {}: {} row(s) stored, {} in history ({} missing, {} extra)",
+                name,
+                stored.len(),
+                expected.len(),
+                missing.len(),
+                extra.len()
+            );
+            for (p, h) in missing.iter().take(3) {
+                println!("  missing {} {}", p, &h[..h.len().min(12)]);
+            }
+            for (p, h) in extra.iter().take(3) {
+                println!("  extra   {} {}", p, &h[..h.len().min(12)]);
+            }
+            problems += 1;
+        }
+    }
+
     // Objects nothing references.
     let orphans: i64 = conn.query_row(
         "SELECT COUNT(*) FROM objects o WHERE NOT EXISTS (

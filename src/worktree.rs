@@ -294,7 +294,7 @@ pub fn scan_files_excluding(
     root: &Path,
     rules: &IgnoreRules,
     exclude: &[String],
-) -> std::io::Result<Vec<(PathBuf, fs::Metadata)>> {
+) -> std::io::Result<Vec<(PathBuf, String, fs::Metadata)>> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -331,8 +331,11 @@ pub fn scan_files_excluding(
                 }
                 // entry.metadata() does not follow extra symlinks and on most
                 // filesystems costs nothing beyond what read_dir returned.
+                // The relative path is computed here and handed back. It was
+                // computed here anyway for the ignore check, and every caller
+                // needed it again: doing it twice allocated two strings per file.
                 match entry.metadata() {
-                    Ok(m) => out.push((path, m)),
+                    Ok(m) => out.push((path, rel, m)),
                     Err(_) => continue,
                 }
             }
@@ -491,7 +494,7 @@ mod tests {
         let got: Vec<String> = scan_files_excluding(&tmp, &r, &[])
             .unwrap()
             .iter()
-            .map(|(p, _)| rel_path(&tmp, p))
+            .map(|(p, r, _)| if r.is_empty() { rel_path(&tmp, p) } else { r.clone() })
             .collect();
         assert_eq!(got, vec!["app.rs", "src/a.rs"], "ignored paths must not be tracked");
         let _ = fs::remove_dir_all(&tmp);

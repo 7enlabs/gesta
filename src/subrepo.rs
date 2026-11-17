@@ -268,7 +268,7 @@ mod tests {
         let found: Vec<String> = crate::worktree::scan_files_excluding(&root, &rules, &exclude)
             .unwrap()
             .iter()
-            .map(|(p, _)| crate::worktree::rel_path(&root, p))
+            .map(|(p, r, _)| if r.is_empty() { crate::worktree::rel_path(&root, p) } else { r.to_string() })
             .collect();
 
         assert!(found.contains(&"own.txt".to_string()));

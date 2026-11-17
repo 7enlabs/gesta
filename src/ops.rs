@@ -40,6 +40,10 @@ impl RepoSnapshot {
                  ON CONFLICT(name) DO UPDATE SET head = excluded.head",
                 params![name, head, now()],
             )?;
+            // Undo moves a head, so the derived tree has to follow. Missing this
+            // made `fsck` report a stale tree after any undo, and `status` then
+            // reported already-committed files as new.
+            crate::store::refresh_branch_tree(conn, name)?;
         }
         // Branches created after the snapshot are removed.
         let keep: Vec<String> = self.branches.iter().map(|(n, _)| n.clone()).collect();
@@ -52,6 +56,10 @@ impl RepoSnapshot {
         for name in existing {
             if !keep.contains(&name) {
                 conn.execute("DELETE FROM branches WHERE name = ?1", params![name])?;
+                conn.execute(
+                    "DELETE FROM branch_tree WHERE branch = ?1",
+                    params![name],
+                )?;
             }
         }
         conn.execute("DELETE FROM tags", [])?;

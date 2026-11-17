@@ -213,10 +213,7 @@ pub fn start(
     // Move the branch to the new base first. Each step then picks onto it, so a
     // stop leaves a valid branch pointing at the last successful pick rather
     // than at a base the caller did not ask for combined with nothing.
-    conn.execute(
-        "UPDATE branches SET head = ?1 WHERE name = ?2",
-        params![onto_id, branch],
-    )?;
+    crate::store::set_branch_head(conn, branch, &onto_id)?;
     repo::restore_worktree(conn, root, branch)?;
 
     let mut s = Session {
@@ -292,17 +289,11 @@ pub fn abort(conn: &Connection, root: &Path) -> ZResult<String> {
     let s = load(conn)?.ok_or_else(|| bad("no rebase in progress".to_string()))?;
     match &s.original_head {
         Some(h) => {
-            conn.execute(
-                "UPDATE branches SET head = ?1 WHERE name = ?2",
-                params![h, s.branch],
-            )?;
+            crate::store::set_branch_head(conn, &s.branch, h)?;
             repo::restore_worktree(conn, root, &s.branch)?;
         }
         None => {
-            conn.execute(
-                "UPDATE branches SET head = NULL WHERE name = ?1",
-                params![s.branch],
-            )?;
+            crate::store::clear_branch_head(conn, &s.branch)?;
         }
     }
     clear(conn)?;
