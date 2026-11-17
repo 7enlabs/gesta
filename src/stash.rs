@@ -24,7 +24,8 @@ pub struct Stash {
     pub id: i64,
     pub message: String,
     pub created_at: i64,
-    pub files: Vec<(String, String)>,
+    /// `(path, hash)`, with no hash meaning the path was deleted.
+    pub files: Vec<(String, Option<String>)>,
 }
 
 fn init_schema(conn: &Connection) -> ZResult<()> {
@@ -38,7 +39,9 @@ fn init_schema(conn: &Connection) -> ZResult<()> {
         CREATE TABLE IF NOT EXISTS stash_files (
             stash_id INTEGER NOT NULL,
             path     TEXT NOT NULL,
-            hash     TEXT NOT NULL,
+            -- No hash means the path was deleted in the working tree, which is a change worth
+            -- keeping: without it a stash of a deletion reported nothing to save.
+            hash     TEXT,
             PRIMARY KEY (stash_id, path)
         );",
     )?;
@@ -55,12 +58,16 @@ pub fn save(conn: &Connection, root: &Path, message: &str, author: &str) -> ZRes
     let committed = repo::committed_tree(conn, &branch)?;
     let d = repo::diff_worktree(conn, root, &branch)?;
 
+    // Every kind of change has to be captured, including a deletion. A stash that ignored
+    // deletions reported "nothing to stash" when the only change was a removed file, so
+    // switching branches silently dropped the fact that a file was meant to be gone.
     let mut paths: Vec<String> = Vec::new();
     paths.extend(d.added.iter().cloned());
     paths.extend(d.modified.iter().cloned());
     paths.sort();
+    let deleted: Vec<String> = d.deleted.clone();
 
-    if paths.is_empty() {
+    if paths.is_empty() && deleted.is_empty() {
         return Ok((0, 0));
     }
 
@@ -97,6 +104,16 @@ pub fn save(conn: &Connection, root: &Path, message: &str, author: &str) -> ZRes
         tx.execute(
             "INSERT INTO stash_files(stash_id, path, hash) VALUES(?1, ?2, ?3)",
             params![stash_id, rel, hash],
+        )?;
+        saved += 1;
+    }
+
+    // A deletion is recorded as an absence of content, which is what tells `apply` to remove
+    // the path rather than write it.
+    for rel in &deleted {
+        tx.execute(
+            "INSERT INTO stash_files(stash_id, path, hash) VALUES(?1, ?2, NULL)",
+            params![stash_id, rel],
         )?;
         saved += 1;
     }
@@ -147,7 +164,10 @@ fn load(conn: &Connection, id: Option<i64>) -> ZResult<Stash> {
         let mut stmt =
             conn.prepare("SELECT path, hash FROM stash_files WHERE stash_id = ?1 ORDER BY path")?;
         let rows = stmt.query_map(params![id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+            ))
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
@@ -204,12 +224,24 @@ pub fn pop(conn: &Connection, root: &Path, id: Option<i64>) -> ZResult<(Stash, u
 
     let mut written = 0usize;
     for (rel, hash) in &stash.files {
-        let content = get_object(conn, hash)?;
         let target = root.join(rel);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
+        match hash {
+            Some(h) => {
+                let content = get_object(conn, h)?;
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&target, content.as_bytes())?;
+            }
+            // No hash recorded means the change being stashed was a deletion, so applying it
+            // removes the path again. Restoring the file instead would silently undo the
+            // deletion the user asked to keep.
+            None => {
+                if target.is_file() {
+                    std::fs::remove_file(&target)?;
+                }
+            }
         }
-        std::fs::write(&target, content.as_bytes())?;
         written += 1;
     }
 
@@ -313,5 +345,86 @@ mod tests {
         let (id, n) = save(&conn, &d, "wip", "t").unwrap();
         assert_eq!((id, n), (0, 0));
         let _ = std::fs::remove_dir_all(&d);
+    }
+    /// A stash that ignores deletions silently drops a change. The first version only
+    /// collected added and modified paths, so a working tree whose only change was a removed
+    /// file reported "nothing to stash" and the deletion was left behind when the branch
+    /// moved.
+    #[test]
+    fn a_deletion_alone_is_still_a_change_worth_saving() {
+        let conn = crate::store::tests::mem_db();
+        let dir = std::env::temp_dir().join(format!("gesta-stash-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        crate::repo::tests::commit_files(
+            &conn,
+            "s1",
+            "base",
+            &[("keep.txt", "keep\n"), ("gone.txt", "gone\n")],
+        );
+        crate::store::set_branch_head(&conn, "main", "s1").unwrap();
+        crate::repo::materialise(&conn, &dir, "main").unwrap();
+        assert!(dir.join("gone.txt").exists());
+
+        std::fs::remove_file(dir.join("gone.txt")).unwrap();
+
+        let (id, saved) = save(&conn, &dir, "deletion", "a").unwrap();
+        assert_eq!(saved, 1, "the deletion was not saved");
+        assert!(id > 0);
+        // The working tree goes back to the head, so the file is present again.
+        assert!(
+            dir.join("gone.txt").exists(),
+            "stashing must restore the head state"
+        );
+
+        let (_stash, written, blocked) = pop(&conn, &dir, None).unwrap();
+        assert!(blocked.is_empty(), "unexpected conflict: {:?}", blocked);
+        assert_eq!(written, 1);
+        assert!(
+            !dir.join("gone.txt").exists(),
+            "popping must apply the deletion again"
+        );
+        assert!(dir.join("keep.txt").exists(), "an unrelated file was touched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn all_three_kinds_of_change_survive_a_stash() {
+        let conn = crate::store::tests::mem_db();
+        let dir = std::env::temp_dir().join(format!("gesta-stash-3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        crate::repo::tests::commit_files(
+            &conn,
+            "t1",
+            "base",
+            &[("a.txt", "one\n"), ("b.txt", "two\n"), ("c.txt", "three\n")],
+        );
+        crate::store::set_branch_head(&conn, "main", "t1").unwrap();
+        crate::repo::materialise(&conn, &dir, "main").unwrap();
+
+        std::fs::write(dir.join("a.txt"), "one MODIFIED\n").unwrap();
+        std::fs::write(dir.join("d.txt"), "brand new\n").unwrap();
+        std::fs::remove_file(dir.join("c.txt")).unwrap();
+
+        let (_id, saved) = save(&conn, &dir, "all three", "a").unwrap();
+        assert_eq!(saved, 3, "expected every kind of change to be saved");
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\n");
+        assert!(dir.join("c.txt").exists(), "the head state was not restored");
+        assert!(!dir.join("d.txt").exists(), "the new file was not cleared");
+
+        pop(&conn, &dir, None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "one MODIFIED\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("d.txt")).unwrap(),
+            "brand new\n"
+        );
+        assert!(!dir.join("c.txt").exists(), "the deletion was not reapplied");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

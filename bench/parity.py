@@ -142,6 +142,35 @@ def main():
         "the stashed new file is back",
         os.path.exists(os.path.join(repo, "scratch.txt")),
     )
+    # A deletion is a change. A stash that ignores it drops the fact that a file was meant
+    # to be gone, which shows up later as an unexplained resurrection.
+    doomed = os.path.join(repo, "src", "doomed.txt")
+    with open(doomed, "w") as fh:
+        fh.write("to be removed\n")
+    sh(f"{GESTA} changeset create add-doomed --author bench", cwd=repo)
+    m = re.search(r"(cs[0-9a-f]+)", sh(f"{GESTA} changeset list --json", cwd=repo).stdout)
+    if m:
+        sh(f"{GESTA} changeset commit {m.group(1)}", cwd=repo)
+    os.remove(doomed)
+    r = sh(f"{GESTA} stash save --message deletion", cwd=repo)
+    check(
+        "a stash saves a deletion instead of claiming nothing to do",
+        r.returncode == 0 and "saved stash" in r.stdout,
+        r.stdout + r.stderr,
+    )
+    check(
+        "stashing a deletion restores the head state",
+        os.path.exists(doomed),
+        "the file was not put back",
+    )
+    r = sh(f"{GESTA} stash pop", cwd=repo)
+    check("popping a deletion works", r.returncode == 0, r.stdout + r.stderr)
+    check(
+        "popping a deletion removes the file again",
+        not os.path.exists(doomed),
+        "the file came back when it should stay deleted",
+    )
+
 
     # Pop must refuse rather than overwrite a local change.
     with open(os.path.join(repo, "src", "a.txt"), "a") as fh:
