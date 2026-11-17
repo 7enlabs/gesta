@@ -312,7 +312,7 @@ impl IgnoreRules {
             .filter(|p| !p.anchored && !p.dir_only && !p.negated)
             .filter_map(|p| p.simple_suffix())
             .collect();
-        // Any negated pattern at all, not only a literal one: `!*.log` is just as
+        // Any negated pattern at all, including a wildcard one: `!*.log` is just as
         // capable of undoing a `*.log` table match as `!keep.log` was.
         let negations: Vec<String> = parsed
             .iter()
