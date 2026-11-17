@@ -734,6 +734,222 @@ pub fn merge_branch(
     Ok(MergeOutcome { applied: vec![id.clone()], conflicts: Vec::new(), reports: Vec::new(), merge_changeset: Some(id) })
 }
 
+/// Apply the change one changeset made onto the current branch.
+///
+/// The three-way merge uses the changeset's own parent as the base, not the
+/// merge base of two branches: the question is "what did this changeset change,
+/// and does that change still apply here", which is exactly a diff against its
+/// parent replayed on the target.
+///
+/// A cherry-pick never moves the source, and it records a new changeset on the
+/// target rather than reusing the source id, because the same id on two branches
+/// would make every history query ambiguous.
+pub fn cherry_pick(
+    conn: &Connection,
+    root: &Path,
+    source: &str,
+    target: &str,
+    author: &str,
+) -> ZResult<MergeOutcome> {
+    // Resolve the id: a branch name means its head, anything else is an id or tag.
+    let source_id = crate::store::resolve_rev(conn, source)?
+        .ok_or_else(|| bad(format!("no such changeset: {}", source)))?;
+
+    let parent: Option<String> = conn
+        .query_row(
+            "SELECT parent FROM changesets WHERE id = ?1",
+            params![source_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+
+    let tgt_head = branch_head(conn, target)?;
+
+    // The paths this changeset touched.
+    let files: Vec<(String, Option<String>, Option<String>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT path, old_hash, new_hash FROM changeset_files
+             WHERE changeset_id = ?1 ORDER BY path",
+        )?;
+        let rows = stmt.query_map(params![source_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    if files.is_empty() {
+        return Ok(MergeOutcome {
+            applied: Vec::new(),
+            conflicts: Vec::new(),
+            reports: Vec::new(),
+            merge_changeset: None,
+        });
+    }
+
+    let mut picked: Vec<(String, Option<String>, String)> = Vec::new();
+    let mut deleted: Vec<String> = Vec::new();
+    let mut conflicts: Vec<String> = Vec::new();
+    let mut reports: Vec<crate::conflict::ConflictReport> = Vec::new();
+
+    for (path, _old, new_hash) in &files {
+        // What the file held before this changeset.
+        let base_text = match &parent {
+            Some(p) => match hash_at_point(conn, path, p)? {
+                Some(h) => get_object(conn, &h)?,
+                None => String::new(),
+            },
+            None => String::new(),
+        };
+        // What the target branch holds now.
+        let our_text = match &tgt_head {
+            Some(t) => match hash_at_point(conn, path, t)? {
+                Some(h) => get_object(conn, &h)?,
+                None => String::new(),
+            },
+            None => String::new(),
+        };
+        // What the changeset made it.
+        let their_text = match new_hash {
+            Some(h) => get_object(conn, h)?,
+            // A deletion: the change is "this path goes away".
+            None => String::new(),
+        };
+
+        let result = merge3(&base_text, &our_text, &their_text);
+        if result.is_conflict() {
+            let theirs = match &result {
+                MergeResult::Conflict { theirs, .. } => theirs.clone(),
+                MergeResult::Clean(_) => String::new(),
+            };
+            // Preserve their side before anything is written, so a refused
+            // cherry-pick still leaves the content recoverable.
+            write_conflict_copy(root, path, &theirs)?;
+            if let Some(rep) = crate::conflict::report(path, &base_text, &our_text, &their_text) {
+                reports.push(rep);
+            }
+            conflicts.push(path.clone());
+            continue;
+        }
+
+        let text = result.text().to_string();
+        if new_hash.is_none() && text.is_empty() {
+            // The changeset removed this path and nothing re-added it.
+            if our_text.is_empty() {
+                // Already absent here: nothing to do, which is not a conflict.
+                continue;
+            }
+            deleted.push(path.clone());
+        } else if text != our_text {
+            picked.push((path.clone(), new_hash.clone(), text));
+        }
+    }
+
+    if !conflicts.is_empty() {
+        // A conflicted pick is not a pick: the head stays where it was.
+        return Ok(MergeOutcome {
+            applied: Vec::new(),
+            conflicts,
+            reports,
+            merge_changeset: None,
+        });
+    }
+
+    if picked.is_empty() && deleted.is_empty() {
+        return Ok(MergeOutcome {
+            applied: Vec::new(),
+            conflicts: Vec::new(),
+            reports: Vec::new(),
+            merge_changeset: None,
+        });
+    }
+
+    let msg: String = conn
+        .query_row(
+            "SELECT message FROM changesets WHERE id = ?1",
+            params![source_id],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|_| "picked".to_string());
+
+    let id = new_changeset_id(conn, &format!("pick {}: {}", &source_id[..source_id.len().min(14)], msg), author)?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO changesets(id, message, author, created_at, status, parent, parent2, branch)
+         VALUES(?1, ?2, ?3, ?4, 'committed', ?5, NULL, ?6)",
+        params![
+            id,
+            format!("pick {}: {}", &source_id[..source_id.len().min(14)], msg),
+            author,
+            now(),
+            tgt_head,
+            target
+        ],
+    )?;
+
+    for (path, _old_hash, text) in &picked {
+        let h = put_object(&tx, text)?;
+        tx.execute(
+            "INSERT INTO changeset_files(changeset_id, path, old_hash, new_hash)
+             VALUES(?1, ?2, NULL, ?3)",
+            params![id, path, h],
+        )?;
+        let next_ver: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM file_versions WHERE path = ?1",
+            params![path],
+            |r| r.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO file_versions(path, version, hash, changeset_id, created_at)
+             VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![path, next_ver, h, id, now()],
+        )?;
+    }
+    for path in &deleted {
+        // A deletion is recorded with a null hash, which is the same shape a
+        // commit uses, so every history query already understands it.
+        tx.execute(
+            "INSERT INTO changeset_files(changeset_id, path, old_hash, new_hash)
+             VALUES(?1, ?2, NULL, NULL)",
+            params![id, path],
+        )?;
+        tx.execute("DELETE FROM blame WHERE path = ?1", params![path])?;
+    }
+    tx.execute("UPDATE branches SET head = ?1 WHERE name = ?2", params![id, target])?;
+    tx.commit()?;
+
+    for (path, _hash, text) in &picked {
+        let target_path = root.join(path);
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&target_path, text)?;
+    }
+    for path in &deleted {
+        let target_path = root.join(path);
+        if target_path.is_file() {
+            fs::remove_file(&target_path)?;
+        }
+    }
+
+    let touched: Vec<(String, String)> = picked
+        .iter()
+        .map(|(p, _, t)| (p.clone(), hash_content(t)))
+        .collect();
+    recompute_blame(conn, &touched)?;
+
+    Ok(MergeOutcome {
+        applied: vec![id.clone()],
+        conflicts: Vec::new(),
+        reports: Vec::new(),
+        merge_changeset: Some(id),
+    })
+}
+
 /// Diff two changesets (or a changeset against its first parent).
 pub fn changeset_diff(conn: &Connection, id: &str) -> ZResult<Vec<FileDiff>> {
     let parent: Option<String> = conn
@@ -1288,4 +1504,142 @@ pub(crate) mod tests {
 
 
 
+
+    /// Make two branches from one base, each with its own edit to `f.txt`.
+    fn two_branches(conn: &Connection, main_text: &str, side_text: &str) -> (String, String) {
+        commit_files(conn, "base", "base", &[("f.txt", "a\nb\nc\n")]);
+        conn.execute(
+            "INSERT INTO branches(name, head, created_at, from_branch)
+             VALUES('side', 'base', 1, 'main')",
+            [],
+        )
+        .unwrap();
+
+        commit_files(conn, "side1", "side edit", &[("f.txt", side_text)]);
+        conn.execute("UPDATE branches SET head = 'side1' WHERE name = 'side'", [])
+            .unwrap();
+        conn.execute("UPDATE changesets SET branch = 'side' WHERE id = 'side1'", [])
+            .unwrap();
+
+        commit_files(conn, "main1", "main edit", &[("f.txt", main_text)]);
+        ("side1".to_string(), "main1".to_string())
+    }
+
+    #[test]
+    fn cherry_pick_applies_a_change_onto_the_current_branch() {
+        let conn = mem_db();
+        let (side, _main) = two_branches(&conn, "a\nb\nc\n", "a\nSIDE\nc\n");
+
+        let d = std::env::temp_dir().join(format!("gesta-pick-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("f.txt"), "a\nb\nc\n").unwrap();
+
+        let out = cherry_pick(&conn, &d, &side, "main", "t").unwrap();
+        assert!(out.conflicts.is_empty(), "a change to a clean base must not conflict");
+        let id = out.merge_changeset.expect("pick must record a changeset");
+        assert_eq!(branch_head(&conn, "main").unwrap().as_deref(), Some(id.as_str()));
+
+        let content = std::fs::read_to_string(d.join("f.txt")).unwrap();
+        assert_eq!(content, "a\nSIDE\nc\n");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_cherry_pick_refuses_instead_of_overwriting_a_conflicting_change() {
+        // The target edited the same line. Writing their version over ours would
+        // destroy a change the user can see, with nothing recording it.
+        let conn = mem_db();
+        let (side, _main) = two_branches(&conn, "a\nMAIN\nc\n", "a\nSIDE\nc\n");
+
+        let d = std::env::temp_dir().join(format!("gesta-pick-c-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("f.txt"), "a\nMAIN\nc\n").unwrap();
+
+        let head_before = branch_head(&conn, "main").unwrap();
+        let out = cherry_pick(&conn, &d, &side, "main", "t").unwrap();
+
+        assert_eq!(out.conflicts, vec!["f.txt".to_string()]);
+        assert!(out.merge_changeset.is_none(), "a conflicted pick must not record");
+        assert_eq!(branch_head(&conn, "main").unwrap(), head_before, "the head must not move");
+        assert_eq!(
+            std::fs::read_to_string(d.join("f.txt")).unwrap(),
+            "a\nMAIN\nc\n",
+            "the target content is untouched"
+        );
+        assert!(
+            d.join("f.txt.theirs").exists(),
+            "their side must be preserved next to the file"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn picking_a_change_that_is_already_present_records_nothing() {
+        let conn = mem_db();
+        commit_files(&conn, "base", "base", &[("f.txt", "a\nb\n")]);
+        commit_files(&conn, "edit", "edit", &[("f.txt", "a\nB\n")]);
+
+        let d = std::env::temp_dir().join(format!("gesta-pick-idem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("f.txt"), "a\nB\n").unwrap();
+
+        let before = branch_head(&conn, "main").unwrap();
+        let out = cherry_pick(&conn, &d, "edit", "main", "t").unwrap();
+        assert!(out.merge_changeset.is_none(), "nothing changed, so nothing recorded");
+        assert_eq!(branch_head(&conn, "main").unwrap(), before);
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_cherry_pick_can_delete_a_file() {
+        let conn = mem_db();
+        commit_files(&conn, "base", "base", &[("f.txt", "x\n"), ("keep.txt", "k\n")]);
+        // Record a deletion on a second commit the same way a commit does.
+        conn.execute(
+            "INSERT INTO changesets(id,message,author,created_at,status,parent,branch)
+             VALUES('del','remove f','a',1,'committed','base','main')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO changeset_files(changeset_id,path,old_hash,new_hash)
+             VALUES('del','f.txt',NULL,NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE branches SET head='del' WHERE name='main'", [])
+            .unwrap();
+
+        let d = std::env::temp_dir().join(format!("gesta-pick-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("f.txt"), "x\n").unwrap();
+
+        // Pick the deletion onto a point that still has the file.
+        conn.execute("UPDATE branches SET head='base' WHERE name='main'", [])
+            .unwrap();
+        let out = cherry_pick(&conn, &d, "del", "main", "t").unwrap();
+        assert!(out.conflicts.is_empty());
+        assert!(out.merge_changeset.is_some());
+        assert!(!d.join("f.txt").exists(), "the picked deletion removes the file");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn picking_an_unknown_changeset_is_an_error() {
+        let conn = mem_db();
+        commit_files(&conn, "base", "base", &[("f.txt", "x\n")]);
+        let d = std::env::temp_dir().join(format!("gesta-pick-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(cherry_pick(&conn, &d, "nope", "main", "t").is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

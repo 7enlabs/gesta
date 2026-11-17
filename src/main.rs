@@ -195,6 +195,16 @@ enum Cmd {
         /// File or `.` to restore the whole working tree
         file: String,
     },
+    /// Apply the change one changeset made onto the current branch
+    CherryPick {
+        /// Changeset id, tag, or branch name
+        source: String,
+        /// Branch to apply onto. Defaults to the current branch.
+        #[arg(long)]
+        onto: Option<String>,
+        #[arg(long, default_value = "agent")]
+        author: String,
+    },
     /// Search the history for the changeset that introduced a fault
     Bisect {
         #[command(subcommand)]
@@ -519,6 +529,7 @@ fn run() -> ZResult<()> {
         Cmd::Branch { sub } if json => cli::cmd_branch_json(sub),
         Cmd::Changeset { sub } if json => cli::cmd_changeset_json(sub),
         Cmd::Sparse { sub } => cli::cmd_sparse(sub),
+        Cmd::CherryPick { source, onto, author } => cli::cmd_cherry_pick(&source, onto.as_deref(), &author),
         Cmd::Bisect { sub } => cli::cmd_bisect(sub),
         Cmd::Stash { sub } => cli::cmd_stash(sub, json),
         Cmd::Hook { sub } => cli::cmd_hook(sub),

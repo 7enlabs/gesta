@@ -259,8 +259,78 @@ def main():
     else:
         check("bisect could build its history", False, f"only {len(ids)} changesets")
 
-    # 12. Things a daily user will look for and not find.
-    for missing in ("rebase", "cherry-pick", "submodule"):
+    # 12. Cherry-pick moves one change onto another branch.
+    cp = os.path.join(ROOT, "pick")
+    os.makedirs(cp)
+    sh(f"{GESTA} init", cwd=cp)
+    with open(os.path.join(cp, "f.txt"), "w") as fh:
+        fh.write("one\ntwo\nthree\n")
+    r = sh(f"{GESTA} changeset create base --author bench", cwd=cp)
+    m = re.search(r"\b(cs[0-9a-f]{6,})\b", r.stdout)
+    base_id = m.group(1) if m else None
+    if base_id:
+        sh(f"{GESTA} changeset commit {base_id}", cwd=cp)
+
+    sh(f"{GESTA} branch create feature", cwd=cp)
+    sh(f"{GESTA} branch switch feature", cwd=cp)
+    with open(os.path.join(cp, "f.txt"), "w") as fh:
+        fh.write("one\nTWO-PICKED\nthree\n")
+    r = sh(f"{GESTA} changeset create fix --author bench", cwd=cp)
+    m = re.search(r"\b(cs[0-9a-f]{6,})\b", r.stdout)
+    fix_id = m.group(1) if m else None
+    if fix_id:
+        sh(f"{GESTA} changeset commit {fix_id}", cwd=cp)
+
+    sh(f"{GESTA} branch switch main", cwd=cp)
+    before = open(os.path.join(cp, "f.txt")).read()
+    check("the branch does not have the change before picking", "TWO-PICKED" not in before, before)
+
+    if fix_id:
+        r = sh(f"{GESTA} cherry-pick {fix_id}", cwd=cp)
+        check("cherry-pick succeeds", r.returncode == 0, r.stdout + r.stderr)
+        after = open(os.path.join(cp, "f.txt")).read()
+        check("cherry-pick applied the change", "TWO-PICKED" in after, after)
+
+        log = sh(f"{GESTA} log --limit 1", cwd=cp).stdout
+        check("the pick was recorded with its own message", "pick" in log, log)
+
+        # Picking the same change again must not create a second changeset.
+        count_before = sh(f"{GESTA} log --limit 50 --json", cwd=cp).stdout.count('"id"')
+        r = sh(f"{GESTA} cherry-pick {fix_id}", cwd=cp)
+        count_after = sh(f"{GESTA} log --limit 50 --json", cwd=cp).stdout.count('"id"')
+        check(
+            "picking an already applied change records nothing",
+            count_before == count_after,
+            f"{count_before} -> {count_after}",
+        )
+    else:
+        check("cherry-pick could build its branches", False, "no changeset id")
+
+    # A conflicting pick must refuse and leave the head alone.
+    with open(os.path.join(cp, "f.txt"), "w") as fh:
+        fh.write("one\nMAIN-ONLY\nthree\n")
+    r = sh(f"{GESTA} changeset create mainedit --author bench", cwd=cp)
+    m = re.search(r"\b(cs[0-9a-f]{6,})\b", r.stdout)
+    if m:
+        sh(f"{GESTA} changeset commit {m.group(1)}", cwd=cp)
+    head_before = sh(f"{GESTA} status", cwd=cp).stdout
+    if fix_id:
+        r = sh(f"{GESTA} cherry-pick {fix_id}", cwd=cp)
+        check("a conflicting pick refuses", r.returncode != 0, r.stdout + r.stderr)
+    head_after = sh(f"{GESTA} status", cwd=cp).stdout
+    check(
+        "a refused pick leaves the head alone",
+        [l for l in head_before.splitlines() if "HEAD" in l]
+        == [l for l in head_after.splitlines() if "HEAD" in l],
+        head_after,
+    )
+    check(
+        "a refused pick keeps the local content",
+        "MAIN-ONLY" in open(os.path.join(cp, "f.txt")).read(),
+    )
+
+    # 13. Things a daily user will look for and not find.
+    for missing in ("rebase", "submodule"):
         r = sh(f"{GESTA} {missing} --help", cwd=repo)
         check(f"{missing} is absent (known gap)", r.returncode != 0)
 

@@ -1382,3 +1382,31 @@ pub fn cmd_bisect(sub: crate::BisectCmd) -> ZResult<()> {
         }
     }
 }
+
+pub fn cmd_cherry_pick(source: &str, onto: Option<&str>, author: &str) -> ZResult<()> {
+    let (root, conn) = open_repo()?;
+    let target = match onto {
+        Some(b) => b.to_string(),
+        None => current_branch(&conn)?,
+    };
+    let out = repo::cherry_pick(&conn, &root, source, &target, author)?;
+
+    if !out.conflicts.is_empty() {
+        println!("cherry-pick stopped: {} file(s) conflict", out.conflicts.len());
+        for p in &out.conflicts {
+            println!("  {}", p);
+        }
+        println!("the head is unchanged; their side was written beside each file as .theirs");
+        return Err(bad("cherry-pick refused the conflicted paths".to_string()));
+    }
+    match out.merge_changeset {
+        Some(id) => {
+            println!("picked {} onto {} as {}", source, target, id);
+            Ok(())
+        }
+        None => {
+            println!("nothing to pick: the change is already present on {}", target);
+            Ok(())
+        }
+    }
+}

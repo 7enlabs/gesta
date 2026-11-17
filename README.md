@@ -56,6 +56,7 @@ gesta blame src/main.rs
 | `hook list` | Which hooks are installed |
 | `hook install <name> [--file F]` | Write a hook, reading stdin when no file is given |
 | `hook remove <name>` | Remove a hook |
+| `cherry-pick <id> [--onto B]` | Apply one changeset's change onto a branch |
 | `bisect start <good> <bad>` | Begin a search for the changeset that introduced a fault |
 | `bisect good \| bad` | Answer about the changeset under test |
 | `bisect status` | Remaining candidates and questions asked |
@@ -74,6 +75,18 @@ gesta blame src/main.rs
 | `fsck [--prune]` | Verify integrity, optionally drop orphan objects |
 | `stats` | Object counts and compression ratio |
 | `ignore add/list/remove` | Ignore patterns |
+
+### Cherry-pick
+
+`cherry-pick` replays the change one changeset made onto another branch. The
+three-way merge uses that changeset's own parent as the base, because the
+question is what the changeset changed, not what two branches diverged on.
+
+The pick records a new changeset rather than reusing the source id: the same id
+on two branches would make every history query ambiguous. A conflicting pick
+refuses, leaves the head where it was, writes the other side beside each file as
+`.theirs`, and keeps your content untouched. Picking a change that is already
+present records nothing.
 
 ### Bisect
 
