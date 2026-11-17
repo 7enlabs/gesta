@@ -1288,3 +1288,97 @@ pub fn cmd_hook(sub: crate::HookCmd) -> ZResult<()> {
         }
     }
 }
+
+pub fn cmd_bisect(sub: crate::BisectCmd) -> ZResult<()> {
+    use crate::BisectCmd;
+    match sub {
+        BisectCmd::Start { good, bad: bad_point } => {
+            let (root, conn) = open_repo()?;
+            if crate::bisect::load(&conn)?.is_some() {
+                return Err(bad(
+                    "a bisect is already running: answer it or run `gesta bisect cancel`"
+                        .to_string(),
+                ));
+            }
+            let s = crate::bisect::start(&conn, &good, &bad_point)?;
+            println!(
+                "bisecting {} candidate(s) between {} and {}",
+                s.candidates.len(),
+                &good[..good.len().min(14)],
+                &bad_point[..bad_point.len().min(14)]
+            );
+            // The first question comes right away, so the caller never has to
+            // make a separate "what next" call before testing anything.
+            match crate::bisect::step(&conn, &root, true)? {
+                crate::bisect::Step::Test(id) => {
+                    println!("testing {}", id);
+                    println!("the working tree now holds that changeset: run your test, then");
+                    println!("  gesta bisect good    if it passes");
+                    println!("  gesta bisect bad     if it fails");
+                }
+                crate::bisect::Step::Found(id) => {
+                    crate::bisect::finish(&conn, &root)?;
+                    println!("first bad changeset: {}", id);
+                }
+            }
+            Ok(())
+        }
+        BisectCmd::Good | BisectCmd::Bad => {
+            let is_good = matches!(sub, BisectCmd::Good);
+            let (root, conn) = open_repo()?;
+            match crate::bisect::step(&conn, &root, is_good)? {
+                crate::bisect::Step::Test(id) => {
+                    println!("testing {}", id);
+                    Ok(())
+                }
+                crate::bisect::Step::Found(id) => {
+                    // Restoring the tree is part of finishing, not a separate
+                    // thing to remember.
+                    crate::bisect::finish(&conn, &root)?;
+                    println!("first bad changeset: {}", id);
+                    println!("the working tree is back at the branch head");
+                    if let Ok(Some((msg, author))) = conn
+                        .query_row(
+                            "SELECT message, author FROM changesets WHERE id = ?1",
+                            rusqlite::params![id],
+                            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                        )
+                        .map(Some)
+                    {
+                        println!("  {} by {}", msg, author);
+                    }
+                    Ok(())
+                }
+            }
+        }
+        BisectCmd::Status => {
+            let (_root, conn) = open_repo()?;
+            match crate::bisect::load(&conn)? {
+                None => {
+                    println!("no bisect running");
+                    Ok(())
+                }
+                Some(s) => {
+                    println!("good:       {}", s.good);
+                    println!("bad:        {}", s.bad);
+                    println!("remaining:  {} candidate(s)", s.candidates.len());
+                    println!("questions:  {}", s.steps);
+                    if let Some(cur) = s.current {
+                        println!("testing:    {}", cur);
+                    }
+                    Ok(())
+                }
+            }
+        }
+        BisectCmd::Cancel => {
+            let (root, conn) = open_repo()?;
+            if crate::bisect::load(&conn)?.is_none() {
+                println!("no bisect running");
+                return Ok(());
+            }
+            let n = crate::bisect::finish(&conn, &root)?;
+            println!("bisect cancelled, {} file(s) restored to the head", n);
+            Ok(())
+        }
+    }
+}

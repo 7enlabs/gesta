@@ -4,6 +4,7 @@
 //! and history, three-way merge, remote sync, and an operation log for undo.
 
 mod auth;
+mod bisect;
 mod cache;
 mod cli;
 mod cli_remote;
@@ -194,6 +195,11 @@ enum Cmd {
         /// File or `.` to restore the whole working tree
         file: String,
     },
+    /// Search the history for the changeset that introduced a fault
+    Bisect {
+        #[command(subcommand)]
+        sub: BisectCmd,
+    },
     /// Save the working tree aside and reset it to the head
     Stash {
         #[command(subcommand)]
@@ -292,6 +298,19 @@ enum ChangesetCmd {
     Diff { id: String },
     /// List pending changesets
     List,
+}
+
+#[derive(Subcommand)]
+enum BisectCmd {
+    /// Begin a search between a known good and a known bad changeset
+    Start { good: String, bad: String },
+    /// Report the changeset under test as good, or as bad
+    Good,
+    Bad,
+    /// Show the state of the search
+    Status,
+    /// Abandon the search and put the working tree back
+    Cancel,
 }
 
 #[derive(Subcommand)]
@@ -500,6 +519,7 @@ fn run() -> ZResult<()> {
         Cmd::Branch { sub } if json => cli::cmd_branch_json(sub),
         Cmd::Changeset { sub } if json => cli::cmd_changeset_json(sub),
         Cmd::Sparse { sub } => cli::cmd_sparse(sub),
+        Cmd::Bisect { sub } => cli::cmd_bisect(sub),
         Cmd::Stash { sub } => cli::cmd_stash(sub, json),
         Cmd::Hook { sub } => cli::cmd_hook(sub),
         Cmd::Init { bare } => cli::cmd_init(bare),

@@ -56,6 +56,10 @@ gesta blame src/main.rs
 | `hook list` | Which hooks are installed |
 | `hook install <name> [--file F]` | Write a hook, reading stdin when no file is given |
 | `hook remove <name>` | Remove a hook |
+| `bisect start <good> <bad>` | Begin a search for the changeset that introduced a fault |
+| `bisect good \| bad` | Answer about the changeset under test |
+| `bisect status` | Remaining candidates and questions asked |
+| `bisect cancel` | Abandon the search and restore the working tree |
 | `undo` | Undo the last operation |
 | `ops [--limit N]` | Operation log |
 | `tag <name> [--list]` | Named pointer to a changeset |
@@ -70,6 +74,17 @@ gesta blame src/main.rs
 | `fsck [--prune]` | Verify integrity, optionally drop orphan objects |
 | `stats` | Object counts and compression ratio |
 | `ignore add/list/remove` | Ignore patterns |
+
+### Bisect
+
+`bisect` writes candidate changesets onto the working tree and asks whether each
+one is good or bad. The answer can come in a later command, so a caller can test,
+answer, and test again. The branch head never moves and the working tree is
+restored when the search ends, whether it found the answer or was cancelled.
+
+The order of candidates comes from the parent chain, never from creation time.
+Commits made in one burst share a timestamp to the second, and a binary search
+over an arbitrary order cuts the wrong half.
 
 ### Hooks
 

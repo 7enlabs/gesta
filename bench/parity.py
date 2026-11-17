@@ -206,8 +206,61 @@ def main():
     sh(f"{GESTA} hook remove pre-commit", cwd=repo)
     sh(f"{GESTA} hook remove post-commit", cwd=repo)
 
-    # 11. Things a daily user will look for and not find.
-    for missing in ("bisect", "rebase", "cherry-pick", "submodule"):
+    # 11. Bisect finds the changeset that introduced a fault.
+    bs = os.path.join(ROOT, "bisect")
+    os.makedirs(bs)
+    sh(f"{GESTA} init", cwd=bs)
+    ids = []
+    for i in range(1, 13):
+        # Every step has to change the content, or there is nothing to commit and
+        # the history never gets long enough to search.
+        tag = "good" if i < 7 else "FAULT"
+        body = f"version {i} {tag}\n"
+        with open(os.path.join(bs, "f.txt"), "w") as fh:
+            fh.write(body)
+        r = sh(f"{GESTA} changeset create v{i} --author bench", cwd=bs)
+        m = re.search(r"\b(cs[0-9a-f]{6,})\b", r.stdout)
+        if m:
+            sh(f"{GESTA} changeset commit {m.group(1)}", cwd=bs)
+            ids.append(m.group(1))
+
+    if len(ids) == 12:
+        r = sh(f"{GESTA} bisect start {ids[0]} {ids[-1]}", cwd=bs)
+        check("bisect starts", r.returncode == 0, r.stdout + r.stderr)
+
+        questions = 0
+        found = None
+        while questions < 8:
+            body = open(os.path.join(bs, "f.txt")).read()
+            ok = "FAULT" not in body
+            questions += 1
+            out = sh(f"{GESTA} bisect {'good' if ok else 'bad'}", cwd=bs).stdout
+            if "first bad changeset" in out:
+                found = [l for l in out.splitlines() if l.startswith("first bad")][0].split()[-1]
+                break
+        # v7 is the first bad one, which is ids[6].
+        check("bisect names the first bad changeset", found == ids[6], f"got {found}, want {ids[6]}")
+        check(
+            "bisect asks a logarithmic number of questions",
+            questions <= 6,
+            f"took {questions} questions for 12 changesets",
+        )
+        body = open(os.path.join(bs, "f.txt")).read()
+        check("bisect restores the working tree", "FAULT" in body, body)
+        out = sh(f"{GESTA} bisect status", cwd=bs).stdout
+        check("bisect is finished after answering", "no bisect running" in out, out)
+
+        # Cancelling must also restore, which is what makes it safe to interrupt.
+        sh(f"{GESTA} bisect start {ids[0]} {ids[-1]}", cwd=bs)
+        r = sh(f"{GESTA} bisect cancel", cwd=bs)
+        check("bisect cancel succeeds", r.returncode == 0, r.stdout + r.stderr)
+        body = open(os.path.join(bs, "f.txt")).read()
+        check("bisect cancel restores the tree", "FAULT" in body, body)
+    else:
+        check("bisect could build its history", False, f"only {len(ids)} changesets")
+
+    # 12. Things a daily user will look for and not find.
+    for missing in ("rebase", "cherry-pick", "submodule"):
         r = sh(f"{GESTA} {missing} --help", cwd=repo)
         check(f"{missing} is absent (known gap)", r.returncode != 0)
 

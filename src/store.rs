@@ -496,6 +496,15 @@ pub fn current_branch(conn: &Connection) -> ZResult<String> {
 
 // graph.
 
+/// Parents of a changeset. Public so a history walk outside this module can
+/// follow the chain without duplicating the query.
+pub fn parents_of_public(
+    conn: &Connection,
+    id: &str,
+) -> ZResult<(Option<String>, Option<String>)> {
+    parents_of(conn, id)
+}
+
 fn parents_of(conn: &Connection, id: &str) -> ZResult<(Option<String>, Option<String>)> {
     Ok(conn
         .query_row(
