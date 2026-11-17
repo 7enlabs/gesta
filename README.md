@@ -150,7 +150,7 @@ src/worktree.rs   file scanning and UTF-8 reads
 
 ## Known gaps
 
-`docs/nang-cap.md` holds the measured upgrade plan. `bench/bench.py` reproduces every number in it. The headline findings on v0.2.0:
+`docs/upgrade-plan.md` holds the measured upgrade plan. `bench/bench.py` reproduces every number in it. The headline findings on v0.2.0:
 
 | Gap | Measured |
 |---|---|

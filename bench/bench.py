@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reproducible measurements behind docs/nang-cap.md.
+"""Reproducible measurements behind docs/upgrade-plan.md.
 
 Run inside the workspace container:
     python3 bench/bench.py
@@ -228,7 +228,7 @@ def main():
     bench_blame_moved_line()
     bench_orphan_objects()
     bench_missing_commands()
-    print("\nDone. Numbers above feed docs/nang-cap.md.")
+    print("\nDone. Numbers above feed docs/upgrade-plan.md.")
 
 
 if __name__ == "__main__":
