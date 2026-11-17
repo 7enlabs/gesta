@@ -112,6 +112,25 @@ pub fn print_renames(conn: &rusqlite::Connection, id: &str) -> ZResult<()> {
     Ok(())
 }
 
+/// What the repository does have, for an error that just said what it does not.
+///
+/// A message that names the missing value and stops leaves the reader guessing whether they
+/// typed it wrong or never made it. Listing what exists answers that in the same line.
+fn branch_names(conn: &rusqlite::Connection) -> String {
+    let mut stmt = match conn.prepare("SELECT name FROM branches ORDER BY name LIMIT 8") {
+        Ok(s) => s,
+        Err(_) => return String::new(),
+    };
+    let names: Vec<String> = match stmt.query_map([], |r| r.get::<_, String>(0)) {
+        Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+        Err(_) => return String::new(),
+    };
+    if names.is_empty() {
+        return "; no branches yet, create one with `gesta branch create <name>`".to_string();
+    }
+    format!("; known branches: {}", names.join(", "))
+}
+
 /// Pending changesets whose recorded content no longer matches the working tree.
 ///
 /// This is what a lost update looks like from the outside: two writers snapshot the same
@@ -899,9 +918,8 @@ pub fn cmd_branch_delete(name: &str) -> ZResult<()> {
     if name == cur {
         return Err(bad(format!("cannot delete the branch you are on ({})", name)));
     }
-    let exists = branch_head(&conn, name).is_ok();
-    if !exists {
-        return Err(bad(format!("no such branch: {}", name)));
+    if branch_head(&conn, name).is_err() {
+        return Err(bad(format!("no such branch: {}{}", name, branch_names(&conn))));
     }
     conn.execute("DELETE FROM branches WHERE name = ?1", rusqlite::params![name])?;
     // The derived tree goes with the branch. Leaving it behind would make a
@@ -1001,7 +1019,7 @@ pub fn cmd_branch_info(name: &str) -> ZResult<()> {
                 ))
             },
         )
-        .map_err(|_| bad(format!("no such branch: {}", name)))?;
+        .map_err(|_| bad(format!("no such branch: {}{}", name, branch_names(&conn))))?;
 
     println!("branch:      {}", name);
     println!("created:     {}", fmt_ts(ts));

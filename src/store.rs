@@ -792,7 +792,25 @@ pub fn branch_head(conn: &Connection, branch: &str) -> ZResult<Option<String>> {
         r.get::<_, Option<String>>(0)
     })
     .optional()?
-    .ok_or_else(|| bad(format!("no such branch: {}", branch)))
+    .ok_or_else(|| {
+        // Name what exists, so a typo reads as a typo. A message that only says what is
+        // missing leaves the reader unsure whether the branch was never made.
+        let known: Vec<String> = conn
+            .prepare("SELECT name FROM branches ORDER BY name LIMIT 8")
+            .and_then(|mut s| {
+                let rows = s.query_map([], |r| r.get::<_, String>(0))?;
+                Ok(rows.filter_map(|r| r.ok()).collect())
+            })
+            .unwrap_or_default();
+        if known.is_empty() {
+            bad(format!(
+                "no such branch: {}; there are no branches yet, create one with `gesta branch create <name>`",
+                branch
+            ))
+        } else {
+            bad(format!("no such branch: {}; known branches: {}", branch, known.join(", ")))
+        }
+    })
 }
 
 // id allocation.
