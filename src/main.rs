@@ -745,6 +745,13 @@ enum IgnoreCmd {
     List,
     /// Remove a pattern
     Remove { pattern: String },
+    /// Say whether a path is ignored, and which rule decides it
+    Why {
+        path: String,
+        /// Answer as JSON
+        #[arg(long)]
+        json_why: bool,
+    },
 }
 
 /// Exit quietly when the reader closed the pipe.
@@ -999,6 +1006,9 @@ fn run() -> ZResult<()> {
             IgnoreCmd::Add { pattern } => cli_remote::cmd_ignore_add(&pattern),
             IgnoreCmd::List => cli_remote::cmd_ignore_list(),
             IgnoreCmd::Remove { pattern } => cli_remote::cmd_ignore_remove(&pattern),
+            IgnoreCmd::Why { path, json_why } => {
+                cli_remote::cmd_ignore_why(&path, json_why || json)
+            }
         },
     }
 }

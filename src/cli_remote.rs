@@ -785,6 +785,121 @@ pub fn cmd_ignore_list() -> ZResult<()> {
     Ok(())
 }
 
+/// Why a path is or is not ignored, and which rule decides it.
+///
+/// The list command prints the rules and leaves the reader to work out which one applies, which
+/// is where a `!` negation and a rooted pattern stop being obvious. Answering for one path is the
+/// question people actually ask, and it is the difference between having rules and being able to
+/// explain them.
+pub fn cmd_ignore_why(path: &str, json: bool) -> ZResult<()> {
+    let (root, conn) = open_repo()?;
+    // Each source keeps its label, so the answer names where the deciding rule came from.
+    let mut sources: Vec<(String, Vec<String>)> = Vec::new();
+    for name in [".zenignore", ".gitignore"] {
+        if let Ok(text) = fs::read_to_string(root.join(name)) {
+            let rules: Vec<String> = text
+                .lines()
+                .map(|l| l.trim())
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .map(|l| l.to_string())
+                .collect();
+            if !rules.is_empty() {
+                sources.push((name.to_string(), rules));
+            }
+        }
+    }
+    {
+        let mut stored: Vec<String> = Vec::new();
+        let mut stmt = conn.prepare("SELECT pattern FROM ignore_rules ORDER BY pattern")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        for r in rows {
+            stored.push(r?);
+        }
+        if !stored.is_empty() {
+            sources.push(("gesta ignore add".to_string(), stored));
+        }
+    }
+    sources.push((
+        "built-in defaults".to_string(),
+        crate::worktree::DEFAULT_IGNORES
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    ));
+
+    let rel = crate::normalise(path);
+    // The same question the scanner asks, so the answer cannot disagree with the scan.
+    let all: Vec<String> = sources.iter().flat_map(|(_, r)| r.iter().cloned()).collect();
+    let ignored = crate::worktree::IgnoreRules::new(all).is_ignored(&rel, false);
+
+    // The deciding rule is the last one that matches, because a later negation undoes an earlier
+    // pattern. Each rule is tried on its own, without its `!`, so the question is "does this
+    // rule's shape cover the path", and the last one that does is the one the scan ended on.
+    let mut deciding: Option<(String, String)> = None;
+    for (source, rules) in &sources {
+        for rule in rules {
+            let body = rule.trim_start_matches('!');
+            let solo = crate::worktree::IgnoreRules::new(vec![body.to_string()]);
+            if solo.is_ignored(&rel, false) {
+                deciding = Some((source.clone(), rule.clone()));
+            }
+        }
+    }
+
+    if json {
+        let mut obj = vec![
+            ("path", crate::json::Json::str(rel.clone())),
+            ("ignored", crate::json::Json::Bool(ignored)),
+            ("patterns", crate::json::Json::int(
+                sources.iter().map(|(_, r)| r.len()).sum::<usize>() as i64,
+            )),
+        ];
+        match &deciding {
+            Some((source, rule)) => {
+                obj.push(("rule", crate::json::Json::str(rule.clone())));
+                obj.push(("source", crate::json::Json::str(source.clone())));
+            }
+            None => {
+                obj.push(("rule", crate::json::Json::Null));
+                obj.push(("source", crate::json::Json::Null));
+            }
+        }
+        crate::cli::emit_object(obj);
+        return Ok(());
+    }
+
+    if ignored {
+        println!("{} is ignored", rel);
+        if let Some((source, rule)) = &deciding {
+            println!("  by rule: {}  (from {})", rule, source);
+        }
+    } else {
+        println!("{} is not ignored", rel);
+        // A path that a rule would have caught and a negation rescued is the case people ask
+        // about. Saying only "not ignored" leaves them hunting for the rule that saved it.
+        if let Some((_source, rule)) = &deciding {
+            println!("  a rule covers it, and one of these puts it back:");
+            for (src, rules) in &sources {
+                for r in rules.iter().filter(|r| r.starts_with('!')) {
+                    let restored = crate::worktree::IgnoreRules::new(vec![r.clone()]);
+                    if crate::worktree::IgnoreRules::new(vec![rule.trim_start_matches('!').to_string()])
+                        .is_ignored(&rel, false)
+                        && !restored.is_ignored(&rel, false)
+                    {
+                        println!("    {}  (from {})", r, src);
+                    }
+                }
+            }
+        }
+    }
+    println!(
+        "  {} pattern(s) across {} source(s)",
+        sources.iter().map(|(_, r)| r.len()).sum::<usize>(),
+        sources.len()
+    );
+    Ok(())
+}
+
 pub fn cmd_ignore_remove(pattern: &str) -> ZResult<()> {
     let (_root, conn) = open_repo()?;
     let n = conn.execute(

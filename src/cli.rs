@@ -1463,6 +1463,11 @@ pub const SCHEMA_VERSION: &str = "gesta@1";
 /// object to a document that already went out.
 pub static JSON_PRINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Emit an object built outside this module, for a caller that needs the same schema stamp.
+pub fn emit_object(fields: Vec<(&str, Json)>) {
+    emit(Json::obj(fields));
+}
+
 fn emit(v: Json) {
     JSON_PRINTED.store(true, std::sync::atomic::Ordering::Relaxed);
     println!("{}", with_schema(v).render_pretty());

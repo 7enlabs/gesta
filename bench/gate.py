@@ -909,6 +909,63 @@ def main():
             ok3, why3 = False, f"ls --json broke: {exc}"
         record("ls --json parses alongside the rest", ok3, why3)
 
+    if want("ignore-why"):
+        # Having rules and being able to explain them are different things. A negation that
+        # rescues a path is the case people actually ask about.
+        import tempfile as _tf
+        import json as _json
+        d = _tf.mkdtemp()
+        sh(f"{ZF} init", cwd=d)
+        with open(os.path.join(d, ".gitignore"), "w") as fh:
+            fh.write("target/\n*.log\n!keep.log\nbuild*\n")
+
+        anchored = sh(f"{ZF} ignore why target/debug/x", cwd=d)
+        record(
+            "ignore why names the anchored rule that matches",
+            "is ignored" in (anchored[1] or "") and "target/" in (anchored[1] or ""),
+            (anchored[1] or "")[:200],
+        )
+        record(
+            "and names the file the rule came from",
+            ".gitignore" in (anchored[1] or ""),
+            (anchored[1] or "")[:200],
+        )
+
+        suffix = sh(f"{ZF} ignore why app.log", cwd=d)
+        record(
+            "a suffix rule is named for a matching path",
+            "*.log" in (suffix[1] or ""),
+            (suffix[1] or "")[:200],
+        )
+
+        negated = sh(f"{ZF} ignore why keep.log", cwd=d)
+        record(
+            "a negated rule explains why the path is not ignored",
+            "not ignored" in (negated[1] or "") and "!keep.log" in (negated[1] or ""),
+            (negated[1] or "")[:240],
+        )
+
+        clean = sh(f"{ZF} ignore why src/main.rs", cwd=d)
+        record(
+            "a path nothing matches is reported plainly",
+            "not ignored" in (clean[1] or ""),
+            (clean[1] or "")[:160],
+        )
+
+        js = sh_out(f"{ZF} --json ignore why target/debug/x", cwd=d)
+        try:
+            payload = _json.loads(js[1])
+            ok = (
+                payload.get("ignored") is True
+                and payload.get("rule") == "target/"
+                and payload.get("source") == ".gitignore"
+                and payload.get("schema")
+            )
+            why = js[1][:220]
+        except Exception as exc:
+            ok, why = False, f"not JSON: {exc}"
+        record("ignore why --json carries the rule, the source and the schema", ok, why)
+
     if want("gc"):
         # A repository that only grows is a repository that gets slower and bigger forever. The
         # check plants an object nothing references and asks gc to remove exactly that one.
