@@ -454,6 +454,63 @@ def main():
             (check[1] or "")[:160],
         )
 
+    if want("ls"):
+        # Listing the tree is the first thing anything does with a repository, and it did not
+        # exist: the only way to discover a path was to guess or to read the whole log.
+        import tempfile as _tf
+        d = _tf.mkdtemp()
+        os.makedirs(os.path.join(d, "src", "deep"), exist_ok=True)
+        for rel in ["a.txt", "src/b.rs", "src/deep/c.rs"]:
+            with open(os.path.join(d, rel), "w") as fh:
+                fh.write("x\n")
+        sh(f"{ZF} init", cwd=d)
+        sh(f'{ZF} changeset create one --author t', cwd=d)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=d)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+
+        listed = sh(f"{ZF} ls", cwd=d)
+        got = sorted(x for x in (listed[1] or "").split("\n") if x.strip())
+        expected = ["a.txt", "src/b.rs", "src/deep/c.rs"]
+        record(
+            "ls names every file in the head tree",
+            got == expected,
+            f"{got}",
+        )
+
+        sub = sh(f"{ZF} ls --path src", cwd=d)
+        subbed = sorted(x for x in (sub[1] or "").split("\n") if x.strip())
+        record(
+            "ls --path limits to a prefix",
+            subbed == ["src/b.rs", "src/deep/c.rs"],
+            f"{subbed}",
+        )
+
+        long_form = sh(f"{ZF} ls --long --path src/deep", cwd=d)
+        record(
+            "ls --long prints the content hash beside the path",
+            long_form[0] == 0 and len((long_form[1] or "").split()) == 2,
+            (long_form[1] or "")[:120],
+        )
+
+        js = sh_out(f"{ZF} --json ls", cwd=d)
+        import json as _json
+        try:
+            payload = _json.loads(js[1])
+            ok = payload.get("count") == 3 and len(payload.get("files", [])) == 3
+            why = js[1][:160]
+        except Exception as exc:
+            ok = False
+            why = f"not JSON: {exc}"
+        record("ls --json parses with a count and the files", ok, why)
+
+        unknown = sh(f"{ZF} ls nosuch", cwd=d)
+        record(
+            "ls on an unknown revision exits 3",
+            unknown[0] == 3,
+            f"exit {unknown[0]}",
+        )
+
     if want("gc"):
         # A repository that only grows is a repository that gets slower and bigger forever. The
         # check plants an object nothing references and asks gc to remove exactly that one.

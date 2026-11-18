@@ -156,6 +156,20 @@ pub fn create_changeset(
     if let Some(first) = scanned.unreadable.first() {
         return Err(bad(format!("cannot read {} ({} more)", first, scanned.unreadable.len() - 1)));
     }
+    // Two files on disk can name one repository path only if a name means something different
+    // from what the store thinks a separator is. Say which two, rather than letting the insert
+    // fail on a primary key and reporting a database constraint to somebody who asked about files.
+    {
+        let mut seen_rel: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for f in &scanned.files {
+            if !seen_rel.insert(f.rel.as_str()) {
+                return Err(bad(format!(
+                    "two files on disk map to one repository path: {}\na directory name and a file name differ only in the separator byte, and a repository path holds one of them",
+                    f.rel
+                )));
+            }
+        }
+    }
     for f in scanned.files {
         if !scope.contains(&f.rel) {
             continue;

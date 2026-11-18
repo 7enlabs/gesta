@@ -761,6 +761,75 @@ pub fn cmd_git_pull(remote: &str, prefix: Option<&str>) -> ZResult<()> {
     Ok(())
 }
 
+/// List the files a revision holds, the way `git ls-tree -r --name-only` does.
+///
+/// An agent that has just been handed a repository needs this before it can name a path:
+/// without it the only way to discover the tree is to read every file the log mentions or to
+/// guess. Printing one path per line is also what makes the output pipeable.
+pub fn cmd_ls(rev: Option<&str>, prefix: Option<&str>, long: bool) -> ZResult<()> {
+    let (_root, conn) = open_repo()?;
+    for (path, hash) in ls_entries(&conn, rev, prefix)? {
+        if long {
+            println!("{} {}", &hash[..hash.len().min(12)], path);
+        } else {
+            println!("{}", path);
+        }
+    }
+    Ok(())
+}
+
+/// The same list as one JSON object, so a caller does not parse lines.
+pub fn cmd_ls_json(rev: Option<&str>, prefix: Option<&str>) -> ZResult<()> {
+    let (_root, conn) = open_repo()?;
+    let entries = ls_entries(&conn, rev, prefix)?;
+    emit(crate::json::Json::obj(vec![
+        (
+            "files",
+            crate::json::Json::arr(
+                entries
+                    .iter()
+                    .map(|(p, h)| {
+                        crate::json::Json::obj(vec![
+                            ("path", crate::json::Json::str(p.clone())),
+                            ("hash", crate::json::Json::str(h.clone())),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        ("count", crate::json::Json::int(entries.len() as i64)),
+    ]));
+    Ok(())
+}
+
+/// Resolve the revision, then hand back its tree sorted by path.
+fn ls_entries(
+    conn: &rusqlite::Connection,
+    rev: Option<&str>,
+    prefix: Option<&str>,
+) -> ZResult<Vec<(String, String)>> {
+    let head = match rev {
+        Some(r) => crate::store::resolve_rev(conn, r)?
+            .ok_or_else(|| crate::error::Error::not_found(format!("no such revision: {}", r)))?,
+        None => {
+            let branch = current_branch(conn)?;
+            crate::store::branch_head(conn, &branch)?.ok_or_else(|| {
+                Box::new(crate::error::Error::new(
+                    crate::error::Code::NotFound,
+                    format!("branch {} has no changesets yet", branch),
+                )) as Box<dyn std::error::Error>
+            })?
+        }
+    };
+    let mut tree: Vec<(String, String)> = crate::repo::tree_at(conn, &head)?.into_iter().collect();
+    tree.sort_by(|a, b| a.0.cmp(&b.0));
+    if let Some(p) = prefix {
+        let p = crate::normalise(p);
+        tree.retain(|(path, _)| path == &p || path.starts_with(&format!("{}/", p.trim_end_matches('/'))));
+    }
+    Ok(tree)
+}
+
 /// Read a git repository into this one.
 pub fn cmd_git_import(path: &str, prefix: Option<&str>) -> ZResult<()> {
     let (_root, conn) = open_repo()?;

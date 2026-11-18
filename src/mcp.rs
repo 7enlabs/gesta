@@ -41,6 +41,20 @@ pub fn tool_definitions() -> Json {
             ]),
         ),
         tool(
+            "gesta_ls",
+            "List the files a revision holds, so a path can be named without guessing. Use this before reading or editing anything: it answers what exists at that point.",
+            Json::obj(vec![
+                ("type", Json::str("object")),
+                (
+                    "properties",
+                    Json::obj(vec![
+                        ("rev", Json::obj(vec![("type", Json::str("string")), ("description", Json::str("Branch, tag or changeset. Default the current branch."))])),
+                        ("path", Json::obj(vec![("type", Json::str("string")), ("description", Json::str("Only paths under this prefix."))])),
+                    ]),
+                ),
+            ]),
+        ),
+        tool(
             "gesta_read_file",
             "Read a file from the repository without checking it out. Pass a changeset or branch to read an older version.",
             Json::obj(vec![
@@ -295,6 +309,7 @@ fn call_tool(root: &Path, params: &Json) -> Result<Json, ToolError> {
         "gesta_status" => tool_status(&conn),
         "gesta_log" => tool_log(&conn, &args),
         "gesta_read_file" => tool_read_file(&conn, &args),
+        "gesta_ls" => tool_ls(&conn, &args),
         "gesta_blame" => tool_blame(&conn, &args),
         "gesta_diff" => tool_diff(&conn, root, &args),
         "gesta_merge_conflicts" => tool_merge_conflicts(&conn, root, &args),
@@ -449,6 +464,36 @@ fn tool_log(conn: &Connection, args: &Json) -> Result<Json, String> {
         .map_err(|e| e.to_string())?;
     let out = rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?;
     Ok(Json::arr(out))
+}
+
+fn tool_ls(conn: &Connection, args: &Json) -> Result<Json, String> {
+    let rev = match arg_str(args, "rev") {
+        Some(r) => r,
+        None => current_branch(conn).map_err(|e| e.to_string())?,
+    };
+    let cs = crate::store::resolve_rev(conn, &rev)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no such branch, tag or changeset: {}", rev))?;
+    let mut tree: Vec<(String, String)> = crate::repo::tree_at(conn, &cs)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .collect();
+    tree.sort_by(|a, b| a.0.cmp(&b.0));
+    if let Some(prefix) = arg_str(args, "path") {
+        let p = crate::normalise(&prefix);
+        let p = p.trim_end_matches('/');
+        tree.retain(|(path, _)| {
+            path == p || path.starts_with(&format!("{}/", p))
+        });
+    }
+    Ok(Json::obj(vec![
+        (
+            "files",
+            Json::arr(tree.iter().map(|(p, _)| Json::str(p.clone())).collect()),
+        ),
+        ("count", Json::int(tree.len() as i64)),
+        ("rev", Json::str(rev)),
+    ]))
 }
 
 fn tool_read_file(conn: &Connection, args: &Json) -> Result<Json, String> {

@@ -111,7 +111,15 @@ fn fmt_ts(ts: i64) -> String {
 }
 
 pub fn normalise(file: &str) -> String {
-    file.replace('\\', "/")
+    // The separator is a platform fact. On Windows a user types `src\\main.rs` and means the
+    // directory separator. On Unix a backslash is an ordinary character in a file name, so
+    // rewriting it turns `back\\slash.txt` into a different file that may not exist, and a read
+    // that worked before the path fix stopped working after it.
+    if cfg!(windows) {
+        file.replace('\\', "/")
+    } else {
+        file.to_string()
+    }
 }
 
 pub fn repo_root() -> ZResult<PathBuf> {
@@ -242,6 +250,17 @@ enum Cmd {
     Show {
         /// Path, optionally as `rev:path`
         spec: String,
+    },
+    /// List the files a revision holds
+    Ls {
+        /// A branch, a tag or a changeset; the working branch when omitted
+        rev: Option<String>,
+        /// Only paths under this prefix
+        #[arg(long)]
+        path: Option<String>,
+        /// Print the content hash beside each path
+        #[arg(long)]
+        long: bool,
     },
     /// Import from or export to a git repository, without calling git
     Git {
@@ -843,6 +862,8 @@ fn run() -> ZResult<()> {
         Cmd::Blame { file } => cli::cmd_blame(&file),
         Cmd::History { file } => cli::cmd_history(&file),
         Cmd::Show { spec } => cli::cmd_show(&spec),
+        Cmd::Ls { rev, path, long: _ } if json => cli::cmd_ls_json(rev.as_deref(), path.as_deref()),
+        Cmd::Ls { rev, path, long } => cli::cmd_ls(rev.as_deref(), path.as_deref(), long),
         Cmd::Git { sub } => match sub {
             GitCmd::Import { path, path_prefix } => cli::cmd_git_import(&path, path_prefix.as_deref()),
             GitCmd::Export { path, branch } => cli::cmd_git_export(&path, branch.as_deref()),

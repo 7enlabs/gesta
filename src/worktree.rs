@@ -519,10 +519,33 @@ pub fn scan_files_excluding(
     Ok(out)
 }
 
-/// Path relative to `root`, always with `/` separators so the database is
-/// portable across platforms.
+/// Path relative to `root`, with `/` between components.
+///
+/// The separators are rebuilt from the path components rather than by replacing every
+/// backslash in the joined string. On Unix a backslash is an ordinary character in a file
+/// name: `back\\slash.txt` and `back/slash.txt` are two different files, and a blanket replace
+/// turned them into one path, which then collided on the primary key and failed the commit with
+/// a message about a database constraint rather than about the file.
 pub fn rel_path(root: &Path, p: &Path) -> String {
-    p.strip_prefix(root).unwrap_or(p).to_string_lossy().replace('\\', "/")
+    let rel = p.strip_prefix(root).unwrap_or(p);
+    let mut out = String::with_capacity(rel.as_os_str().len());
+    let mut first = true;
+    for part in rel.components() {
+        use std::path::Component;
+        let text = match part {
+            Component::Normal(s) => s.to_string_lossy(),
+            // A relative path under the root never holds these; keep them out rather than
+            // letting `..` or a root prefix end up inside a repository path.
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => continue,
+            Component::ParentDir => "..".into(),
+        };
+        if !first {
+            out.push('/');
+        }
+        out.push_str(&text);
+        first = false;
+    }
+    out
 }
 
 /// Outcome of reading a file as text.
@@ -848,5 +871,32 @@ mod tests {
         assert!(!rules.is_ignored("src/target/x", false), "a nested one matched an anchored rule");
         // And a non-ASCII path in front of it must not trip the byte slice.
         assert!(!rules.is_ignored("tồ/target/x", false));
+    }
+    #[test]
+    fn a_backslash_in_a_file_name_is_not_a_separator() {
+        // Two different files on a Unix disk. A blanket replace made them one path.
+        let root = std::path::Path::new("/repo");
+        let one = root.join("back\\slash.txt");
+        let two = root.join("back").join("slash.txt");
+        let a = rel_path(root, &one);
+        let b = rel_path(root, &two);
+        assert_eq!(a, "back\\slash.txt", "a backslash in a name was rewritten");
+        assert_eq!(b, "back/slash.txt");
+        assert_ne!(a, b, "two different files became one path");
+    }
+
+    #[test]
+    fn nesting_is_joined_with_forward_slashes() {
+        let root = std::path::Path::new("/repo");
+        let p = root.join("a").join("b").join("c.md");
+        assert_eq!(rel_path(root, &p), "a/b/c.md");
+        assert_eq!(rel_path(root, &root.join("x.txt")), "x.txt");
+    }
+
+    #[test]
+    fn a_vietnamese_name_survives_the_path_round_trip() {
+        let root = std::path::Path::new("/repo");
+        let p = root.join("tài-liệu").join("ghi-chú.md");
+        assert_eq!(rel_path(root, &p), "tài-liệu/ghi-chú.md");
     }
 }
