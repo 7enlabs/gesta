@@ -578,9 +578,12 @@ pub fn get_object(conn: &Connection, hash: &str) -> ZResult<String> {
     // The hash is the contract. A rebuild that does not match means the store is
     // corrupt, and returning the wrong bytes would hide it.
     if hash_content(&rebuilt) != hash {
-        return Err(bad(format!(
-            "rebuilt object {} does not match its hash",
-            hash
+        // The hash is the contract, so a rebuild that disagrees means the store holds bytes it
+        // cannot vouch for. That is corruption, not a missing name, and the caller should stop
+        // and run fsck rather than retry.
+        return Err(Box::new(crate::error::Error::new(
+            crate::error::Code::Corrupt,
+            format!("rebuilt object {} does not match its hash", hash),
         )));
     }
     Ok(rebuilt)

@@ -24,6 +24,7 @@ mod mcp;
 mod error;
 mod merge;
 mod ops;
+mod packfile;
 mod remote;
 mod rebase;
 mod repo;

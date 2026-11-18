@@ -662,6 +662,70 @@ def main():
             f"push {pushed[0]} clone {cloned[0]} {(cloned[1] or '')[:120]}",
         )
 
+    if want("packfile"):
+        # A repository after `git gc` holds no loose objects: everything is in a pack. An import
+        # that only reads loose objects works on a repository nobody has used.
+        import shutil as _shutil
+        import tempfile as _tf
+        if not _shutil.which("git"):
+            record("git is available", False, "git is not on PATH")
+        else:
+            src = _tf.mkdtemp()
+            sh(f"git init -q -b main {src}")
+            sh("git config user.email t@e.st && git config user.name T", cwd=src)
+            for i in range(1, 5):
+                with open(os.path.join(src, "a.txt"), "w") as fh:
+                    fh.write(f"v{i}\n")
+                os.makedirs(os.path.join(src, "sub"), exist_ok=True)
+                with open(os.path.join(src, "sub", "b.txt"), "w") as fh:
+                    fh.write("deep\n")
+                sh(f"git add -A && git commit -qm c{i}", cwd=src)
+            sh("git gc -q 2>/dev/null", cwd=src)
+            loose = 0
+            for _root, _dirs, files in os.walk(os.path.join(src, ".git", "objects")):
+                if "pack" in _root:
+                    continue
+                loose += len(files)
+            record(
+                "the fixture really is packed",
+                os.path.isdir(os.path.join(src, ".git", "objects", "pack"))
+                and any(f.endswith(".pack") for f in os.listdir(os.path.join(src, ".git", "objects", "pack"))),
+                f"{loose} loose objects",
+            )
+
+            dest = _tf.mkdtemp()
+            sh(f"{ZF} init", cwd=dest)
+            got = sh(f"{ZF} git import {src}", cwd=dest)
+            record(
+                "a packed git repository imports",
+                got[0] == 0 and "imported" in (got[1] or ""),
+                (got[1] or "")[:200],
+            )
+            listed = sh(f"{ZF} ls", cwd=dest)
+            record(
+                "every path came through from the pack",
+                "a.txt" in (listed[1] or "") and "sub/b.txt" in (listed[1] or ""),
+                (listed[1] or "")[:200],
+            )
+            body = sh(f"{ZF} show main:a.txt", cwd=dest)
+            record(
+                "and the content of a packed blob is right",
+                body[0] == 0 and (body[1] or "").strip() == "v4",
+                (body[1] or "")[:120],
+            )
+            deep = sh(f"{ZF} show main:sub/b.txt", cwd=dest)
+            record(
+                "a nested path inside the pack reads too",
+                deep[0] == 0 and (deep[1] or "").strip() == "deep",
+                (deep[1] or "")[:120],
+            )
+            # A branch ref after `git gc` lives in packed-refs, not in refs/heads.
+            record(
+                "the branch was found through packed-refs",
+                "main" in (got[1] or ""),
+                (got[1] or "")[:160],
+            )
+
     if want("gc"):
         # A repository that only grows is a repository that gets slower and bigger forever. The
         # check plants an object nothing references and asks gc to remove exactly that one.

@@ -209,13 +209,10 @@ impl Repo {
     pub fn read_object(&self, hash: &str) -> ZResult<Object> {
         let path = self.object_path(hash);
         if !path.exists() {
-            return Err(Box::new(crate::error::Error::new(
-                crate::error::Code::Corrupt,
-                format!(
-                    "object {} is not a loose object here. A repository written only as a packfile needs `git gc` to give its objects back",
-                    hash
-                ),
-            )));
+            // Everything can be inside a packfile instead. A repository that has been through
+            // `git gc` holds no loose objects at all, and refusing it made an import of any real
+            // repository impossible.
+            return self.read_packed(hash);
         }
         let packed = std::fs::read(&path)?;
         let mut dec = flate2::read::ZlibDecoder::new(&packed[..]);
@@ -244,6 +241,37 @@ impl Repo {
             )));
         }
         Ok(Object { kind, body })
+    }
+
+    /// Read an object out of whichever pack holds it.
+    fn read_packed(&self, hash: &str) -> ZResult<Object> {
+        let packs = crate::packfile::Pack::open_all(&self.git_dir)?;
+        for pack in &packs {
+            if let Some(found) = pack.read(hash)? {
+                let kind = match found.kind {
+                    crate::packfile::Kind::Commit => Kind::Commit,
+                    crate::packfile::Kind::Tree => Kind::Tree,
+                    crate::packfile::Kind::Blob => Kind::Blob,
+                    crate::packfile::Kind::Tag => Kind::Tag,
+                    // A resolved object is never a delta: the reader hands back the base's kind.
+                    crate::packfile::Kind::OfsDelta | crate::packfile::Kind::RefDelta => {
+                        return Err(bad(format!("object {} resolved to a delta", hash)))
+                    }
+                };
+                return Ok(Object {
+                    kind,
+                    body: found.data,
+                });
+            }
+        }
+        Err(Box::new(crate::error::Error::new(
+            crate::error::Code::NotFound,
+            format!(
+                "object {} is in neither a loose object nor a packfile here ({} pack(s) searched)",
+                hash,
+                packs.len()
+            ),
+        )))
     }
 
     /// The value of a ref, or nothing when it does not exist.
@@ -291,6 +319,26 @@ impl Repo {
     /// Every branch, by short name.
     pub fn branches(&self) -> ZResult<BTreeMap<String, String>> {
         let mut out = BTreeMap::new();
+        // `git gc` moves branch refs out of `refs/heads/` and into `packed-refs`, so a repository
+        // that has been packed once has no ref files at all. Reading only the directory made an
+        // import of a real repository report "no branches" while every commit was present.
+        let packed = self.git_dir.join("packed-refs");
+        if let Ok(text) = std::fs::read_to_string(&packed) {
+            for line in text.lines() {
+                // The header starts with `#`, and a peeled tag line with `^`.
+                if line.starts_with('#') || line.starts_with('^') || line.trim().is_empty() {
+                    continue;
+                }
+                let mut parts = line.split_whitespace();
+                let (Some(sha), Some(name)) = (parts.next(), parts.next()) else {
+                    continue;
+                };
+                if let Some(branch) = name.strip_prefix("refs/heads/") {
+                    out.insert(branch.to_string(), sha.to_string());
+                }
+            }
+        }
+        // Loose refs win: a branch written after the last pack is the current one.
         let heads = self.git_dir.join("refs").join("heads");
         collect_refs(&heads, &heads, &mut out)?;
         Ok(out)
