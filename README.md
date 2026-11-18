@@ -452,7 +452,7 @@ Measured on a 558 KB file edited one line fifty times: 1,504 KB before, 692 KB a
 
 ## Release gate
 
-`bench/gate.py` is the single command that decides whether a version may be published. Thirteen steps, each a real command with a real exit code:
+`bench/gate.py` is the single command that decides whether a version may be published. Forty steps, each a real command with a real exit code:
 
 ```bash
 python3 bench/gate.py            # all steps
@@ -487,9 +487,11 @@ cargo test --release              # 184 unit tests
 python3 bench/replace_git.py      # 20 end to end capability checks
 python3 bench/http_remote.py      # 11 checks over a real socket
 python3 bench/http_auth.py        # 18 checks on tokens and roles
-python3 bench/mcp_json.py         # 14 checks on the MCP server and --json
+python3 bench/mcp_json.py         # 23 checks on the MCP server and --json
 python3 bench/api_changeset.py    # 13 checks on remote changesets and path scope
 python3 bench/concurrency.py      # 8 checks on parallel snapshots and commits
+python3 bench/scale.py            # an ordinary commit, against git
+python3 bench/rebuild_cost.py     # the rebuild a merge and a land pay
 python3 bench/conflicts.py        # 13 checks on structured conflict reports
 python3 bench/sparse.py           # 16 checks on sparse checkout safety
 python3 bench/tls.py              # 12 checks on TLS, including refusals

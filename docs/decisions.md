@@ -20,10 +20,11 @@ without its mistakes reads as if it were obvious.
 
 | # | Decision | Reason |
 |---|---|---|
-| C1 | `set_branch_head` updates the branch tree incrementally from the changeset's own file list. | Rebuilding the whole tree per commit measured 24 ms at 500 files and 67 ms at 8000. That is O(repository) on the one operation an agent does most. Measured again after the change, with the binary copied off the working directory and the median of three rounds: a one file commit went from 28.7 ms at 500 files to 54.3 ms at 8000, which is 1.89x for a repository 16 times larger. The middle half of the samples spread by 5 to 12 percent, so any single-run number for this is worth about 10 percent and no more. |
+| C1 | `set_branch_head` updates the branch tree incrementally from the changeset's own file list. | The one operation an agent does most must not cost the size of the repository. Measured with `bench/scale.py` (median of three rounds, binary read from the container's own disk): an ordinary one file commit goes from 28.7 ms at 500 files to 54.3 ms at 8000, which is 1.89x for a repository 16 times larger, with the middle half of samples inside 5 to 12 percent. |
+| C1b | The rebuild is kept, and costs the size of the repository. | A merge, a land and a remote apply cannot carry the tree forward, so they rebuild it from history. Measured with `bench/rebuild_cost.py`: 22.7 ms at 500 files, 57.2 ms at 2000, 187.8 ms at 8000, which is 8.26x for 16 times the files. That is the price of the correctness the fallback buys, and it is why the common path does not take it. |
 | C2 | The incremental path falls back to a rebuild when the changeset's parent is not the previous head. | Merge, undo and remote apply all re-parent. Updating incrementally across a re-parent would silently write a wrong tree. |
 | C3 | Deltas are capped at a chain of 16. | An unbounded chain makes a read walk the whole history. The cap bounds a read and keeps the compression that matters. |
-| C4 | `status` reads a maintained table instead of rebuilding the committed tree. | Rebuilding cost about 2 ms on 2000 files, on every `status` and every `diff`. |
+| C4 | `status` reads a maintained table instead of rebuilding the committed tree. | Rebuilding ran on every `status` and every `diff`, so the saving lands on the most frequent command. The 2 ms figure from the original change has not been reproduced since, and a `status` on 500 files now measures about 30 ms in total, which the note below explains is not comparable. A number that cannot be reproduced is recorded as such rather than repeated. |
 | C5 | The stat cache exists, and a file younger than a small window is re-read rather than trusted. | A cache hit needs size and mtime to match. A file written in the same clock tick as the last read has an mtime that proves nothing. |
 
 ## Evidence over claims
@@ -58,7 +59,7 @@ without its mistakes reads as if it were obvious.
 | P4 | The sealed store uses ChaCha20-Poly1305 with a single pass KDF. | The threat model is a leaked backup, not an attacker holding the file and a GPU. The single pass is stated rather than hidden. |
 | P5 | `S3Config` has no `Debug`. | It holds the secret key, and a derived `Debug` prints it in any panic message. The test avoids needing it rather than adding it for convenience. |
 | P6 | A plain `http://` endpoint is refused except on loopback. | The signature names the key, covers the payload and can be replayed inside its signing window. Loopback is allowed because a local test server cannot be read by anyone else. |
-| P7 | The S3 remote is kept. | It is the only remote that needs no listening process. It costs 670 lines and one gate step; the 1.6 MB of binary difference belongs to rustls, which the HTTPS remote needs on its own. |
+| P7 | The S3 remote is kept. | It is the only remote that needs no listening process. It costs 719 lines across `s3.rs` and `sigv4.rs` and one gate step. Measured from two builds, the TLS feature adds 1.63 MB (6,065,400 to 7,695,864 bytes), and that cost belongs to the HTTPS remote, which needs it on its own; S3 reuses it. |
 
 ## The interface an agent meets
 
@@ -81,6 +82,23 @@ without its mistakes reads as if it were obvious.
 | I2 | The Windows installer targets PowerShell 5.1 and writes the user PATH. | Every Windows 10 and 11 machine has 5.1. Elevation is why installs get abandoned. |
 | I3 | No releases, no tags. | The project ships from the branch. A version number in the manifest tracks the interface, not a packaged artifact. |
 
+## How a number gets here
+
+Every figure in this document carries what it takes to judge it: the command that produced it,
+the spread, and whether it can be reproduced. A number without those three is a claim, and a
+claim in a decision table is worse than a blank, because it gets quoted.
+
+Three rules came out of getting this wrong repeatedly:
+
+- **Measure the thing, not something near it.** Four attempts at measuring the tree rebuild each
+  timed a different operation: disk writes, a growing table, a conflict, a branch switch. Each
+  produced a plausible curve.
+- **Hold one variable.** At 500 files, `land` took 29, 20 and 30 ms with 5, 50 and 200 changesets
+  of history. That settled in one run what four rounds of reasoning had not: the cost follows the
+  files, not the length of the history.
+- **Say when a number is old.** The 2 ms for rebuilding the tree in C4 has not been reproduced and
+  is marked as such. It may well be right; nobody has shown it.
+
 ## Mistakes kept on the record
 
 These cost more time than the decisions above, so they stay written down.
@@ -96,6 +114,7 @@ These cost more time than the decisions above, so they stay written down.
 | M7 | `bench/scale.py` kept the first binary it copied to `/tmp` and reused it on every later run. | A benchmark that reuses a stale copy measures the previous build and reports it as the current one. The copy is refreshed every run now, and the numbers above are from a correct run. |
 | M8 | Timing the binary in place added about 16 ms per run, because it lives on a bind mount. | Read an executable from the container's own disk before timing it. The mount cost was larger than the work being measured, and it looked exactly like slow code. |
 | M9 | The benchmark printed one median per size, and ten runs of the same commit on this machine ranged from 29 ms to 50 ms. | Report the spread beside the number. A single figure from a 70 percent range cannot support a claim, and the person reading it has no way to tell. The report now prints the median of three rounds and the interquartile spread of each. |
+| M10 | Measuring the tree rebuild took four attempts, each wrong in a different way. | `undo` writes every path to disk, so it timed the file system. A fresh branch per sample grew the table being read. Editing one file on both sides made the land a conflict. Leaving `branch switch` inside the timer timed an operation that writes the whole tree. Each produced a plausible curve that described something other than the rebuild. What settled it was holding one variable fixed: at 500 files, `land` took 29, 20 and 30 ms with 5, 50 and 200 changesets of history, so the cost follows the files and not the history. |
 
 ## Not done, and why
 
