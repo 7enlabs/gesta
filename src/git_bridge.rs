@@ -450,7 +450,7 @@ pub fn push_to_git_remote(
         .arg("-q")
         .arg(&staging)
         .output()
-        .map_err(|e| bad(format!("git is needed to push to a remote: {}", e)))?;
+        .map_err(|e| Box::new(crate::error::Error::new(crate::error::Code::Remote, format!("git is needed to push to a remote: {}", e))))?;
 
     let written = export_bare(conn, &staging, branch)?;
 
@@ -461,13 +461,16 @@ pub fn push_to_git_remote(
         .arg(remote)
         .arg(written.branches.iter().map(|b| format!("refs/heads/{}:refs/heads/{}", b, b)).collect::<Vec<_>>().join(" "))
         .output()
-        .map_err(|e| bad(format!("cannot run git: {}", e)))?;
+        .map_err(|e| Box::new(crate::error::Error::new(crate::error::Code::Remote, format!("cannot run git: {}", e))))?;
 
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         let _ = std::fs::remove_dir_all(&staging);
         // git's own message is the useful one: it names the ref, the reason and the fix.
-        return Err(bad(format!("git push failed: {}", err.trim())));
+        return Err(Box::new(crate::error::Error::new(
+            crate::error::Code::Remote,
+            format!("git push failed: {}", err.trim()),
+        )));
     }
     let _ = std::fs::remove_dir_all(&staging);
     let _ = adjust_remote_head(remote, &written.branches);
@@ -487,9 +490,12 @@ pub fn pull_from_git_remote(conn: &Connection, remote: &str, prefix: Option<&str
         .args(["init", "--bare", "-q"])
         .arg(&staging)
         .output()
-        .map_err(|e| bad(format!("git is needed to pull from a remote: {}", e)))?;
+        .map_err(|e| Box::new(crate::error::Error::new(crate::error::Code::Remote, format!("git is needed to pull from a remote: {}", e))))?;
     if !init.status.success() {
-        return Err(bad("git init failed in the staging directory"));
+        return Err(Box::new(crate::error::Error::new(
+            crate::error::Code::Remote,
+            "git init failed in the staging directory",
+        )));
     }
 
     let fetch = std::process::Command::new("git")
@@ -497,11 +503,14 @@ pub fn pull_from_git_remote(conn: &Connection, remote: &str, prefix: Option<&str
         .arg(&staging)
         .args(["fetch", remote, "+refs/heads/*:refs/heads/*"])
         .output()
-        .map_err(|e| bad(format!("cannot run git: {}", e)))?;
+        .map_err(|e| Box::new(crate::error::Error::new(crate::error::Code::Remote, format!("cannot run git: {}", e))))?;
     if !fetch.status.success() {
         let err = String::from_utf8_lossy(&fetch.stderr);
         let _ = std::fs::remove_dir_all(&staging);
-        return Err(bad(format!("git fetch failed: {}", err.trim())));
+        return Err(Box::new(crate::error::Error::new(
+            crate::error::Code::Remote,
+            format!("git fetch failed: {}", err.trim()),
+        )));
     }
 
     // `fetch` writes packfiles and an import reads loose objects, so the packs are taken apart

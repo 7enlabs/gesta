@@ -846,11 +846,16 @@ fn push_http(
         pin.as_deref(),
     )?;
     if status == 401 || status == 403 {
-        return Err(bad(format!(
-            "remote {} rejected the token ({}): {}",
-            remote_name,
-            status,
-            String::from_utf8_lossy(&body).trim()
+        // A refused token is not a missing thing and not a damaged store: it is the one failure
+        // where retrying with the same credentials will never work.
+        return Err(Box::new(crate::error::Error::new(
+            crate::error::Code::Auth,
+            format!(
+                "remote {} rejected the token ({}): {}",
+                remote_name,
+                status,
+                String::from_utf8_lossy(&body).trim()
+            ),
         )));
     }
     if status != 200 {
@@ -1097,7 +1102,12 @@ pub fn cmd_token_add(role: &str, name: &str, hashed: bool) -> ZResult<()> {
     let role = match role.to_ascii_lowercase().as_str() {
         "write" => "write",
         "read" => "read",
-        other => return Err(bad(format!("unknown role {:?}: use read or write", other))),
+        other => {
+            return Err(Box::new(crate::error::Error::new(
+                crate::error::Code::Usage,
+                format!("unknown role {:?}: use read or write", other),
+            )))
+        }
     };
     if name.trim().is_empty() || name.contains(':') {
         return Err(bad("token name must be non-empty and must not contain ':'"));

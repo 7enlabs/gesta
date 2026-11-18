@@ -238,7 +238,7 @@ pub fn commit_one(conn: &Connection, id: &str) -> ZResult<usize> {
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
         )
         .optional()?;
-    let (status, branch) = row.ok_or_else(|| bad(format!("no such changeset: {}", id)))?;
+    let (status, branch) = row.ok_or_else(|| crate::error::Error::not_found(format!("no such changeset: {}", id)))?;
     if status == "committed" {
         return Ok(0);
     }
@@ -762,7 +762,7 @@ pub fn cherry_pick(
 ) -> ZResult<MergeOutcome> {
     // Resolve the id: a branch name means its head, anything else is an id or tag.
     let source_id = crate::store::resolve_rev(conn, source)?
-        .ok_or_else(|| bad(format!("no such changeset: {}", source)))?;
+        .ok_or_else(|| crate::error::Error::not_found(format!("no such changeset: {}", source)))?;
 
     let parent: Option<String> = conn
         .query_row(
@@ -1686,11 +1686,16 @@ pub fn land_branch(
 ) -> ZResult<MergeOutcome> {
     let current = branch_head(conn, target)?;
     if current.as_deref() != expected_target_head {
-        return Err(bad(format!(
-            "{} moved while this was being prepared: expected {}, found {}",
-            target,
-            expected_target_head.unwrap_or("(none)"),
-            current.as_deref().unwrap_or("(none)")
+        // The tree is not damaged and the request is not wrong: it is out of date against
+        // another writer, which is what this check exists to catch.
+        return Err(Box::new(crate::error::Error::new(
+            crate::error::Code::DirtyWorktree,
+            format!(
+                "{} moved while this was being prepared: expected {}, found {}",
+                target,
+                expected_target_head.unwrap_or("(none)"),
+                current.as_deref().unwrap_or("(none)")
+            ),
         )));
     }
     merge_branch(conn, root, source, target, author)

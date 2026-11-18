@@ -168,7 +168,7 @@ pub fn revert_changeset(
             },
         )
         .optional()?
-        .ok_or_else(|| bad(format!("no such changeset: {}", target)))?;
+        .ok_or_else(|| crate::error::Error::not_found(format!("no such changeset: {}", target)))?;
 
     if status != "committed" {
         return Err(bad(format!(

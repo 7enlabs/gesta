@@ -494,7 +494,9 @@ pub fn cmd_changeset_apply(id: &str) -> ZResult<()> {
             |r| r.get::<_, i64>(0),
         )
         .optional()?;
-    let cutoff = cutoff.ok_or_else(|| bad(format!("no such changeset: {}", id)))?;
+    let cutoff = cutoff.ok_or_else(|| {
+        crate::error::Error::not_found(format!("no such changeset: {}", id))
+    })?;
 
     let ids: Vec<String> = {
         let mut stmt = conn.prepare(
@@ -551,7 +553,7 @@ pub fn cmd_changeset_diff(id: &str) -> ZResult<()> {
     println!(
         "changeset {}: {}",
         id,
-        msg.ok_or_else(|| bad(format!("no such changeset: {}", id)))?
+        msg.ok_or_else(|| crate::error::Error::not_found(format!("no such changeset: {}", id)))?
     );
     print_renames(&conn, id)?;
 
@@ -987,9 +989,14 @@ pub fn cmd_show(spec: &str) -> ZResult<()> {
         None => (current_branch(&conn)?, normalise(spec)),
     };
     let cs = store::resolve_rev(&conn, &rev)?
-        .ok_or_else(|| bad(format!("no such branch, tag or changeset: {}", rev)))?;
+        .ok_or_else(|| crate::error::Error::not_found(format!("no such branch, tag or changeset: {}", rev)))?;
     let hash = hash_at_point(&conn, &path, &cs)?
-        .ok_or_else(|| bad(format!("{} does not exist at {}", path, rev)))?;
+        .ok_or_else(|| {
+            crate::error::Error::new(
+                crate::error::Code::PathNotFound,
+                format!("{} does not exist at {}", path, rev),
+            )
+        })?;
     print!("{}", get_object(&conn, &hash)?);
     Ok(())
 }
@@ -1292,7 +1299,12 @@ type YResultAlias = ZResult<()>;
 /// wrong thing. The version goes on every object so a caller can refuse one it does not know.
 pub const SCHEMA_VERSION: &str = "gesta@1";
 
+/// Set once anything has been printed as JSON, so a later failure does not append a second
+/// object to a document that already went out.
+pub static JSON_PRINTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn emit(v: Json) {
+    JSON_PRINTED.store(true, std::sync::atomic::Ordering::Relaxed);
     println!("{}", with_schema(v).render_pretty());
 }
 

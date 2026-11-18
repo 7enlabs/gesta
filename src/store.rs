@@ -806,13 +806,19 @@ pub fn branch_head(conn: &Connection, branch: &str) -> ZResult<Option<String>> {
                 Ok(rows.filter_map(|r| r.ok()).collect())
             })
             .unwrap_or_default();
+        // The code travels with the message, so a caller can branch on "no such branch" without
+        // matching the sentence. The sentence stays as it was: it names what exists and the fix.
         if known.is_empty() {
-            bad(format!(
+            Box::new(crate::error::Error::not_found(format!(
                 "no such branch: {}; there are no branches yet, create one with `gesta branch create <name>`",
                 branch
-            ))
+            ))) as Box<dyn std::error::Error>
         } else {
-            bad(format!("no such branch: {}; known branches: {}", branch, known.join(", ")))
+            Box::new(crate::error::Error::not_found(format!(
+                "no such branch: {}; known branches: {}",
+                branch,
+                known.join(", ")
+            ))) as Box<dyn std::error::Error>
         }
     })
 }

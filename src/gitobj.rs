@@ -209,9 +209,12 @@ impl Repo {
     pub fn read_object(&self, hash: &str) -> ZResult<Object> {
         let path = self.object_path(hash);
         if !path.exists() {
-            return Err(bad(format!(
-                "object {} is not a loose object here. A repository written only as a packfile needs `git gc` to give its objects back",
-                hash
+            return Err(Box::new(crate::error::Error::new(
+                crate::error::Code::Corrupt,
+                format!(
+                    "object {} is not a loose object here. A repository written only as a packfile needs `git gc` to give its objects back",
+                    hash
+                ),
             )));
         }
         let packed = std::fs::read(&path)?;

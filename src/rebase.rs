@@ -203,7 +203,7 @@ pub fn start(
     }
 
     let onto_id = crate::store::resolve_rev(conn, onto)?
-        .ok_or_else(|| bad(format!("no such changeset: {}", onto)))?;
+        .ok_or_else(|| crate::error::Error::not_found(format!("no such changeset: {}", onto)))?;
     let original = crate::store::branch_head(conn, branch)?;
     let pending = to_replay(conn, branch, &onto_id)?;
     if pending.is_empty() {
@@ -238,7 +238,10 @@ pub fn continue_after_resolution(
     root: &Path,
     author: &str,
 ) -> ZResult<Progress> {
-    let mut s = load(conn)?.ok_or_else(|| bad("no rebase in progress".to_string()))?;
+    let mut s = load(conn)?.ok_or_else(|| Box::new(crate::error::Error::new(
+            crate::error::Code::Unmerged,
+            "no rebase in progress: there is nothing to continue",
+        )))?;
     let current = s
         .current
         .clone()
@@ -286,7 +289,10 @@ pub fn continue_after_resolution(
 
 /// Put the branch back where it started and forget the session.
 pub fn abort(conn: &Connection, root: &Path) -> ZResult<String> {
-    let s = load(conn)?.ok_or_else(|| bad("no rebase in progress".to_string()))?;
+    let s = load(conn)?.ok_or_else(|| Box::new(crate::error::Error::new(
+            crate::error::Code::Unmerged,
+            "no rebase in progress: there is nothing to continue",
+        )))?;
     match &s.original_head {
         Some(h) => {
             crate::store::set_branch_head(conn, &s.branch, h)?;

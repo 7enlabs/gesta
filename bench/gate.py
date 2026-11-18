@@ -33,6 +33,12 @@ def sh(cmd, cwd=ZF_DIR, timeout=900):
     return r.returncode, (r.stdout + r.stderr).strip()
 
 
+def sh_out(cmd, cwd=ZF_DIR, timeout=900):
+    """stdout alone, for a check that parses JSON: stderr carries a line for a person."""
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, cwd=cwd, timeout=timeout)
+    return r.returncode, r.stdout.strip()
+
+
 def main():
     only = sys.argv[1] if len(sys.argv) > 1 else None
 
@@ -339,6 +345,73 @@ def main():
                 count == 2,
                 f"{count} changesets, expected 2",
             )
+
+    if want("errors"):
+        # A caller has to be able to tell "nothing there" from "the store is damaged" without
+        # reading English, and a failure under --json has to parse.
+        import tempfile as _tf
+        d = _tf.mkdtemp()
+        sh(f"{ZF} init", cwd=d)
+        with open(os.path.join(d, "a.txt"), "w") as fh:
+            fh.write("v1\n")
+        sh(f'{ZF} changeset create one --author t', cwd=d)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=d)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+
+        missing = sh(f"{ZF} show nosuch:a.txt", cwd=d)
+        record(
+            "a missing branch exits with a code a caller can branch on",
+            missing[0] == 3,
+            f"exit {missing[0]}, expected 3",
+        )
+        record(
+            "the message still names what is missing",
+            "no such branch" in (missing[1] or ""),
+            (missing[1] or "")[:160],
+        )
+
+        bad_cs = sh(f"{ZF} changeset diff cs000000000000", cwd=d)
+        record(
+            "a missing changeset exits with the same code",
+            bad_cs[0] == 3,
+            f"exit {bad_cs[0]}, expected 3",
+        )
+
+        usage = sh(f"{ZF} --nonsense", cwd=d)
+        record(
+            "a bad argument exits 2, so it is not confused with a missing thing",
+            usage[0] == 2,
+            f"exit {usage[0]}, expected 2",
+        )
+
+        # `sh` folds stderr into stdout, and the error line goes to stderr on purpose, so the
+        # JSON is fetched on its own here.
+        js = sh_out(f"{ZF} --json changeset diff cs000000000000", cwd=d)
+        import json as _json
+        try:
+            payload = _json.loads(js[1])
+            ok = payload.get("error", {}).get("code") == "not-found"
+            why = js[1][:160]
+        except Exception as exc:
+            ok = False
+            why = f"not JSON at all: {exc}: {js[1][:120]}"
+        record("a failure under --json parses and carries a code", ok, why)
+
+        # A path with a quote is the case that breaks a hand built JSON string. The shell needs
+        # the quote escaped before the program ever sees it, so the argument is quoted properly
+        # rather than by hand.
+        import shlex as _shlex
+        arg = _shlex.quote('main:quote"name.txt')
+        quoted = sh_out(f"{ZF} --json show {arg}", cwd=d)
+        try:
+            _json.loads(quoted[1])
+            ok2 = True
+            why2 = quoted[1][:120]
+        except Exception as exc:
+            ok2 = False
+            why2 = f"a quote in a path broke the JSON: {exc}: {quoted[1][:80]!r}"
+        record("a quote in a message does not break the JSON", ok2, why2)
 
     if want("gc"):
         # A repository that only grows is a repository that gets slower and bigger forever. The

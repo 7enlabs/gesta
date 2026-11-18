@@ -21,6 +21,7 @@ mod hooks;
 mod http;
 mod json;
 mod mcp;
+mod error;
 mod merge;
 mod ops;
 mod remote;
@@ -123,7 +124,13 @@ pub fn repo_root() -> ZResult<PathBuf> {
             return Ok(cur);
         }
         if !cur.pop() {
-            return Err(bad("not a repository (run 'gesta init')"));
+            return Err(Box::new(error::Error::new(
+                error::Code::NotARepo,
+                format!(
+                    "not a repository: {} and no directory above it holds one (run `gesta init` here)",
+                    cur.display()
+                ),
+            )));
         }
     }
 }
@@ -698,6 +705,24 @@ enum IgnoreCmd {
 ///
 /// Only a broken pipe is swallowed. Any other panic keeps the default message,
 /// because hiding a real bug would be worse than the noise.
+/// Escape a message for the one-line JSON error, so a quote or a newline in a path does not
+/// produce a broken object.
+fn escape_json(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn quiet_broken_pipe() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -717,8 +742,36 @@ fn quiet_broken_pipe() {
 fn main() {
     quiet_broken_pipe();
     if let Err(e) = run() {
+        // The code decides the exit status, so a caller can tell "nothing there" from "the store
+        // is damaged" without reading English. The message still goes to a person unchanged.
+        let code = error::code_of(e.as_ref());
+        // With --json the failure goes to stdout as one object, so a caller that asked for JSON
+        // does not have to parse English out of stderr. Without it the sentence is unchanged.
+        // Only when nothing was printed yet. `merge --json` prints the conflicted files and then
+        // returns an error to keep the exit code non-zero; a second object after that document
+        // makes the output unparseable, which is worse than having no error object at all.
+        if std::env::args().any(|a| a == "--json")
+            && !cli::JSON_PRINTED.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            if let Some(ours) = e.downcast_ref::<error::Error>() {
+                println!("{}", ours.json());
+            } else {
+                println!(
+                    "{{\"error\":{{\"code\":\"{}\",\"message\":\"{}\",\"advice\":\"{}\"}}}}",
+                    code.name(),
+                    escape_json(&e.to_string()),
+                    escape_json(code.advice())
+                );
+            }
+        }
         eprintln!("gesta: {}", e);
-        std::process::exit(1);
+        std::process::exit(match code {
+            error::Code::NotFound | error::Code::PathNotFound => 3,
+            error::Code::Usage => 2,
+            error::Code::Auth => 4,
+            error::Code::DirtyWorktree | error::Code::Unmerged => 5,
+            _ => 1,
+        });
     }
 }
 
