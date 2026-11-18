@@ -1763,8 +1763,83 @@ pub fn cmd_changeset_json(sub: crate::ChangesetCmd) -> YResultAlias {
             emit(Json::arr(rows.collect::<rusqlite::Result<Vec<_>>>()?));
             Ok(())
         }
-        other => crate::cli::dispatch_changeset_text(other),
+        crate::ChangesetCmd::Create { message, author, session, intent } => {
+            cmd_changeset_create_json(&message, &author, session.as_deref(), intent.as_deref())
+        }
+        crate::ChangesetCmd::Commit { id } => cmd_changeset_commit_json(&id),
+        // A caller that asked for JSON and got text has a silent failure: it parses nothing and
+        // branches on nothing, and the run looks successful. Refuse rather than print prose.
+        _other => Err(Box::new(crate::error::Error::new(
+            crate::error::Code::Usage,
+            "this subcommand has no JSON form yet: run it without --json and read the text",
+        ))),
     }
+}
+
+/// `changeset create --json`: the id and what it took, so a caller can act without parsing text.
+fn cmd_changeset_create_json(
+    message: &str,
+    author: &str,
+    session: Option<&str>,
+    intent: Option<&str>,
+) -> YResultAlias {
+    let (root, conn) = open_repo()?;
+    let branch = current_branch(&conn)?;
+    let made = store::with_retry(|| repo::create_changeset(&conn, &root, message, author))?;
+    let Some(cs) = made else {
+        // Nothing to snapshot is not an error, and a caller still needs a shape to read.
+        emit(Json::obj(vec![
+            ("changed", Json::Bool(false)),
+            ("changeset", Json::Null),
+            ("branch", Json::str(branch)),
+        ]));
+        return Ok(());
+    };
+    if session.is_some() || intent.is_some() {
+        conn.execute(
+            "UPDATE changesets SET session = ?1, intent = ?2 WHERE id = ?3",
+            rusqlite::params![session, intent, cs.id],
+        )?;
+    }
+    let entries = |v: &[(String, Option<String>, String)]| {
+        Json::arr(
+            v.iter()
+                .map(|(rel, old, _)| {
+                    Json::obj(vec![
+                        ("path", Json::str(rel.clone())),
+                        ("change", Json::str(if old.is_none() { "added" } else { "modified" })),
+                    ])
+                })
+                .collect(),
+        )
+    };
+    emit(Json::obj(vec![
+        ("changed", Json::Bool(true)),
+        ("changeset", Json::str(cs.id.clone())),
+        ("branch", Json::str(branch)),
+        ("files", entries(&cs.files)),
+        (
+            "deleted",
+            Json::arr(cs.deleted.iter().cloned().map(Json::str).collect()),
+        ),
+        (
+            "skipped_binary",
+            Json::arr(cs.skipped.iter().cloned().map(Json::str).collect()),
+        ),
+    ]));
+    Ok(())
+}
+
+/// `changeset commit --json`: how many files moved, and the branch it landed on.
+fn cmd_changeset_commit_json(id: &str) -> YResultAlias {
+    let (_root, conn) = open_repo()?;
+    let written = store::with_retry(|| repo::commit_one(&conn, id))?;
+    emit(Json::obj(vec![
+        ("id", Json::str(id)),
+        ("files", Json::int(written as i64)),
+        ("already_committed", Json::Bool(written == 0)),
+    ]));
+    Ok(())
 }
 
 // Text-mode dispatch for the subcommands JSON mode does not cover. Keeping it
@@ -1778,20 +1853,6 @@ pub fn dispatch_branch_text(sub: crate::BranchCmd) -> ZResult<()> {
         crate::BranchCmd::Merge { source, target, author } => cmd_branch_merge(&source, &target, &author),
         crate::BranchCmd::Info { name } => cmd_branch_info(&name),
         crate::BranchCmd::Conflicts { source, target } => cmd_merge_preview(&source, &target),
-    }
-}
-
-pub fn dispatch_changeset_text(sub: crate::ChangesetCmd) -> ZResult<()> {
-    match sub {
-        crate::ChangesetCmd::Create { message, author, session, intent } => {
-            cmd_changeset_create_meta(&message, &author, session.as_deref(), intent.as_deref())
-        }
-        crate::ChangesetCmd::Commit { id } => cmd_changeset_commit(&id),
-        crate::ChangesetCmd::Apply { id } => cmd_changeset_apply(&id),
-        crate::ChangesetCmd::CommitAll => cmd_changeset_commit_all(),
-        crate::ChangesetCmd::Diff { id } => cmd_changeset_diff(&id),
-        crate::ChangesetCmd::List => cmd_changeset_list(),
-        crate::ChangesetCmd::Sign { id, key } => cmd_sign(&id, key.as_deref()),
     }
 }
 

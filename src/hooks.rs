@@ -56,10 +56,13 @@ pub fn run(root: &Path, name: &str, args: &[&str]) -> ZResult<()> {
         .output()
         .map_err(|e| bad(format!("hook {} could not run: {}", name, e)))?;
 
-    // A hook's own output is the useful part of a failure, so it goes straight
-    // through rather than being swallowed into an error string.
+    // A hook's own output is the useful part of a failure, so it goes through rather than being
+    // swallowed into an error string. It goes to stderr, which is where a hook's chatter belongs:
+    // writing it to stdout put a line of prose in front of a JSON document, and a caller that
+    // asked for `--json` got something no parser could read. A hook that wants to change the
+    // committed content cannot, so it has nothing to say on stdout that a caller should read.
     if !out.stdout.is_empty() {
-        print!("{}", String::from_utf8_lossy(&out.stdout));
+        eprint!("{}", String::from_utf8_lossy(&out.stdout));
     }
     if !out.stderr.is_empty() {
         eprint!("{}", String::from_utf8_lossy(&out.stderr));

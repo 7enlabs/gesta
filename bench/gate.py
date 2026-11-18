@@ -387,7 +387,9 @@ def main():
 
         # `sh` folds stderr into stdout, and the error line goes to stderr on purpose, so the
         # JSON is fetched on its own here.
-        js = sh_out(f"{ZF} --json changeset diff cs000000000000", cwd=d)
+        # `show` resolves a revision and fails with not-found; `changeset diff` has no JSON form
+        # and would answer usage, which is a different error on purpose.
+        js = sh_out(f"{ZF} --json show nosuch:a.txt", cwd=d)
         import json as _json
         try:
             payload = _json.loads(js[1])
@@ -842,6 +844,70 @@ def main():
             "src/feed.rs line" not in (review[1] or ""),
             (review[1] or "")[:400],
         )
+
+    if want("json-stdout"):
+        # `--json` means stdout is one document. A hook that prints, and a subcommand that has no
+        # JSON form, both used to put prose there, and a caller parsed nothing while the run
+        # looked successful.
+        import tempfile as _tf
+        import json as _json
+        d = _tf.mkdtemp()
+        sh(f"{ZF} init", cwd=d)
+        os.makedirs(os.path.join(d, ".gesta", "hooks"), exist_ok=True)
+        hook = os.path.join(d, ".gesta", "hooks", "pre-commit")
+        with open(hook, "w") as fh:
+            fh.write("#!/bin/sh\necho 'hook chatter'\n")
+        os.chmod(hook, 0o755)
+        with open(os.path.join(d, "a.txt"), "w") as fh:
+            fh.write("x\n")
+
+        made = sh_out(f'{ZF} --json changeset create "one" --author t', cwd=d)
+        try:
+            payload = _json.loads(made[1])
+            ok = payload.get("changed") is True and payload.get("changeset", "").startswith("cs")
+            why = made[1][:200]
+        except Exception as exc:
+            ok, why = False, f"not JSON: {exc}: {made[1][:120]!r}"
+        record("changeset create --json answers with one document", ok, why)
+
+        cid = ""
+        try:
+            cid = _json.loads(made[1]).get("changeset", "")
+        except Exception:
+            pass
+        if cid:
+            committed = sh_out(f"{ZF} --json changeset commit {cid}", cwd=d)
+            try:
+                second = _json.loads(committed[1])
+                ok2 = second.get("files") == 1 and second.get("already_committed") is False
+                why2 = committed[1][:200]
+            except Exception as exc:
+                ok2, why2 = False, f"the hook's output broke the JSON: {exc}: {committed[1][:120]!r}"
+            record("a chatty hook cannot break the JSON on stdout", ok2, why2)
+
+        # A subcommand with no JSON form must answer with an error document, not prose: the
+        # shape stays parseable so a caller learns the code instead of failing to parse.
+        refused = sh_out(f"{ZF} --json changeset diff {cid}", cwd=d)
+        try:
+            err = _json.loads(refused[1])
+            ok_ref = refused[0] != 0 and err.get("error", {}).get("code") == "usage"
+            why_ref = refused[1][:200]
+        except Exception as exc:
+            ok_ref, why_ref = False, f"prose on stdout instead of an error document: {exc}"
+        record(
+            "a subcommand without a JSON form answers with an error document",
+            ok_ref,
+            why_ref,
+        )
+
+        # And `ls --json` still parses, since it is the newest JSON surface.
+        ls = sh_out(f"{ZF} --json ls", cwd=d)
+        try:
+            _json.loads(ls[1])
+            ok3, why3 = True, ls[1][:120]
+        except Exception as exc:
+            ok3, why3 = False, f"ls --json broke: {exc}"
+        record("ls --json parses alongside the rest", ok3, why3)
 
     if want("gc"):
         # A repository that only grows is a repository that gets slower and bigger forever. The
