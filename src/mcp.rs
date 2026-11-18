@@ -96,6 +96,32 @@ pub fn tool_definitions() -> Json {
             ]),
         ),
         tool(
+            "gesta_brief",
+            "Everything a session needs before its first edit, in one call: branch, head, whether a rebase or merge stopped, pending changesets, stale snapshots, stashes and how many files differ from the head. Start here.",
+            Json::obj(vec![
+                ("type", Json::str("object")),
+                ("properties", Json::obj(vec![])),
+            ]),
+        ),
+        tool(
+            "gesta_grep",
+            "Find text. With history true it searches every recorded version, including text that was deleted, and returns the changeset that holds each match.",
+            Json::obj(vec![
+                ("type", Json::str("object")),
+                (
+                    "properties",
+                    Json::obj(vec![
+                        ("pattern", Json::obj(vec![("type", Json::str("string")), ("description", Json::str("Text to find."))])),
+                        ("history", Json::obj(vec![("type", Json::str("boolean")), ("description", Json::str("Search every recorded version instead of the files on disk."))])),
+                        ("word", Json::obj(vec![("type", Json::str("boolean")), ("description", Json::str("Match whole words only."))])),
+                        ("ignore_case", Json::obj(vec![("type", Json::str("boolean")), ("description", Json::str("Case insensitive."))])),
+                        ("path", Json::obj(vec![("type", Json::str("string")), ("description", Json::str("Only paths starting with this prefix."))])),
+                    ]),
+                ),
+                ("required", Json::arr(vec![Json::str("pattern")])),
+            ]),
+        ),
+        tool(
             "gesta_create_changeset",
             "Snapshot the working tree as a pending changeset. Nothing is committed until gesta_commit.",
             Json::obj(vec![
@@ -246,6 +272,8 @@ fn call_tool(root: &Path, params: &Json) -> Result<Json, ToolError> {
     let name = name.as_str();
 
     let value = match name {
+        "gesta_brief" => tool_brief(&conn, root),
+        "gesta_grep" => tool_grep(&conn, root, &args),
         "gesta_status" => tool_status(&conn),
         "gesta_log" => tool_log(&conn, &args),
         "gesta_read_file" => tool_read_file(&conn, &args),
@@ -276,6 +304,50 @@ fn call_tool(root: &Path, params: &Json) -> Result<Json, ToolError> {
 
 fn arg_str(args: &Json, key: &str) -> Option<String> {
     field(args, key).and_then(json::as_str).map(|s| s.to_string())
+}
+
+fn tool_brief(conn: &Connection, root: &Path) -> Result<Json, String> {
+    let b = crate::brief::brief(conn, root).map_err(|e| e.to_string())?;
+    Ok(crate::brief::to_json(&b))
+}
+
+fn tool_grep(conn: &Connection, root: &Path, args: &Json) -> Result<Json, String> {
+    let needle = field(args, "pattern")
+        .and_then(json::as_str)
+        .ok_or("gesta_grep needs a pattern".to_string())?;
+    let history = field(args, "history").and_then(json::as_bool).unwrap_or(false);
+    let word = field(args, "word").and_then(json::as_bool).unwrap_or(false);
+    let ignore_case = field(args, "ignore_case")
+        .and_then(json::as_bool)
+        .unwrap_or(false);
+    let path = field(args, "path").and_then(json::as_str);
+
+    let pattern = crate::grep::Pattern::new(needle, ignore_case, word).map_err(|e| e.to_string())?;
+    let hits = if history {
+        crate::grep::search_history(conn, &pattern, path, 5000)
+    } else {
+        crate::grep::search_worktree(conn, root, &pattern, path)
+    }
+    .map_err(|e| e.to_string())?;
+
+    Ok(Json::obj(vec![
+        ("count", Json::int(hits.len() as i64)),
+        (
+            "hits",
+            Json::arr(
+                hits.iter()
+                    .map(|h| {
+                        Json::obj(vec![
+                            ("path", Json::str(h.path.clone())),
+                            ("line", Json::int(h.line as i64)),
+                            ("rev", Json::str(h.rev.clone())),
+                            ("text", Json::str(h.text.clone())),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+    ]))
 }
 
 fn tool_status(conn: &Connection) -> Result<Json, String> {

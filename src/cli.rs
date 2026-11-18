@@ -733,6 +733,48 @@ pub fn cmd_history(file: &str) -> ZResult<()> {
     Ok(())
 }
 
+/// Everything a session needs before its first edit, printed as a few short lines.
+pub fn cmd_brief() -> ZResult<()> {
+    let (root, conn) = open_repo()?;
+    let b = crate::brief::brief(&conn, &root)?;
+    println!("branch:   {}", b.branch);
+    println!("head:     {}", b.head.as_deref().unwrap_or("(empty)"));
+    println!("next:     {}", b.next.as_str());
+    if b.changed > 0 {
+        println!("changed:  {} file(s) differ from the head", b.changed);
+    }
+    if !b.pending.is_empty() {
+        println!("pending:  {}", b.pending.join(", "));
+    }
+    if !b.stale.is_empty() {
+        println!(
+            "stale:    {} (the disk moved on; discard before committing)",
+            b.stale.join(", ")
+        );
+    }
+    if b.rebase_pending > 0 {
+        println!("rebase:   {} changeset(s) left to replay", b.rebase_pending);
+    }
+    if b.stashes > 0 {
+        println!("stashes:  {}", b.stashes);
+    }
+    if !b.conflicts.is_empty() {
+        println!("conflict: {}", b.conflicts.join(", "));
+    }
+    let advice = b.next.advice();
+    if !advice.is_empty() {
+        println!("\n{}", advice);
+    }
+    Ok(())
+}
+
+pub fn cmd_brief_json() -> ZResult<()> {
+    let (root, conn) = open_repo()?;
+    let b = crate::brief::brief(&conn, &root)?;
+    emit(crate::brief::to_json(&b));
+    Ok(())
+}
+
 /// Search the working tree or the history.
 pub fn cmd_grep(
     needle: &str,

@@ -125,6 +125,63 @@ def main():
                     bad.append(f"{f}:{line} {m.group(0)[:40]}")
         record("no hardcoded credential in src", not bad, "\n".join(bad[:10]))
 
+    if want("brief"):
+        # One call that answers where the session stands. An agent that asks this with four
+        # commands pays four round trips and holds four outputs in context.
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        sh(f"{ZF} init", cwd=tmp)
+        with open(os.path.join(tmp, "a.txt"), "w") as fh:
+            fh.write("v1\n")
+        sh(f"{ZF} changeset create base --author t", cwd=tmp)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=tmp)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=tmp)
+
+        r = sh(f"{ZF} brief --json", cwd=tmp)
+        record(
+            "a clean repository reports ready",
+            '"next": "ready"' in r[1],
+            r[1][:160],
+        )
+
+        with open(os.path.join(tmp, "a.txt"), "w") as fh:
+            fh.write("v2\n")
+        r = sh(f"{ZF} brief --json", cwd=tmp)
+        record(
+            "an edit on disk asks for a commit and says which command",
+            '"next": "commit-work"' in r[1] and "changeset create" in r[1],
+            r[1][:200],
+        )
+
+        sh(f"{ZF} changeset create snap --author t", cwd=tmp)
+        r = sh(f"{ZF} brief --json", cwd=tmp)
+        record(
+            "a snapshot that matches the disk is what to commit next",
+            '"next": "commit-pending"' in r[1],
+            r[1][:200],
+        )
+
+        with open(os.path.join(tmp, "a.txt"), "w") as fh:
+            fh.write("v3\n")
+        r = sh(f"{ZF} brief --json", cwd=tmp)
+        record(
+            "a snapshot the disk moved past is named as stale",
+            '"stale": [' in r[1] and "cs" in r[1] and '"next": "commit-work"' in r[1],
+            r[1][:240],
+        )
+
+        # The MCP surface has to expose it, since that is how an agent reaches it.
+        r = sh(
+            f"""printf '%s\\n' '{{"jsonrpc":"2.0","id":1,"method":"tools/list"}}' | {ZF} mcp""",
+            cwd=tmp,
+        )
+        record(
+            "the MCP server offers brief and grep",
+            "gesta_brief" in r[1] and "gesta_grep" in r[1],
+            r[1][:160],
+        )
+
     if want("grep"):
         # Searching history is the capability a working tree cannot offer: the string that was
         # deleted is usually the one being looked for.

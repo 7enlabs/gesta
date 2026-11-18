@@ -360,6 +360,14 @@ pub fn as_str(v: &Json) -> Option<&str> {
     }
 }
 
+/// Read a boolean, so a tool argument does not have to be spelled as a string.
+pub fn as_bool(v: &Json) -> Option<bool> {
+    match v {
+        Json::Bool(b) => Some(*b),
+        _ => None,
+    }
+}
+
 pub fn as_i64(v: &Json) -> Option<i64> {
     match v {
         Json::Int(n) => Some(*n),

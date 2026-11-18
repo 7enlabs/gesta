@@ -5,6 +5,7 @@
 
 mod auth;
 mod bisect;
+mod brief;
 mod cache;
 mod clock;
 mod cli;
@@ -193,6 +194,12 @@ enum Cmd {
     Show {
         /// Path, optionally as `rev:path`
         spec: String,
+    },
+    /// Everything a session needs before its first edit, in one call
+    Brief {
+        /// Print the object instead of a short summary
+        #[arg(long)]
+        json: bool,
     },
     /// Search the working tree, or every version in the history
     Grep {
@@ -724,6 +731,13 @@ fn run() -> ZResult<()> {
         Cmd::Blame { file } => cli::cmd_blame(&file),
         Cmd::History { file } => cli::cmd_history(&file),
         Cmd::Show { spec } => cli::cmd_show(&spec),
+        Cmd::Brief { json: brief_json } => {
+            if brief_json {
+                cli::cmd_brief_json()
+            } else {
+                cli::cmd_brief()
+            }
+        }
         Cmd::Grep {
             pattern,
             history,

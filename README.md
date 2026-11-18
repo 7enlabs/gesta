@@ -78,6 +78,7 @@ gesta blame src/main.rs
 | `stash list` | Saved stashes, newest first |
 | `stash pop [--id N]` | Write a stash back, refusing over local changes |
 | `stash drop [--id N]` | Delete a stash without applying it |
+| `brief [--json]` | Everything a session needs before its first edit, in one call |
 | `grep <text> [--history]` | Find text in the working tree, or in every recorded version |
 | `hook list` | Which hooks are installed |
 | `hook install <name> [--file F]` | Write a hook, reading stdin when no file is given |
@@ -110,6 +111,25 @@ gesta blame src/main.rs
 | `fsck [--prune] [--worktree]` | Verify integrity, optionally drop orphan objects; `--worktree` also compares the files on disk with the head |
 | `stats` | Object counts and compression ratio |
 | `ignore add/list/remove` | Ignore patterns |
+
+### Starting a session
+
+```sh
+$ gesta brief
+branch:   main
+head:     cs6455603ddbe5
+next:     commit-work
+changed:  1 file(s) differ from the head
+
+the working tree differs from the head: `gesta changeset create` then `gesta changeset commit`, or `gesta stash save` to set it aside
+```
+
+`next` is one of `ready`, `commit-work`, `commit-pending` or `finish-rebase`, and the advice is
+the command for that state. A stopped rebase outranks everything else, because nothing else is
+safe until it is finished.
+
+Answering this with separate commands costs four round trips and four blocks of output to keep
+in context. One object is what an agent can branch on.
 
 ### Searching
 
