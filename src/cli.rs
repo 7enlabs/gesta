@@ -1214,8 +1214,43 @@ type YResultAlias = ZResult<()>;
 // JSON output. Each function mirrors the text command's data exactly; the text
 // version stays the default because a terminal is still the common case.
 
+/// The version of every JSON document this program prints.
+///
+/// An agent reads this output and branches on its field names. Renaming a field without saying
+/// so breaks a caller silently, which is the worst kind of break: it keeps running and does the
+/// wrong thing. The version goes on every object so a caller can refuse one it does not know.
+pub const SCHEMA_VERSION: &str = "gesta@1";
+
 fn emit(v: Json) {
-    println!("{}", v.render_pretty());
+    println!("{}", with_schema(v).render_pretty());
+}
+
+/// Wrap a list in an object that names the schema.
+///
+/// A bare array cannot carry a version, and an agent reading field names needs one. The bare
+/// form stays the default because a pipe through `jq '.[0]'` is what people already write, so
+/// the envelope is opt in rather than a silent change of shape.
+pub fn envelope(key: &str, items: Vec<Json>) -> Json {
+    let n = items.len() as i64;
+    Json::obj(vec![
+        ("schema", Json::str(SCHEMA_VERSION)),
+        ("count", Json::int(n)),
+        (key, Json::arr(items)),
+    ])
+}
+
+/// Put `schema` at the top level of an object. Arrays and scalars carry nothing to version.
+fn with_schema(v: Json) -> Json {
+    match v {
+        Json::Obj(mut m) => {
+            // A document that already names its schema keeps it: a nested object printing its
+            // own version must not be overwritten by the outer one.
+            m.entry("schema".to_string())
+                .or_insert_with(|| Json::str(SCHEMA_VERSION));
+            Json::Obj(m)
+        }
+        other => other,
+    }
 }
 
 pub fn cmd_status_json() -> ZResult<()> {
@@ -1256,7 +1291,7 @@ pub fn cmd_status_json() -> ZResult<()> {
     Ok(())
 }
 
-pub fn cmd_log_json(limit: usize) -> ZResult<()> {
+pub fn cmd_log_json(limit: usize, envelope: bool) -> ZResult<()> {
     let (_root, conn) = open_repo()?;
     let mut stmt = conn.prepare(
         "SELECT id, message, author, created_at, status, parent FROM changesets
@@ -1275,7 +1310,12 @@ pub fn cmd_log_json(limit: usize) -> ZResult<()> {
             ),
         ]))
     })?;
-    emit(Json::arr(rows.collect::<rusqlite::Result<Vec<_>>>()?));
+    let items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    if envelope {
+        emit(self::envelope("changesets", items));
+    } else {
+        emit(Json::arr(items));
+    }
     Ok(())
 }
 

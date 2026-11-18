@@ -112,6 +112,15 @@ gesta blame src/main.rs
 | `stats` | Object counts and compression ratio |
 | `ignore add/list/remove` | Ignore patterns |
 
+### A versioned contract
+
+Every JSON document carries `"schema": "gesta@1"`, and so does every MCP tool result. A parser
+that meets a version it does not know should refuse it rather than guess at field names
+([docs/json-contract.md](docs/json-contract.md)).
+
+`log --json` and `changeset list --json` stay bare arrays, because a list cannot carry a key and
+wrapping it would break the pipes people write. `--envelope` asks for the versioned object.
+
 ### Starting a session
 
 ```sh

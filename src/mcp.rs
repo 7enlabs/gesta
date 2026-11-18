@@ -286,6 +286,17 @@ fn call_tool(root: &Path, params: &Json) -> Result<Json, ToolError> {
     }
     .map_err(|e| (-32603, e))?;
 
+    // Every tool result carries the schema version, so a client can refuse one it does not
+    // know instead of reading fields by the wrong names and running on quietly wrong data.
+    let value = match value {
+        Json::Obj(mut m) => {
+            m.entry("schema".to_string())
+                .or_insert_with(|| Json::str(crate::cli::SCHEMA_VERSION));
+            Json::Obj(m)
+        }
+        other => other,
+    };
+
     // MCP wraps every tool result in a content array. The JSON is also returned
     // as text so a model that only reads `content` still sees the data.
     let text = value.render();

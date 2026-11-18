@@ -73,6 +73,60 @@ def mcp_session(cwd, messages):
     return responses, err
 
 
+def check_schema_version():
+    """Every JSON document carries a version, so a caller can refuse one it does not know.
+
+    A renamed field breaks a caller silently: it keeps running and reads the wrong thing. The
+    version is the only way a client can tell that the shape moved.
+    """
+    d = os.path.join(ROOT, "schema")
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d, exist_ok=True)
+    run("init", cwd=d)
+    write(d, "a.txt", "hello\n")
+    commit(d, "first")
+
+    for label, args in (
+        ("status", ["--json", "status"]),
+        ("brief", ["brief", "--json"]),
+        ("branch list", ["--json", "branch", "list"]),
+    ):
+        rc, out = run(*args, cwd=d)
+        ok = False
+        try:
+            ok = json.loads(out).get("schema") == "gesta@1"
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        record(f"the {label} document names its schema version", ok, out[:200])
+
+    rc, out = run("--json", "log", "--limit", "1", "--envelope", cwd=d)
+    ok = False
+    try:
+        doc = json.loads(out)
+        ok = doc.get("schema") == "gesta@1" and isinstance(doc.get("changesets"), list)
+    except json.JSONDecodeError:
+        pass
+    record("log --envelope names its schema and still carries the list", ok, out[:200])
+
+    rc, out = run("--json", "log", "--limit", "1", cwd=d)
+    ok = out.lstrip().startswith("[")
+    record("log --json stays a bare array so existing pipes keep working", ok, out[:120])
+
+    responses, _err = mcp_session(d, [
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+         "params": {"name": "gesta_brief", "arguments": {}}},
+    ])
+    got = ""
+    for r in responses:
+        if r.get("id") == 1:
+            got = (r.get("result") or {}).get("structuredContent") or {}
+    record(
+        "an MCP tool result names its schema too",
+        isinstance(got, dict) and got.get("schema") == "gesta@1",
+        str(got)[:200],
+    )
+
+
 def main():
     if not os.path.exists(ZF):
         sys.exit(f"binary not found: {ZF}")
@@ -85,6 +139,8 @@ def main():
     write(repo, "src/main.rs", "fn main() {\n    println!(\"hi\");\n}\n")
     write(repo, "README.md", "# demo\n")
     commit(repo, "initial commit")
+
+    check_schema_version()
 
     # --- MCP over stdio ---
     responses, err = mcp_session(

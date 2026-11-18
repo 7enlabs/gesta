@@ -180,6 +180,9 @@ enum Cmd {
         /// One line per changeset
         #[arg(long)]
         oneline: bool,
+        /// With --json, wrap the list in an object that names its schema
+        #[arg(long)]
+        envelope: bool,
     },
     /// Changeset operations
     Changeset {
@@ -676,7 +679,9 @@ fn run() -> ZResult<()> {
     let json = cli.json;
     match cli.cmd {
         Cmd::Status if json => cli::cmd_status_json(),
-        Cmd::Log { limit, .. } if json => cli::cmd_log_json(limit),
+        Cmd::Log {
+            limit, envelope, ..
+        } if json => cli::cmd_log_json(limit, envelope),
         Cmd::Blame { file } if json => cli::cmd_blame_json(&file),
         Cmd::History { file } if json => cli::cmd_history_json(&file),
         Cmd::Diff { changeset, from, to, .. } if json => {
@@ -717,7 +722,7 @@ fn run() -> ZResult<()> {
                 cli::cmd_diff(changeset.as_deref(), name_only)
             }
         }
-        Cmd::Log { limit, oneline } => cli::cmd_log(limit, oneline),
+        Cmd::Log { limit, oneline, .. } => cli::cmd_log(limit, oneline),
         Cmd::Changeset { sub } => match sub {
             ChangesetCmd::Create { message, author, session, intent } => {
                 let session = session.or_else(|| std::env::var("GESTA_SESSION").ok());
