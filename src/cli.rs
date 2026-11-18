@@ -2743,7 +2743,19 @@ pub fn cmd_review(from: Option<&str>, to: Option<&str>, min_risk: Option<&str>) 
                         println!("      ... {} more", stale.len() - 5);
                     }
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    // Nothing found is not the same claim as nothing to find. Counting where a
+                    // name could be built or forwarded says which of the two this is, and a
+                    // reader who knows the gap decides differently about the clean result.
+                    let blind = crate::impact::blind_spots(&conn, &tree);
+                    if blind.any() {
+                        println!(
+                            "    no stale reference found, but {} file(s) could hide one: {} place(s) \
+                             build a name at run time, {} forward it through another name",
+                            blind.files_read, blind.computed_keys, blind.indirections
+                        );
+                    }
+                }
                 // A review that fails because a file could not be read would stop a reader
                 // from seeing the findings it did produce. Say so and carry on.
                 Err(e) => println!("    impact check skipped: {}", e),

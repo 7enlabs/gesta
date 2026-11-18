@@ -1474,6 +1474,82 @@ def main():
             (nolist[1] or "")[:200],
         )
 
+    if want("impact-blind"):
+        # "Nothing found" and "nothing to find" are different claims. A review that reports the
+        # first as the second makes a clean result look stronger than it is.
+        import tempfile as _tf
+        d = _tf.mkdtemp()
+        sh(f"{ZF} init", cwd=d)
+        os.makedirs(os.path.join(d, "src"), exist_ok=True)
+        with open(os.path.join(d, "src", "opts.js"), "w") as fh:
+            fh.write("export const timeout_ms = 30;\n")
+        with open(os.path.join(d, "src", "dyn.js"), "w") as fh:
+            fh.write('const key = "time" + "out_ms";\nimport * as o from "./opts";\nconsole.log(o[key]);\n')
+        sh(f'{ZF} changeset create "add opts" --author t', cwd=d)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=d)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+
+        with open(os.path.join(d, "src", "opts.js"), "w") as fh:
+            fh.write("export const timeoutSeconds = 30;\n")
+        sh(f'{ZF} changeset create "rename the field" --author t', cwd=d)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=d)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+
+        rev = sh(f"{ZF} review", cwd=d)
+        body = rev[1] or ""
+        record(
+            "a review that finds nothing says how much it could not see",
+            "no stale reference found, but" in body,
+            body[-400:],
+        )
+        record(
+            "and counts the places that build a name at run time",
+            "1 place(s) build a name at run time" in body,
+            body[-400:],
+        )
+        record(
+            "and the places that forward it through another name",
+            "1 forward it through another name" in body,
+            body[-400:],
+        )
+
+        # When something IS found the blind-spot line must not appear: it would read as doubt
+        # about a finding that is certain.
+        d2 = _tf.mkdtemp()
+        sh(f"{ZF} init", cwd=d2)
+        os.makedirs(os.path.join(d2, "src"), exist_ok=True)
+        with open(os.path.join(d2, "src", "config.js"), "w") as fh:
+            fh.write("export function parseConfig(raw) {\n  return raw;\n}\n")
+        with open(os.path.join(d2, "src", "main.js"), "w") as fh:
+            fh.write("const c = require(\"./config\");\nconst v = c.parseConfig(x);\n")
+        sh(f'{ZF} changeset create "add config" --author t', cwd=d2)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=d2)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d2)
+
+        with open(os.path.join(d2, "src", "config.js"), "w") as fh:
+            fh.write("export function readConfig(raw) {\n  return raw;\n}\n")
+        sh(f'{ZF} changeset create "rename parseConfig" --author t', cwd=d2)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=d2)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d2)
+
+        found = sh(f"{ZF} review", cwd=d2)
+        fb = found[1] or ""
+        record(
+            "a stale reference is named with its file and line",
+            "stale reference(s) in files this step did not touch" in fb
+            and "src/main.js line 2" in fb,
+            fb[-500:],
+        )
+        record(
+            "and a definite finding is not hedged with a blind-spot note",
+            "no stale reference found" not in fb,
+            fb[-400:],
+        )
+
     if want("gc"):
         # A repository that only grows is a repository that gets slower and bigger forever. The
         # check plants an object nothing references and asks gc to remove exactly that one.

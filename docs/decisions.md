@@ -159,3 +159,9 @@ Following the chain at read time is what makes re-tagging honest. The walk is bo
 ## T3. Blame reads its ignore list from the repository, not from local configuration
 
 A tree-wide reformat or a symbol rename makes every line point at one changeset. True, and useless: the reader wants the change that last touched the line in substance. A list at the repository root means every clone inherits the same answer. A list that lives in local configuration gives two people two different histories of the same file, which is the one outcome a blame cannot afford.
+
+## I1. "Nothing found" is not "nothing to find"
+
+A review that reports no stale reference reads as a clean bill of health. That is a stronger claim than the search can support: a name built at run time or reached through an alias is invisible to a text search. Counting the places where that could happen, and saying so only when nothing was found, turns a silent gap into a stated one without hedging a definite finding.
+
+The count comes from the same tree the search walked, so both answers describe one pass over one set of files. A count taken from a different set would answer a different question.

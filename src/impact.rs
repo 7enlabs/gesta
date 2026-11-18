@@ -113,6 +113,72 @@ fn is_noise(name: &str) -> bool {
     NOISE.contains(&lower.as_str()) || name.len() < 4
 }
 
+
+/// What a search could not see, counted rather than guessed at.
+///
+/// A review that finds nothing reads as "nothing to find". That is a different claim from "nothing
+/// I can see", and the difference decides whether a reader trusts a clean result. The two shapes
+/// that stay invisible are a name assembled at run time and a name reached through another name,
+/// so counting the places those could hide turns a silent gap into a stated one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlindSpots {
+    /// Lines that build a string, so a key they produce is not a name this search can match.
+    pub computed_keys: usize,
+    /// Lines that re-export or alias, so a name can reach a file through a second name.
+    pub indirections: usize,
+    /// Files whose content was read; the denominator for the two counts above.
+    pub files_read: usize,
+}
+
+impl BlindSpots {
+    /// Whether the search had anything it could not see.
+    pub fn any(&self) -> bool {
+        self.computed_keys > 0 || self.indirections > 0
+    }
+}
+
+/// Count the places where a name could be built or forwarded.
+///
+/// This walks the same tree the search walks, so the two answers describe one pass over one set of
+/// files. A count taken from a different set would be a claim about a different question.
+pub fn blind_spots(conn: &Connection, tree: &[(String, String)]) -> BlindSpots {
+    // Named so the checks below read as shapes rather than as escaped quote soup.
+    const QUOTE: char = '"';
+    let mut out = BlindSpots::default();
+    for (_, hash) in tree {
+        let Ok(body) = crate::store::get_object(conn, hash) else {
+            continue;
+        };
+        out.files_read += 1;
+        for line in body.lines() {
+            let t = line.trim();
+            if t.starts_with("//") || t.starts_with('#') || t.starts_with('*') {
+                continue;
+            }
+            // A concatenation or a template placeholder is how a key gets built from parts.
+            // A quote-shaped string built by glue is the same shape as a template literal, so
+            // both are counted: the point is that a key was assembled, not how.
+            let glue_before = t.contains(&format!("+ {}", QUOTE));
+            let glue_after = t.contains(&format!("{} +", QUOTE));
+            let template = t.contains("`${");
+            let formatted = t.contains("format!(");
+            if glue_before || glue_after || template || formatted {
+                out.computed_keys += 1;
+            }
+            // A re-export or a destructuring alias gives one name two spellings.
+            if t.contains("export * from")
+                || t.contains("module.exports =")
+                || t.contains("} = require(")
+                || t.contains(" as ")
+                    && (t.contains("import") || t.contains("const {") || t.contains("let {"))
+            {
+                out.indirections += 1;
+            }
+        }
+    }
+    out
+}
+
 /// Find names the change removed that still appear somewhere it did not touch.
 ///
 /// `changed` is every path the change edited, so a name still present in one of those is not a
