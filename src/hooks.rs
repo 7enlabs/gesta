@@ -40,6 +40,87 @@ pub fn path_of(root: &Path, name: &str) -> PathBuf {
     hooks_dir(root).join(name)
 }
 
+/// What a repository recorded about an installed hook when it was installed.
+///
+/// A hook is a program that runs with the user's rights, so a hook that changed after it was
+/// installed is the interesting event: either its author edited it deliberately, or something
+/// else did. Recording the hash at install time is what makes that question answerable without
+/// asking the filesystem whether it looks suspicious.
+pub fn record_installed(root: &Path, name: &str, body: &str) -> ZResult<()> {
+    let dir = repo_dir(root);
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("hooks.installed");
+    let mut lines: Vec<String> = Vec::new();
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        for line in text.lines() {
+            // Replace the entry for this hook, and keep the rest as they were.
+            if let Some(rest) = line.strip_prefix(&format!("{}\t", name)) {
+                let _ = rest;
+                continue;
+            }
+            if !line.trim().is_empty() {
+                lines.push(line.to_string());
+            }
+        }
+    }
+    lines.push(format!("{}\t{}", name, crate::store::hash_content(body)));
+    lines.sort();
+    std::fs::write(&path, lines.join("\n") + "\n")?;
+    Ok(())
+}
+
+/// One hook's state: installed, what it hashed to when installed, and what it hashes to now.
+pub struct HookState {
+    pub name: String,
+    pub installed: bool,
+    pub recorded: Option<String>,
+    pub current: Option<String>,
+}
+
+impl HookState {
+    /// Whether the file changed after it was installed.
+    pub fn changed(&self) -> bool {
+        match (&self.recorded, &self.current) {
+            (Some(r), Some(c)) => r != c,
+            // Installed without a record, which an older repository can be: not "changed", but
+            // not verifiable either.
+            _ => false,
+        }
+    }
+}
+
+/// Compare every hook against what was recorded when it was installed.
+pub fn status(root: &Path) -> ZResult<Vec<HookState>> {
+    let record_path = repo_dir(root).join("hooks.installed");
+    let mut recorded: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if let Ok(text) = std::fs::read_to_string(&record_path) {
+        for line in text.lines() {
+            if let Some((name, hash)) = line.split_once('\t') {
+                recorded.insert(name.trim().to_string(), hash.trim().to_string());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for name in HOOKS {
+        let path = path_of(root, name);
+        let installed = path.is_file();
+        let current = if installed {
+            std::fs::read(&path)
+                .ok()
+                .map(|b| crate::store::hash_bytes(&b))
+        } else {
+            None
+        };
+        out.push(HookState {
+            name: name.to_string(),
+            installed,
+            recorded: recorded.get(*name).cloned(),
+            current,
+        });
+    }
+    Ok(out)
+}
+
 pub fn is_installed(root: &Path, name: &str) -> bool {
     path_of(root, name).is_file()
 }
@@ -54,6 +135,22 @@ pub fn run(root: &Path, name: &str, args: &[&str]) -> ZResult<()> {
     let path = path_of(root, name);
     if !path.is_file() {
         return Ok(());
+    }
+
+    // Refuse to run a hook that no longer matches what was installed.
+    //
+    // A hook executes with the user's rights, so checking it only when somebody remembers to ask
+    // protects nothing: the interesting case is the commit that is about to run it. A hook with
+    // no recorded hash is allowed, because a repository can predate the record and refusing would
+    // break it; the difference is reported by `hook status`, which is where somebody looks.
+    if let Some(state) = status(root)?.into_iter().find(|s| s.name == name) {
+        if state.changed() {
+            return Err(bad(format!(
+                "hook {} changed after it was installed; run `gesta hook status` to see both \
+                 hashes, then reinstall it to accept the new body",
+                name
+            )));
+        }
     }
 
     let out = Command::new(&path)
@@ -105,6 +202,9 @@ pub fn install(root: &Path, name: &str, body: &str) -> ZResult<PathBuf> {
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms)?;
     }
+    // The hash is taken from the bytes just written, not from re-reading the file, so a failure
+    // here cannot record something different from what the hook contains.
+    record_installed(root, name, body)?;
     Ok(path)
 }
 

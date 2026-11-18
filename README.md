@@ -89,6 +89,7 @@ gesta blame src/main.rs
 | `hook list` | Which hooks are installed |
 | `hook install <name> [--file F]` | Write a hook, reading stdin when no file is given |
 | `hook remove <name>` | Remove a hook |
+| `hook status [--json]` | Whether each hook still matches what was installed |
 | `rebase <onto> [--branch B]` | Replay a branch's changesets onto another point |
 | `rebase --continue` | Finish a stopped rebase using what is on disk |
 | `rebase --abort` | Put the branch back where the rebase started |
@@ -251,17 +252,27 @@ over an arbitrary order cuts the wrong half.
 
 ### Hooks
 
-A hook is a program in `.gesta/hooks/`. Two are supported:
+A hook is a program in `.gesta/hooks/`. Three are supported:
 
 - `pre-commit` runs before anything is written. A non-zero exit stops the
   commit and leaves the repository untouched, so a refusal cannot half-apply.
 - `post-commit` runs after the commit is durable. A non-zero exit is reported
   but does not undo the commit, because rolling back a finished write would make
   the store and the report disagree.
+- `pre-land` runs before a branch merges into a shared target, which is when a
+  change stops being private and the last point where a failing suite costs one
+  person instead of everybody. A refusal leaves both branches untouched.
 
-Both receive the operation and the changeset id as arguments, and run with the
-repository root as the working directory. Nothing runs unless a file with the
-hook name exists, so a fresh repository executes nothing it did not ask for.
+`pre-commit` and `post-commit` receive the operation and the changeset id as
+arguments; `pre-land` receives the source and target branch names. All run with
+the repository root as the working directory. Nothing runs unless a file with
+the hook name exists, so a fresh repository executes nothing it did not ask for.
+
+Hooks are ignored by the repository, so a clone never carries one and an
+incoming bundle cannot install a program that runs on its own. Installing a hook
+records its hash; a hook that changed after installation is refused rather than
+executed, and `hook status` shows both hashes. Reinstalling is how a deliberate
+edit is accepted.
 
 
 Every read command takes `--json` (status, log, blame, history, diff, tag, ops, branch list, changeset list). Show commands print text by default because a terminal is still the common case.

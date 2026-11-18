@@ -1950,7 +1950,7 @@ pub fn cmd_stash(sub: crate::StashCmd, json: bool) -> ZResult<()> {
     }
 }
 
-pub fn cmd_hook(sub: crate::HookCmd) -> ZResult<()> {
+pub fn cmd_hook(sub: crate::HookCmd, json: bool) -> ZResult<()> {
     use crate::HookCmd;
     match sub {
         HookCmd::List => {
@@ -1979,6 +1979,7 @@ pub fn cmd_hook(sub: crate::HookCmd) -> ZResult<()> {
             println!("installed {} at {}", name, path.display());
             Ok(())
         }
+        HookCmd::Status { json_status } => cmd_hook_status(json_status || json),
         HookCmd::Remove { name } => {
             let (root, _conn) = open_repo()?;
             if crate::hooks::remove(&root, &name)? {
@@ -1989,6 +1990,64 @@ pub fn cmd_hook(sub: crate::HookCmd) -> ZResult<()> {
             Ok(())
         }
     }
+}
+
+/// Report whether each hook still matches what was installed.
+///
+/// A hook runs with the user's rights. The interesting event is a hook that changed after it was
+/// installed, because that is either a deliberate edit somebody should see or an edit nobody
+/// asked for. Both deserve to be visible before the next commit runs it.
+pub fn cmd_hook_status(json: bool) -> ZResult<()> {
+    let (root, _conn) = open_repo()?;
+    let states = crate::hooks::status(&root)?;
+    if json {
+        let mut items = Vec::new();
+        for s in &states {
+            items.push(crate::json::Json::obj(vec![
+                ("name", crate::json::Json::str(s.name.clone())),
+                ("installed", crate::json::Json::Bool(s.installed)),
+                ("changed", crate::json::Json::Bool(s.changed())),
+                (
+                    "recorded",
+                    match &s.recorded {
+                        Some(h) => crate::json::Json::str(h.clone()),
+                        None => crate::json::Json::Null,
+                    },
+                ),
+                (
+                    "current",
+                    match &s.current {
+                        Some(h) => crate::json::Json::str(h.clone()),
+                        None => crate::json::Json::Null,
+                    },
+                ),
+            ]));
+        }
+        emit_object(vec![
+            ("hooks", crate::json::Json::Arr(items)),
+            (
+                "changed",
+                crate::json::Json::int(states.iter().filter(|s| s.changed()).count() as i64),
+            ),
+        ]);
+        return Ok(());
+    }
+    for s in &states {
+        if !s.installed {
+            println!("absent     {}", s.name);
+        } else if s.changed() {
+            println!("changed    {}", s.name);
+        } else if s.recorded.is_some() {
+            println!("unchanged  {}", s.name);
+        } else {
+            println!("unrecorded {}", s.name);
+        }
+    }
+    let changed = states.iter().filter(|s| s.changed()).count();
+    if changed > 0 {
+        println!("{} hook(s) changed since installation", changed);
+    }
+    Ok(())
 }
 
 pub fn cmd_bisect(sub: crate::BisectCmd) -> ZResult<()> {

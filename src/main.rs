@@ -586,6 +586,12 @@ enum HookCmd {
     },
     /// Remove a hook
     Remove { name: String },
+    /// Show each hook and whether it changed since it was installed
+    Status {
+        /// Answer as JSON
+        #[arg(long)]
+        json_status: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -872,7 +878,7 @@ fn run() -> ZResult<()> {
         Cmd::Bisect { sub } => cli::cmd_bisect(sub),
         Cmd::Sub { sub } => cli::cmd_sub(sub, json),
         Cmd::Stash { sub } => cli::cmd_stash(sub, json),
-        Cmd::Hook { sub } => cli::cmd_hook(sub),
+        Cmd::Hook { sub } => cli::cmd_hook(sub, json),
         Cmd::Init { bare } => cli::cmd_init(bare),
         Cmd::Status => cli::cmd_status(),
         Cmd::Diff { changeset, from, to, name_only } => {
