@@ -173,3 +173,11 @@ A gate reports on work nobody did when a skipped check counts as a pass. The fai
 ## G2. A step name that matches nothing must refuse
 
 `bench/gate.py <name>` runs one step. A mistyped name used to select nothing, print `0/0 gate steps pass`, and exit zero with the same sentence a full pass prints. Any selector must refuse a value it cannot honour, and should suggest the nearest name: a suggestion is the difference between an error somebody fixes and one they work around.
+
+## O1. Output that was cut says where the rest is
+
+A cap on a list leaves the reader knowing something exists and unable to see it. Every place that prints "and N more" names the command that lists all of them, and a cut line says how long it really was. The cost is a few characters; the alternative is a report nobody can act on.
+
+## O2. Cutting a long line is opt-in, and the default is the whole line
+
+A caller that gets a shortened line has no other place to fetch the original, so shortening by default removes information the caller cannot recover. `--max-line` exists for a caller that has decided a transcript is worth shrinking, and it states what it did.

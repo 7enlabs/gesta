@@ -200,7 +200,10 @@ pub fn cmd_inspect(
             println!("  {}  {}", id, author);
         }
         if bundle.changesets.len() > authors.len() {
-            println!("  ... and {} more", bundle.changesets.len() - authors.len());
+            println!(
+                "  ... and {} more (gesta remote inspect --json lists every author)",
+                bundle.changesets.len() - authors.len()
+            );
         }
         if identity.is_empty() {
             println!("  author identities: none");

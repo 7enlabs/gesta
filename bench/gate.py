@@ -2193,6 +2193,59 @@ def main():
             out[-600:],
         )
 
+    if want("cut-output"):
+        # Output that was shortened has to say so and say where the rest is. A count on its own
+        # leaves a reader knowing something exists and unable to see it.
+        import tempfile as _tf
+        import json as _json
+        d = _tf.mkdtemp()
+        sh(f"{ZF} init", cwd=d)
+        with open(os.path.join(d, "long.txt"), "w") as fh:
+            fh.write("x" * 4000 + "\n")
+        sh(f'{ZF} changeset create "long" --author t', cwd=d)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=d)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+
+        whole = sh(f"{ZF} grep x --path long.txt", cwd=d)
+        record(
+            "a long line is left whole by default",
+            whole[0] == 0 and len(whole[1].rstrip("\n")) >= 4000,
+            f"length {len(whole[1] or '')}",
+        )
+
+        cut = sh(f"{ZF} grep x --path long.txt --max-line 80", cwd=d)
+        body = cut[1] or ""
+        record(
+            "asking for a cut actually cuts",
+            "[" in body and "cut]" in body and len(body) < 500,
+            body[:200],
+        )
+        record(
+            "and the cut line says how long it really was",
+            "4000 chars, cut" in body,
+            body[:200],
+        )
+        record(
+            "and a note says how to see the whole line",
+            "run without --max-line" in body,
+            body[-200:],
+        )
+
+        # The three places that cap a list must name the way to see everything.
+        import subprocess as _sp
+        src = os.path.join(os.getcwd(), "src")
+        hits = _sp.run(
+            ["grep", "-rn", "more (", os.path.join(src, "cli.rs"), os.path.join(src, "cli_remote.rs")],
+            capture_output=True, text=True,
+        )
+        lines = [l for l in (hits.stdout or "").splitlines() if "more (" in l]
+        record(
+            "every capped list names the command that lists the rest",
+            len(lines) >= 3,
+            f"{len(lines)} capped list(s) name a way back: " + "; ".join(x[:70] for x in lines[:3]),
+        )
+
     if want("suites"):
         suites = [
             "e2e", "http_remote", "http_auth", "mcp_json", "api_changeset",

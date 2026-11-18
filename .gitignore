@@ -25,3 +25,6 @@ Thumbs.db
 
 # Scratch
 /tmp/
+
+# Harness output: one record per run, and a run is not source.
+bench/harness/runs/

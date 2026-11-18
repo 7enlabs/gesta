@@ -327,6 +327,9 @@ enum Cmd {
         /// Print `path:line` only, for piping into another tool
         #[arg(long)]
         files_with_matches: bool,
+        /// Cut each matching line to this many characters. Zero keeps lines whole.
+        #[arg(long = "max-line", default_value_t = 0)]
+        max_line: usize,
     },
     /// Write files back to disk from a changeset
     Checkout {
@@ -976,6 +979,7 @@ fn run() -> ZResult<()> {
             path,
             limit,
             files_with_matches,
+            max_line,
         } => {
             let search = cli::Search {
                 pattern,
@@ -986,6 +990,7 @@ fn run() -> ZResult<()> {
                 path,
                 limit,
                 files_with_matches,
+                max_line,
             };
             if json {
                 cli::cmd_grep_json(search)

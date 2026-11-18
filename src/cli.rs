@@ -333,7 +333,12 @@ pub fn cmd_status() -> ZResult<()> {
             println!("  ? {}", f);
         }
         if d.skipped_binary.len() > 10 {
-            println!("  ... and {} more", d.skipped_binary.len() - 10);
+            // Nothing hidden: output that was cut says where the rest is. A count alone leaves
+            // the reader knowing something exists and unable to see it.
+            println!(
+                "  ... and {} more (gesta diff --json lists every skipped path)",
+                d.skipped_binary.len() - 10
+            );
         }
     }
     Ok(())
@@ -1234,6 +1239,8 @@ pub struct Search {
     pub path: Option<String>,
     pub limit: i64,
     pub files_with_matches: bool,
+    /// Cut each matching line to this many characters. Zero keeps lines whole.
+    pub max_line: usize,
 }
 
 /// Search the working tree or the history.
@@ -1251,13 +1258,36 @@ pub fn cmd_grep(s: Search) -> ZResult<()> {
         }
         return Ok(());
     }
+    // A single minified line can be thousands of characters, and a person reading a terminal and
+    // an agent reading a transcript pay for all of it. Cutting is opt-in, because a caller that
+    // wants the whole line has no other place to get it, and a cut line says how long it was.
+    let mut cut = 0usize;
+    let clip = |text: &str| -> String {
+        if s.max_line == 0 || text.chars().count() <= s.max_line {
+            return text.to_string();
+        }
+        let mut out: String = text.chars().take(s.max_line).collect();
+        out.push_str(&format!(" [{} chars, cut]", text.chars().count()));
+        out
+    };
     for h in &hits {
+        if s.max_line > 0 && h.text.chars().count() > s.max_line {
+            cut += 1;
+        }
         if s.history {
             let short = &h.rev[..h.rev.len().min(14)];
-            println!("{}:{}:{}: {}", short, h.path, h.line, h.text);
+            println!("{}:{}:{}: {}", short, h.path, h.line, clip(&h.text));
         } else {
-            println!("{}:{}: {}", h.path, h.line, h.text);
+            println!("{}:{}: {}", h.path, h.line, clip(&h.text));
         }
+    }
+    if cut > 0 {
+        // The count and the way back, because a reader who is told only that something was
+        // shortened cannot see what it said.
+        eprintln!(
+            "note: {} line(s) were cut to {} characters; run without --max-line to see them whole",
+            cut, s.max_line
+        );
     }
     if hits.is_empty() {
         return Err(bad(no_match(&s.pattern, s.history)));
@@ -2740,7 +2770,10 @@ pub fn cmd_review(from: Option<&str>, to: Option<&str>, min_risk: Option<&str>) 
                         println!("        {}", s.text);
                     }
                     if stale.len() > 5 {
-                        println!("      ... {} more", stale.len() - 5);
+                        println!(
+                            "      ... {} more (gesta review --json lists every one)",
+                            stale.len() - 5
+                        );
                     }
                 }
                 Ok(_) => {
