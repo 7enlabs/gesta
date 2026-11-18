@@ -226,7 +226,9 @@ TASKS: list[Task] = [
             "gesta log --json | grep -q 'half done'",
             "gesta fsck",
         ],
-        solve=["gesta brief", "gesta changeset commit-all"],
+        # `--json` because the task is about what an agent learns from one call, and an agent reads
+        # the document rather than the prose.
+        solve=["gesta brief --json", "gesta changeset commit-all"],
         teaches="brief, changeset commit",
         tags=["agent"],
     ),

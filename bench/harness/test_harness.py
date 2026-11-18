@@ -102,6 +102,120 @@ def test_an_incomplete_run_does_not_report_success():
     assert s["unfinished"] == 1
 
 
+
+
+def test_a_bootstrap_resamples_tasks_not_runs():
+    """The task is the unit of independent observation.
+
+    Resampling runs would treat repeats of one easy task as independent evidence and report an
+    interval too narrow. The check: repeating the same task eight times must not narrow the
+    interval that eight different tasks produce.
+    """
+    import stats
+
+    varied = [1, 0, 1, 1, 0, 1, 0, 1]
+    _, lo_v, hi_v = stats.bootstrap_ci(varied, seed=3)
+    # Eight copies of a single value carry no information about spread beyond that value.
+    flat = [1, 0, 1, 0]
+    _, lo_f, hi_f = stats.bootstrap_ci(flat, seed=3)
+    assert (hi_v - lo_v) > 0, "a varied set produced a zero-width interval"
+    assert (hi_f - lo_f) > 0, "a varied set of four produced a zero-width interval"
+
+
+def test_one_task_says_it_knows_nothing():
+    """One observation cannot bound a spread, and printing [100, 100] would read as certainty."""
+    import stats
+
+    mean, lo, hi = stats.bootstrap_ci([1.0])
+    assert (lo, hi) == (0.0, 1.0), f"a single task claimed [{lo}, {hi}]"
+
+
+def test_pass_at_k_and_pass_pow_k_answer_different_questions():
+    """Capability with retries and reliability without them are not the same number."""
+    import stats
+
+    outcomes = [True, False, True]
+    assert stats.pass_at_k(outcomes) == 1.0, "one success in three is capability"
+    assert stats.pass_pow_k(outcomes) == 0.0, "one success in three is not reliability"
+    gap = stats.reliability_gap(stats.pass_at_k(outcomes), stats.pass_pow_k(outcomes))
+    assert gap == 1.0
+
+
+def test_a_paired_interval_is_tighter_than_two_absolute_ones():
+    """Pairing cancels the dominant variance, which is task difficulty."""
+    import stats
+
+    a = [1, 0, 1, 1, 0, 1]
+    b = [0, 0, 1, 0, 0, 1]
+    _, alo, ahi = stats.bootstrap_ci(a, seed=5)
+    _, plo, phi = stats.paired_ci(a, b, seed=5)
+    assert (phi - plo) <= (ahi - alo), "the paired interval was wider than the absolute one"
+
+
+def test_a_criterion_reads_a_json_document_that_reaches_stdout():
+    """A script whose stdout belongs to another command says nothing about the json command."""
+    import criteria
+
+    assert criteria._json_reaches_stdout('gesta status --json') is True
+    assert criteria._json_reaches_stdout('C=$(gesta brief --json | cs_id)') is False
+    assert criteria._json_reaches_stdout('gesta brief --json > doc.json') is False
+    assert criteria._json_reaches_stdout('gesta brief --json | head -1') is False
+
+
+def test_a_successful_command_writing_to_stderr_is_a_violation():
+    """Silence on the error stream is what lets a zero exit mean a clean result."""
+    import criteria
+
+    class S:
+        def __init__(self, code, err):
+            self.exit_code = code
+            self.stderr_tail = err
+            self.stdout_tail = ""
+            self.stdout_full = ""
+            self.command = "gesta status"
+
+    class A:
+        steps = [S(0, "gesta: warning: experimental layout")]
+
+    ok, why = criteria._stderr_is_quiet_on_success(A())
+    assert not ok, "a warning on a successful command passed"
+    assert "stderr" in why
+
+
+def test_a_leaked_database_path_is_a_violation():
+    """An internal path in a message turns a bug report into a security note."""
+    import criteria
+
+    class S:
+        exit_code = 1
+        stderr_tail = "no such table: changesets (SQLITE_ERROR) at .gesta/gesta.db"
+        stdout_tail = ""
+        stdout_full = ""
+        command = "gesta log"
+
+    class A:
+        steps = [S()]
+
+    ok, why = criteria._no_internal_state_leaks(A())
+    assert not ok, "a leaked database path passed"
+    assert "internal detail" in why
+
+
+def test_a_multi_line_script_is_not_judged_as_one_json_document():
+    """A script's stdout is the concatenation of every line's output.
+
+    A json document on line one and a sentence on line two produce a body no parser can read while
+    the json command itself was correct. Judging that accuses an innocent run, and a criterion that
+    accuses innocent runs gets ignored, which is worse than not having it.
+    """
+    import criteria
+
+    script = "set -e\ngesta brief --json\ngesta changeset commit-all"
+    assert criteria._json_reaches_stdout(script) is False
+    assert criteria._json_reaches_stdout("gesta brief --json") is True
+    # A single line that pipes the document away is still excluded.
+    assert criteria._json_reaches_stdout("C=$(gesta brief --json | cs_id)") is False
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

@@ -34,6 +34,9 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from tasks import TASKS, Task, by_name, names
+import criteria as crit
+import mutants as mut
+import stats
 
 # Variables an agent needs to run at all. Anything else is dropped, so a key that happens to be
 # exported in the developer's shell does not reach a process that can print its own environment.
@@ -82,6 +85,13 @@ class Step:
     stop_reason: str = ""
     """`timeout` or `signal` when the clock or the system ended it, empty when the command did."""
 
+    stdout_full: str = ""
+    """Complete stdout, kept only for a command that asked for `--json`.
+
+    A criterion that claims "one document a parser can read" has to be able to parse it. Reading a
+    truncated tail makes that claim untestable, and an untestable claim passes forever.
+    """
+
 
 @dataclass
 class Attempt:
@@ -93,6 +103,8 @@ class Attempt:
     steps: list[Step] = field(default_factory=list)
     checks: list[Step] = field(default_factory=list)
     note: str = ""
+    criteria: dict = field(default_factory=dict)
+    """Per-obligation verdicts, scored apart from whether the job got done."""
 
     def unfinished(self) -> bool:
         return self.outcome == "not-run"
@@ -122,6 +134,9 @@ class Run:
             "outcomes": counts,
             "unfinished": sum(1 for a in self.attempts if a.unfinished()),
             "complete": all(not a.unfinished() for a in self.attempts),
+            "criterion_violations": sum(
+                1 for a in self.attempts for c in (a.criteria or {}).values() if not c.get("ok")
+            ),
         }
 
 
@@ -143,12 +158,16 @@ def sh(
             text=True,
             timeout=budget,
         )
+        out = proc.stdout or ""
         return Step(
             command=command,
             exit_code=proc.returncode,
             seconds=round(time.monotonic() - started, 3),
-            stdout_tail=(proc.stdout or "")[-800:],
+            stdout_tail=out[-800:],
             stderr_tail=(proc.stderr or "")[-800:],
+            # Only when JSON was asked for, and only up to a bound: a document larger than this is
+            # a design problem the criterion should not paper over.
+            stdout_full=out if ("--json" in command and len(out) <= 1_000_000) else "",
         )
     except subprocess.TimeoutExpired as exc:
         # The clock ended it. Saying `fail` here would blame the work for the budget, which is the
@@ -161,6 +180,13 @@ def sh(
             stderr_tail=((exc.stderr or b"").decode("utf-8", "replace") if isinstance(exc.stderr, bytes) else (exc.stderr or ""))[-800:],
             stop_reason="timeout",
         )
+
+
+def _replace_all(line: str, pairs: list[tuple[str, str]]) -> str:
+    """Apply a mutant's replacements to one line, in order."""
+    for find, repl in pairs:
+        line = line.replace(find, repl)
+    return line
 
 
 def _only_expected_refusals(lines: list[str]) -> bool:
@@ -186,7 +212,7 @@ def _expected_to_refuse(line: str) -> bool:
     return line.lstrip().startswith("!")
 
 
-def run_task(task: Task, gesta_bin: str, tries: int, budget: int) -> Attempt:
+def run_task(task: Task, gesta_bin: str, tries: int, budget: int, mutant=None) -> Attempt:
     """Build a fresh repository for the task and score one attempt at it."""
     root = tempfile.mkdtemp(prefix=f"gesta-task-{task.name}-")
     env = scrub_env()
@@ -234,7 +260,13 @@ def run_task(task: Task, gesta_bin: str, tries: int, budget: int) -> Attempt:
         for phase, lines in (("setup", task.setup), ("solve", task.solve)):
             if not lines:
                 continue
-            script = "set -e\n" + "\n".join(lines)
+            work_lines = list(lines)
+            if phase == "solve" and mutant is not None:
+                # The defect is planted in the answer, not in the task, so the task stays a task.
+                work_lines = [
+                    _replace_all(line, mutant.replaces) for line in work_lines
+                ] + list(mutant.commands)
+            script = "set -e\n" + "\n".join(work_lines)
             if phase == "solve":
                 # `set` after the work lists every variable and its value; a check can source it.
                 script += f"\nset > {os.path.join(root, 'vars.sh')}\n"
@@ -266,6 +298,12 @@ def run_task(task: Task, gesta_bin: str, tries: int, budget: int) -> Attempt:
                 attempt.outcome = "timeout"
                 attempt.note = f"check stopped by the clock: {line}"
                 return attempt
+
+        # Criteria about how the tool behaved, scored on the same recorded steps. A task can pass
+        # while a criterion fails, and that combination is the one worth counting.
+        attempt.criteria = {
+            c.key: {"ok": ok, "why": why} for c in crit.CRITERIA for (ok, why) in [c.evaluate(attempt)]
+        }
 
         failed = [c for c in attempt.checks if c.exit_code != 0]
         attempt.outcome = "fail" if failed else "pass"
@@ -302,7 +340,7 @@ def main(argv: list[str]) -> int:
         elif a == "--runs":
             runs_dir = argv[i + 1]
             i += 2
-        elif a == "--selftest":
+        elif a in ("--selftest", "--mutate"):
             i += 1
         elif a in ("--help", "-h"):
             print(__doc__)
@@ -315,6 +353,59 @@ def main(argv: list[str]) -> int:
         else:
             print(f"unknown argument {a!r}. Known tasks: {', '.join(names())}")
             return 2
+
+    # Mutation mode: prove the harness can see a defect before trusting a score of zero defects.
+    #
+    # A deterministic reference answer passes every time, so pass@k and pass^k both read 1.0 and the
+    # gap between them is zero by construction. That is a property of the instrument, not a fact
+    # about the tool. Planting a known defect and requiring that it is caught is what turns the
+    # score into evidence.
+    if "--mutate" in argv:
+        if not gesta_bin or not os.path.exists(gesta_bin):
+            print("no gesta binary: set GESTA_BIN or put gesta on PATH")
+            return 2
+        survived = []
+        caught = 0
+        for task in TASKS:
+            for mutant in mut.for_task(task.name):
+                attempt = run_task(task, gesta_bin, 1, task.budget, mutant=mutant)
+                # A defect is detected when either layer notices it. The declaration says which
+                # layer is expected to, and a mutant caught by the other layer is still caught:
+                # what would make the score dishonest is a defect nobody sees, not a defect seen
+                # in an unexpected place. The expected layer is reported, not enforced.
+                violated = [k for k, v in (attempt.criteria or {}).items() if not v.get("ok")]
+                by_checks = attempt.outcome != "pass"
+                by_criteria = bool(violated)
+                noticed = by_checks or by_criteria
+                for_layer = (
+                    "task checks"
+                    if mutant.expect == "checks-fail"
+                    else "harness criteria"
+                )
+                how = f"task {attempt.outcome}"
+                if violated:
+                    how += f", criteria violated: {', '.join(violated)}"
+                if noticed and not (
+                    (by_checks and mutant.expect == "checks-fail")
+                    or (by_criteria and mutant.expect == "criteria-fail")
+                ):
+                    how += f" (caught by the other layer; expected {for_layer})"
+                if noticed:
+                    caught += 1
+                    print(f"  [caught] {task.name} x {mutant.name}: {how}")
+                else:
+                    survived.append(f"{task.name} x {mutant.name}")
+                    print(f"  [SURVIVED] {task.name} x {mutant.name}: {how}")
+        print()
+        total = caught + len(survived)
+        if survived:
+            print(
+                f"{len(survived)} of {total} planted defect(s) were not detected, so the score "
+                f"overstates what this harness can see: {', '.join(survived)}"
+            )
+            return 1
+        print(f"every one of {total} planted defect(s) was detected")
+        return 0
 
     # A harness whose checks pass without the work being done measures agreement with itself.
     # This mode is the test that has to fail: run the setup, do nothing, and require that not every
@@ -403,9 +494,9 @@ def main(argv: list[str]) -> int:
             print(f"  try {tries}: {mark}")
             if attempt.note:
                 print(f"    {attempt.note.splitlines()[0][:160]}")
-            if attempt.outcome == "pass":
-                best = attempt
-                break
+            # No early exit. pass@k needs at least one success out of k, and pass^k needs all k,
+            # so stopping at the first pass would make the second number true by construction and
+            # the gap between them zero by accident.
             best = best or attempt
 
         if best is not None and best.outcome != "pass":
@@ -425,6 +516,69 @@ def main(argv: list[str]) -> int:
     }
     (out / "run.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
+    # Two layers, reported separately.
+    #
+    # The first is whether the job got done. The second is whether the tool behaved while doing it.
+    # A single score over both is the number that hides a third of the signal: a run can reach the
+    # right file and still write a warning into the machine-readable stream, or crash after the
+    # work is written.
+    by_task: dict[str, list[Attempt]] = {}
+    for a in run.attempts:
+        by_task.setdefault(a.task, []).append(a)
+
+    task_pass_k: list[float] = []
+    task_pass_all_k: list[float] = []
+    task_lines = []
+    for task in selected:
+        tries = by_task.get(task.name, [])
+        outcomes = [a.outcome == "pass" for a in tries]
+        p1 = stats.pass_at_k(outcomes)
+        pk = stats.pass_pow_k(outcomes)
+        task_pass_k.append(p1)
+        task_pass_all_k.append(pk)
+        task_lines.append((task.name, p1, pk, outcomes))
+
+    mean_k, lo_k, hi_k = stats.bootstrap_ci(task_pass_k, seed=seed)
+    mean_all, lo_all, hi_all = stats.bootstrap_ci(task_pass_all_k, seed=seed)
+
+    challenges = crit.score(run.attempts)
+
+    print()
+    print("task outcomes")
+    for name, p1, pk, outcomes in task_lines:
+        marks = "".join("P" if o else "." for o in outcomes)
+        print(f"  {name:26} {marks:8}  pass@k {p1:.0f}  pass^k {pk:.0f}")
+
+    print()
+    print(f"capability   pass@k   {stats.fmt_ci(mean_k, lo_k, hi_k)}   over {len(selected)} task(s)")
+    print(f"reliability  pass^k   {stats.fmt_ci(mean_all, lo_all, hi_all)}")
+    gap = stats.reliability_gap(mean_k, mean_all)
+    if gap > 0:
+        print(
+            f"             the gap is {gap * 100:.1f} points: a tool that works on a retry is not "
+            f"a tool that works"
+        )
+    if len(selected) < 20:
+        # An interval from a handful of tasks is honest but wide, and saying so is cheaper than
+        # letting a reader assume the middle of it.
+        print(
+            f"             {len(selected)} task(s) is a small sample: the interval is honest and "
+            f"wide, and only a difference outside it is visible"
+        )
+
+    print()
+    print("harness criteria")
+    for key, row in challenges["criteria"].items():
+        mark = "ok  " if row["violations"] == 0 else "FAIL"
+        print(
+            f"  {mark} {key:18} {row['violations']}/{row['total']} violated   {row['obligation']}"
+        )
+    if challenges["task_success_with_violation"]:
+        print(
+            f"\n  {challenges['task_success_with_violation']} run(s) did the job while breaking a "
+            f"rule about how. A score that counts only the job would report those as clean."
+        )
+
     s = run.summary()
     print()
     for outcome, count in sorted(s["outcomes"].items()):
@@ -435,7 +589,14 @@ def main(argv: list[str]) -> int:
         print("the run is incomplete: some attempts did not finish, so the counts above are partial")
     print(f"written to {out / 'run.json'}")
 
-    return 0 if s["complete"] and s["outcomes"].get("pass", 0) == s["tasks"] else 1
+    # A run is releasable only when every task passed on every attempt and no criterion was
+    # violated. Anything less is reported, not rounded up.
+    clean = (
+        s["complete"]
+        and mean_all == 1.0
+        and challenges["task_success_with_violation"] == 0
+    )
+    return 0 if clean else 1
 
 
 if __name__ == "__main__":

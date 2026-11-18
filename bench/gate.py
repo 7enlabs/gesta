@@ -2193,6 +2193,26 @@ def main():
             out[-600:],
         )
 
+        # A score of zero defects is evidence only if the instrument can see a defect. Planting a
+        # known one and requiring that it is caught is what makes the passing run mean something.
+        rc, out = sh(f"cd bench/harness && {env_prefix}python3 run.py --mutate", timeout=900)
+        record(
+            "every planted defect is detected by a task check or a harness criterion",
+            rc == 0 and "planted defect(s) was detected" in out,
+            out[-700:],
+        )
+
+        # Two layers, not one: a run can do the job and still behave badly, and a single score
+        # reports that combination as clean.
+        rc, out = sh(
+            f"cd bench/harness && {env_prefix}python3 run.py --k 2", timeout=900
+        )
+        record(
+            "the report separates capability from reliability",
+            "capability" in out and "reliability" in out and "pass^k" in out,
+            out[-500:],
+        )
+
     if want("cut-output"):
         # Output that was shortened has to say so and say where the rest is. A count on its own
         # leaves a reader knowing something exists and unable to see it.

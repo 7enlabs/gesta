@@ -181,3 +181,34 @@ A cap on a list leaves the reader knowing something exists and unable to see it.
 ## O2. Cutting a long line is opt-in, and the default is the whole line
 
 A caller that gets a shortened line has no other place to fetch the original, so shortening by default removes information the caller cannot recover. `--max-line` exists for a caller that has decided a transcript is worth shrinking, and it states what it did.
+
+## H1. Two layers, scored apart
+
+A task can succeed while the tool behaved badly. Scoring only the deliverable reports that
+combination as clean, and the harness benchmark literature puts the size of the gap at 31.1% of runs.
+Every attempt is scored on whether the job got done and separately on five obligations about how.
+
+A criterion must not accuse an innocent run. That is the failure that makes it useless rather than
+strict: an instrument that cries wolf gets switched off. A command whose output was piped or
+redirected away is not judged, and neither is a multi-line script, whose stdout belongs to no single
+command inside it.
+
+## H2. The bootstrap resamples tasks, never runs
+
+Variance is a between-task term over the task count plus a within-task term over tasks times runs.
+Adding runs shrinks only the second, and on agent work the first is usually larger. Resampling runs
+would treat repeats of one easy task as independent evidence and report an interval too narrow to be
+useful.
+
+One task reports [0, 100]. A zero-width interval from a single observation is certainty nobody
+earned.
+
+## H3. A passing score needs a mutation test to mean anything
+
+A deterministic reference answer passes every time, so the interval is zero by construction: that is
+a property of the instrument, not a fact about the tool. Planting a known defect and requiring that
+something catches it is what turns a score of zero defects into evidence.
+
+Mutation found four faults in this harness that a passing run could not: a criterion reading a
+truncated tail it could never parse, a criterion judging a script's concatenated output as if it
+belonged to one command, and two mutants whose planted defect never reached the path they claimed.
