@@ -228,3 +228,11 @@ Every tool failure used to return -32603, which tells a client the server broke.
 Calling a tool directly tests whether it works. It says nothing about whether anything reading twelve descriptions can tell them apart. `gesta_status` and `gesta_brief` both answer "what is going on", and a wrong choice returns a plausible answer, so the mistake never surfaces as an error.
 
 The eval scores selection, arguments and restraint separately. Restraint matters most: a request no tool answers must be declined, because a forced fit turns "I cannot" into an action.
+
+## S1. Blame is stored as ranges, and the author is not stored with it
+
+A row per line repeats the changeset, the author and the timestamp for every line of every file. This project had 62,824 such rows carrying one distinct changeset, and 90% of the database was that table and its indexes. A range says the same thing once: these lines, from this changeset.
+
+The author and the timestamp are not columns here. They have one home on `changesets`, and a reader joins for them. Duplicating a value that has one home is how a database ends up mostly repetition, and making the duplicate smaller does not compete with not writing it.
+
+Measured: 9,236,480 bytes to 901,120 on this project, and 550,338,560 to 73,469,952 on a 10,669-file vault. Against git, 10.16x became 1.36x.

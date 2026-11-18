@@ -128,14 +128,24 @@ pub fn init_schema(conn: &Connection) -> ZResult<()> {
             created_at   INTEGER NOT NULL,
             PRIMARY KEY (path, version)
         );
-        CREATE TABLE IF NOT EXISTS blame (
+        -- Blame is stored as ranges, not as one row per line.
+        --
+        -- A row per line repeats the changeset, the author and the timestamp for every line of
+        -- every file. On this project that was 62,824 rows carrying one distinct changeset: 90% of
+        -- the database held the same three values over and over, and the two indexes over them
+        -- doubled it. A range says the same thing once: these lines, from this changeset.
+        --
+        -- `author` and `committed_at` are not stored here at all. They live on `changesets`, keyed
+        -- by id, and a reader joins for them. Duplicating a value that has one home is how a
+        -- database ends up mostly repetition.
+        CREATE TABLE IF NOT EXISTS blame_ranges (
             path         TEXT NOT NULL,
-            line_no      INTEGER NOT NULL,
+            start_line   INTEGER NOT NULL,
+            end_line     INTEGER NOT NULL,
             changeset_id TEXT NOT NULL,
-            author       TEXT NOT NULL,
-            committed_at INTEGER NOT NULL,
-            PRIMARY KEY (path, line_no)
+            PRIMARY KEY (path, start_line)
         );
+        CREATE INDEX IF NOT EXISTS idx_blame_ranges_cs ON blame_ranges(changeset_id);
         -- No working_copy table: committed content already lives in `objects`
         -- and duplicating it doubled disk usage for nothing.
         CREATE TABLE IF NOT EXISTS branches (
@@ -224,7 +234,6 @@ pub fn init_schema(conn: &Connection) -> ZResult<()> {
         CREATE INDEX IF NOT EXISTS idx_fv_path ON file_versions(path);
         CREATE INDEX IF NOT EXISTS idx_cs_status ON changesets(status, created_at);
         CREATE INDEX IF NOT EXISTS idx_cs_parent ON changesets(parent);
-        CREATE INDEX IF NOT EXISTS idx_blame_cs ON blame(changeset_id);
         "#,
     )?;
 

@@ -327,7 +327,7 @@ pub fn commit_one(conn: &Connection, id: &str) -> ZResult<usize> {
             None => {
                 // Deletion: record it as a version with no hash so history can
                 // still answer "which changeset removed this file".
-                tx.execute("DELETE FROM blame WHERE path = ?1", params![path])?;
+                tx.execute("DELETE FROM blame_ranges WHERE path = ?1", params![path])?;
                 written += 1;
             }
         }
@@ -362,7 +362,7 @@ fn recompute_blame(conn: &Connection, files: &[(String, String)]) -> ZResult<()>
         let current = match get_object(conn, hash) {
             Ok(text) => text,
             Err(_) => {
-                conn.execute("DELETE FROM blame WHERE path = ?1", params![path])?;
+                conn.execute("DELETE FROM blame_ranges WHERE path = ?1", params![path])?;
                 continue;
             }
         };
@@ -379,21 +379,33 @@ fn recompute_blame(conn: &Connection, files: &[(String, String)]) -> ZResult<()>
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
 
-        // Blame rows come back in line order, which lets the match below run as a
-        // forward walk over two sequences instead of a search.
+        // Blame comes back as ranges, and the match below walks two sequences line by line, so
+        // the ranges are expanded here. Line order is what lets that walk run forward instead of
+        // searching, and a range always covers consecutive lines.
         let previous: Vec<(String, String, i64)> = {
             let mut stmt = conn.prepare(
-                "SELECT changeset_id, author, committed_at FROM blame
-                 WHERE path = ?1 ORDER BY line_no ASC",
+                "SELECT b.start_line, b.end_line, b.changeset_id, c.author, c.created_at
+                 FROM blame_ranges b JOIN changesets c ON c.id = b.changeset_id
+                 WHERE b.path = ?1 ORDER BY b.start_line ASC",
             )?;
-            let rows = stmt.query_map(params![path], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
-                ))
-            })?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
+            let ranges = stmt
+                .query_map(params![path], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, i64>(4)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut out = Vec::new();
+            for (start, end, cs, author, ts) in ranges {
+                for _ in start..=end {
+                    out.push((cs.clone(), author.clone(), ts));
+                }
+            }
+            out
         };
 
         // The version before this one. Its lines tell which of the previous blame
@@ -453,13 +465,23 @@ fn recompute_blame(conn: &Connection, files: &[(String, String)]) -> ZResult<()>
             .map(|o| o.unwrap_or_else(|| fallback.clone()))
             .collect();
 
-        conn.execute("DELETE FROM blame WHERE path = ?1", params![path])?;
+        conn.execute("DELETE FROM blame_ranges WHERE path = ?1", params![path])?;
+        // Consecutive lines owned by the same changeset become one range. A file written in one
+        // commit is one row instead of one row per line, which is what it always meant.
         let mut stmt = conn.prepare(
-            "INSERT INTO blame(path, line_no, changeset_id, author, committed_at)
-             VALUES(?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO blame_ranges(path, start_line, end_line, changeset_id)
+             VALUES(?1, ?2, ?3, ?4)",
         )?;
-        for (i, (cs_id, author, ts)) in owner.iter().enumerate() {
-            stmt.execute(params![path, (i + 1) as i64, cs_id, author, ts])?;
+        let mut i = 0usize;
+        while i < owner.len() {
+            let (cs_id, _, _) = &owner[i];
+            let start = i;
+            let mut end = i;
+            while end + 1 < owner.len() && &owner[end + 1].0 == cs_id {
+                end += 1;
+            }
+            stmt.execute(params![path, (start + 1) as i64, (end + 1) as i64, cs_id])?;
+            i = end + 1;
         }
     }
     Ok(())
@@ -956,7 +978,7 @@ pub fn cherry_pick(
              VALUES(?1, ?2, NULL, NULL)",
             params![id, path],
         )?;
-        tx.execute("DELETE FROM blame WHERE path = ?1", params![path])?;
+        tx.execute("DELETE FROM blame_ranges WHERE path = ?1", params![path])?;
     }
     crate::store::set_branch_head(&tx, target, &id)?;
     tx.commit()?;
@@ -1800,12 +1822,36 @@ pub(crate) mod tests {
     }
 
     /// Authors in line order, one per line of the current file.
+    /// One author per line, which is what every caller of this helper means.
+    ///
+    /// Blame is stored as ranges, so a helper that returned one entry per row would report one
+    /// author for a file written in one commit and three for a file written in three. The tests
+    /// below are about which line belongs to whom, so the expansion belongs here.
     fn authors(conn: &Connection, path: &str) -> Vec<String> {
         let mut stmt = conn
-            .prepare("SELECT author FROM blame WHERE path = ?1 ORDER BY line_no")
+            .prepare(
+                "SELECT b.start_line, b.end_line, c.author FROM blame_ranges b
+                 JOIN changesets c ON c.id = b.changeset_id
+                 WHERE b.path = ?1 ORDER BY b.start_line",
+            )
             .unwrap();
-        let rows = stmt.query_map(params![path], |r| r.get::<_, String>(0)).unwrap();
-        rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        let rows = stmt
+            .query_map(params![path], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap();
+        let mut out = Vec::new();
+        for row in rows {
+            let (start, end, author) = row.unwrap();
+            for _ in start..=end {
+                out.push(author.clone());
+            }
+        }
+        out
     }
 
     #[test]
@@ -1874,8 +1920,15 @@ pub(crate) mod tests {
             .query_row("SELECT COUNT(*) FROM file_versions WHERE path='f.txt'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(versions, 1);
+        // Two lines written by one changeset are one range now. The count of rows is not the count
+        // of lines, and a test that asserted otherwise was asserting the old storage shape rather
+        // than the answer.
         let blamed: i64 = conn
-            .query_row("SELECT COUNT(*) FROM blame WHERE path='f.txt'", [], |r| r.get(0))
+            .query_row(
+                "SELECT SUM(end_line - start_line + 1) FROM blame_ranges WHERE path='f.txt'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(blamed, 2);
         assert_eq!(branch_head(&conn, "main").unwrap().as_deref(), Some("cs1"));
@@ -1908,10 +1961,10 @@ pub(crate) mod tests {
         commit_files(&conn, "cs2", "v2", &[("f.txt", "keep\nnew\nend\n")]);
 
         let line1: String = conn
-            .query_row("SELECT changeset_id FROM blame WHERE path='f.txt' AND line_no=1", [], |r| r.get(0))
+            .query_row("SELECT changeset_id FROM blame_ranges WHERE path='f.txt' AND start_line<=1 AND end_line>=1", [], |r| r.get(0))
             .unwrap();
         let line2: String = conn
-            .query_row("SELECT changeset_id FROM blame WHERE path='f.txt' AND line_no=2", [], |r| r.get(0))
+            .query_row("SELECT changeset_id FROM blame_ranges WHERE path='f.txt' AND start_line<=2 AND end_line>=2", [], |r| r.get(0))
             .unwrap();
         assert_eq!(line1, "cs1", "unchanged line keeps its original changeset");
         assert_eq!(line2, "cs2", "changed line belongs to the new changeset");
@@ -1952,14 +2005,10 @@ pub(crate) mod tests {
         .unwrap();
         commit_one(&conn, "cs2").unwrap();
 
-        let authors: Vec<String> = {
-            let mut stmt = conn
-                .prepare("SELECT author FROM blame WHERE path='f.txt' ORDER BY line_no")
-                .unwrap();
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
-            rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
-        };
-        assert_eq!(authors, vec!["agentA", "agentA", "agentA", "agentB"],
+        // Through the helper, so this test asks the same question as the others: which line
+        // belongs to whom, not how the answer is stored.
+        let blamed = authors(&conn, "f.txt");
+        assert_eq!(blamed, vec!["agentA", "agentA", "agentA", "agentB"],
             "the appended duplicate belongs to agentB");
     }
 

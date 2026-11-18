@@ -79,3 +79,34 @@ A real fix is fewer rows, not smaller ones. Two candidates, neither implemented:
 
 Both are schema changes and both lose a capability. Neither has been done, and the honest
 number stays 6.6x until one of them is.
+
+## Blame was 90% of the database
+
+Measured on this project: 118 files, 62,824 blame rows, one distinct changeset. The table repeated
+the same changeset id, author and timestamp once per line of every file, and its two indexes doubled
+the cost. `dbstat` put blame at 3,944,448 bytes plus 4,412,800 bytes of index, against 622,592 bytes
+for the objects themselves. The disk figure this project reported as 6.6x and 10.2x was mostly this
+one table.
+
+Blame is stored as ranges now. A file written by one commit is one row:
+
+```
+path            start_line  end_line  changeset_id
+wide.txt        1           400       cs...
+```
+
+Editing one line splits it into three ranges rather than 401 rows. The author and the timestamp are
+not stored here at all: they live on `changesets`, keyed by id, and a reader joins for them.
+
+Two numbers, both measured.
+
+| Tree | Before | After |
+|---|---|---|
+| this project, 118 files | 9,236,480 bytes, 62,824 rows | 901,120 bytes, 116 rows |
+| a markdown vault, 10,669 files | 550,338,560 bytes | 73,469,952 bytes |
+
+Against git's roughly 54 MB for the same vault, that is 1.36x instead of 10.16x. Committing the
+whole vault took 5,371 ms before and 1,229 ms after.
+
+The general rule: a row that repeats a value which has one home is the largest cost in a database,
+and no amount of making that row smaller competes with not writing it.

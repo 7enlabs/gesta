@@ -818,7 +818,7 @@ pub fn cmd_stats() -> ZResult<()> {
     let objects = count_objects(&conn)?;
     let changesets: i64 = conn.query_row("SELECT COUNT(*) FROM changesets", [], |r| r.get(0))?;
     let versions: i64 = conn.query_row("SELECT COUNT(*) FROM file_versions", [], |r| r.get(0))?;
-    let blame: i64 = conn.query_row("SELECT COUNT(*) FROM blame", [], |r| r.get(0))?;
+    let blame: i64 = conn.query_row("SELECT COUNT(*) FROM blame_ranges", [], |r| r.get(0))?;
     let branches: i64 = conn.query_row("SELECT COUNT(*) FROM branches", [], |r| r.get(0))?;
     let tags: i64 = conn.query_row("SELECT COUNT(*) FROM tags", [], |r| r.get(0))?;
 

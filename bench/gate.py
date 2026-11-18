@@ -2394,6 +2394,78 @@ def main():
             f"empty: {', '.join(thin[:4])}" if thin else "every section lists what changed",
         )
 
+    if want("blame-storage"):
+        # Blame stored one row per line, repeating the changeset, the author and the timestamp for
+        # every line of every file. On this project that was 62,824 rows carrying one distinct
+        # changeset, and 90% of the database. Ranges say the same thing once.
+        import tempfile as _tf
+
+        d = _tf.mkdtemp()
+        sh(f"{ZF} init", cwd=d)
+        # A file wide enough that per-line storage would be obvious.
+        with open(os.path.join(d, "wide.txt"), "w") as fh:
+            fh.write("".join(f"line {i}\n" for i in range(1, 401)))
+        sh(f'{ZF} changeset create "one commit writes the file" --author solo', cwd=d)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=d)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+
+        import sqlite3 as _sq
+        db = _sq.connect(os.path.join(d, ".gesta", "gesta.db"))
+        rows = db.execute("select count(*) from blame_ranges where path='wide.txt'").fetchone()[0]
+        covered = db.execute(
+            "select sum(end_line - start_line + 1) from blame_ranges where path='wide.txt'"
+        ).fetchone()[0]
+        db.close()
+
+        record(
+            "one commit writing a 400-line file stores one range, not 400 rows",
+            rows == 1,
+            f"{rows} row(s) for 400 lines",
+        )
+        record(
+            "and the range covers every line",
+            covered == 400,
+            f"{covered} line(s) covered",
+        )
+
+        # A second author on one line must split the range rather than rewrite it.
+        with open(os.path.join(d, "wide.txt"), "w") as fh:
+            fh.write("".join(f"line {i}\n" for i in range(1, 401)).replace("line 200\n", "line 200 changed\n"))
+        sh(f'{ZF} changeset create "one line changed" --author other', cwd=d)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=d)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+
+        db = _sq.connect(os.path.join(d, ".gesta", "gesta.db"))
+        r2 = db.execute(
+            "select start_line, end_line, changeset_id from blame_ranges where path='wide.txt' order by start_line"
+        ).fetchall()
+        db.close()
+        record(
+            "an edit in the middle splits the range into three, not 400 rows",
+            len(r2) == 3 and r2[1][0] == 200 and r2[1][1] == 200,
+            f"{len(r2)} range(s): " + ", ".join(f"{a}-{b}" for a, b, _ in r2),
+        )
+
+        blame = sh(f"{ZF} blame wide.txt", cwd=d)
+        body = blame[1] or ""
+        record(
+            "and blame still names the other author on that line",
+            "other" in body and "solo" in body,
+            body[body.find("line 199") - 60 : body.find("line 199") + 120] if "line 199" in body else body[:200],
+        )
+
+        # The author is stored once, on the changeset, and read by join.
+        db = _sq.connect(os.path.join(d, ".gesta", "gesta.db"))
+        cols = [r[1] for r in db.execute("pragma table_info(blame_ranges)")]
+        db.close()
+        record(
+            "the blame table does not duplicate the author or the timestamp",
+            "author" not in cols and "committed_at" not in cols,
+            f"columns: {', '.join(cols)}",
+        )
+
     if want("suites"):
         suites = [
             "e2e", "http_remote", "http_auth", "mcp_json", "api_changeset",

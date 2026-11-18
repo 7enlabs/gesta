@@ -723,14 +723,14 @@ fn blame_through(
 ) -> ZResult<Option<(String, String, Option<String>)>> {
     let current: Option<(String, String, Option<String>)> = conn
         .query_row(
-            "SELECT b.changeset_id, b.author, c.intent
-             FROM blame b LEFT JOIN changesets c ON c.id = b.changeset_id
-             WHERE b.path = ?1 AND b.line_no = ?2",
+            "SELECT b.changeset_id, c.author, c.intent
+             FROM blame_ranges b LEFT JOIN changesets c ON c.id = b.changeset_id
+             WHERE b.path = ?1 AND b.start_line <= ?2 AND b.end_line >= ?2",
             rusqlite::params![path, line_no],
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(1)?.unwrap_or_default(),
                     r.get::<_, Option<String>>(2)?,
                 ))
             },
@@ -805,20 +805,32 @@ pub fn cmd_blame(file: &str, ignore: &[String]) -> ZResult<()> {
     // session wrote it and why, which is the question that actually comes up when an
     // agent produced most of the file.
     let rows: Vec<(i64, String, String, Option<String>)> = {
+        // Expand the ranges into one entry per line, because the caller prints a line at a time.
+        // The expansion happens here rather than in the store: a range is the cheapest way to
+        // keep the answer, and a list of lines is the cheapest way to read it.
         let mut stmt = conn.prepare(
-            "SELECT b.line_no, b.changeset_id, b.author, c.intent
-             FROM blame b LEFT JOIN changesets c ON c.id = b.changeset_id
-             WHERE b.path = ?1 ORDER BY b.line_no",
+            "SELECT b.start_line, b.end_line, b.changeset_id, c.author, c.intent
+             FROM blame_ranges b LEFT JOIN changesets c ON c.id = b.changeset_id
+             WHERE b.path = ?1 ORDER BY b.start_line",
         )?;
-        let rows = stmt.query_map(rusqlite::params![rel], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Option<String>>(3)?,
-            ))
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
+        let ranges = stmt
+            .query_map(rusqlite::params![rel], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut out = Vec::new();
+        for (start, end, cs, author, intent) in ranges {
+            for line in start..=end {
+                out.push((line, cs.clone(), author.clone().unwrap_or_default(), intent.clone()));
+            }
+        }
+        out
     };
 
     if rows.is_empty() {
@@ -1803,16 +1815,34 @@ pub fn cmd_blame_json(file: &str) -> ZResult<()> {
     let (_root, conn) = open_repo()?;
     let rel = normalise(file);
     let mut stmt = conn.prepare(
-        "SELECT line_no, changeset_id, author FROM blame WHERE path = ?1 ORDER BY line_no",
+        "SELECT b.start_line, b.end_line, b.changeset_id, c.author FROM blame_ranges b
+         LEFT JOIN changesets c ON c.id = b.changeset_id WHERE b.path = ?1 ORDER BY b.start_line",
     )?;
-    let rows = stmt.query_map(rusqlite::params![rel], |r| {
-        Ok(Json::obj(vec![
-            ("line", Json::int(r.get::<_, i64>(0)?)),
-            ("changeset", Json::str(r.get::<_, String>(1)?)),
-            ("author", Json::str(r.get::<_, String>(2)?)),
-        ]))
-    })?;
-    let lines = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    // The document keeps one entry per line, because a caller that asked for JSON asked for the
+    // same answer the text form gives. Ranges are how the answer is stored, not how it is read.
+    let ranges = stmt
+        .query_map(rusqlite::params![rel], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut lines = Vec::new();
+    for (start, end, cs, author) in ranges {
+        for line in start..=end {
+            lines.push(Json::obj(vec![
+                ("line", Json::int(line)),
+                ("changeset", Json::str(cs.clone())),
+                (
+                    "author",
+                    Json::str(author.clone().unwrap_or_default()),
+                ),
+            ]));
+        }
+    }
     let count = lines.len();
     emit(Json::obj(vec![
         ("path", Json::str(rel)),

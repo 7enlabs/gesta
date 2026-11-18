@@ -630,7 +630,7 @@ that could not tell its result from its starting state. See `docs/harness.md`.
 - **TLS needs a certificate you supply or pin.** `serve --tls self-signed` works on a private network once a client pins the fingerprint; a public deployment needs a real certificate from a CA.
 - **Tokens expire but are not revocable per session.** An entry can carry an expiry date, and removing its line revokes it, but there is no "revoke this one now" call.
 - **No SSH transport.**
-- **Small files cost more than git.** 6.6x for a tree of tiny files, and 10.2x on a markdown vault of 11,000 files. Packing several objects into one row was built and measured: it made the file larger, because a pointer into a segment is a hash, two integers and a row header. The cost is spread over six tables that each hold a row per tracked path, so the fix is fewer rows, not smaller ones, and that costs a capability. The measurement is in `docs/storage.md`.
+- **Small files cost more than git.** 6.6x for a tree of tiny files. A markdown vault of 10,669 files costs 1.36x, down from 10.16x: blame held one row per line, repeating a changeset and an author that had one home, and ranges replaced it. Packing several objects into one row was built and measured first and made the file larger, because a pointer into a segment is a hash, two integers and a row header. Both measurements are in `docs/storage.md`.
 - **Blame is line-sequence based.** A line moved and edited in the same commit loses its original author.
 - **Binary files are stored but not diffed.** They are kept raw and restored byte for byte, and `blame` has nothing to attribute for them. There is no LFS: a large binary costs its full size in every version that changes it.
 - **No submodules in the git sense and no `.gitattributes`.** `sub` records a child repository as a pointer, which covers the case without git's file.
@@ -688,6 +688,6 @@ Each of these is pinned by a test, and each one exists because the first impleme
 
 ## Status
 
-Version 0.6.0. Usable for one developer or a set of agents, on one machine, on a private network over TLS, or by agents that never check out the tree. Still not a full git replacement: a tree of many tiny files costs 6.08x git in disk, and a token cannot be revoked before its expiry without editing the auth file. Rebase, cherry-pick, bisect and hooks exist; LFS does not.
+Version 0.6.0. Usable for one developer or a set of agents, on one machine, on a private network over TLS, or by agents that never check out the tree. A markdown vault of 10,669 files costs 1.36x git in disk, down from 10.16x after blame storage moved from one row per line to ranges. Still not a full git replacement: a token cannot be revoked before its expiry without editing the auth file, and LFS does not exist.
 
 `CHANGELOG.md` says what changed at each version. `docs/upgrade-plan.md` holds the measurements behind each decision and the list of what is still missing.

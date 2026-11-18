@@ -575,7 +575,10 @@ fn tool_read_file(conn: &Connection, args: &Json) -> Result<Json, String> {
 fn tool_blame(conn: &Connection, args: &Json) -> Result<Json, String> {
     let path = arg_str(args, "path").ok_or("params: blame needs a path")?;
     let mut stmt = conn
-        .prepare("SELECT line_no, changeset_id, author FROM blame WHERE path = ?1 ORDER BY line_no")
+        .prepare(
+            "SELECT b.start_line, b.end_line, b.changeset_id, c.author FROM blame_ranges b
+             LEFT JOIN changesets c ON c.id = b.changeset_id WHERE b.path = ?1 ORDER BY b.start_line",
+        )
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([&path], |r| {
