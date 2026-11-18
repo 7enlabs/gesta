@@ -830,6 +830,97 @@ fn ls_entries(
     Ok(tree)
 }
 
+/// Create a signing key and print the public half.
+pub fn cmd_key_generate(path: Option<&str>) -> ZResult<()> {
+    let path = match path {
+        Some(p) => std::path::PathBuf::from(p),
+        None => crate::sign::default_key_path(),
+    };
+    let key = crate::sign::SigningKey::generate(&path)?;
+    println!("created a signing key: {}", key.path.display());
+    println!("public key: {}", key.public_hex());
+    println!();
+    println!("Give that public key to anyone who should verify your changesets.");
+    Ok(())
+}
+
+/// Sign a pending changeset with the local key.
+pub fn cmd_sign(id: &str, key_path: Option<&str>) -> ZResult<()> {
+    let (_root, conn) = open_repo()?;
+    let (message, author, parent, status): (String, String, Option<String>, String) = conn
+        .query_row(
+            "SELECT message, author, parent, status FROM changesets WHERE id = ?1",
+            rusqlite::params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?
+        .ok_or_else(|| crate::error::Error::not_found(format!("no such changeset: {}", id)))?;
+    if status == "committed" {
+        return Err(bad(format!(
+            "{} is already committed: signing after the fact signs a different history than the one anybody else has",
+            id
+        )));
+    }
+    let path = match key_path {
+        Some(p) => std::path::PathBuf::from(p),
+        None => crate::sign::default_key_path(),
+    };
+    let key = crate::sign::SigningKey::load(&path)?;
+    let signature = key.sign_changeset(id, &message, &author, parent.as_deref());
+    conn.execute(
+        "UPDATE changesets SET signature = ?2, signer = ?3 WHERE id = ?1",
+        rusqlite::params![id, signature, key.public_hex()],
+    )?;
+    println!("signed {} with {}", id, key.public_hex());
+    Ok(())
+}
+
+/// Check a changeset's signature.
+pub fn cmd_verify(id: Option<&str>, key_hex: Option<&str>) -> ZResult<()> {
+    let (_root, conn) = open_repo()?;
+    let id = match id {
+        Some(i) => i.to_string(),
+        None => {
+            let branch = current_branch(&conn)?;
+            branch_head(&conn, &branch)?.ok_or_else(|| {
+                Box::new(crate::error::Error::new(
+                    crate::error::Code::NotFound,
+                    "the branch has no changesets to verify",
+                )) as Box<dyn std::error::Error>
+            })?
+        }
+    };
+    /// What a verification needs: the fields the signature covered, plus the signature itself.
+    type SignedRow = (String, String, Option<String>, Option<String>, Option<String>);
+    let row: Option<SignedRow> = conn
+        .query_row(
+            "SELECT message, author, parent, signature, signer FROM changesets WHERE id = ?1",
+            rusqlite::params![&id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?;
+    let (message, author, parent, signature, signer) = row
+        .ok_or_else(|| crate::error::Error::not_found(format!("no such changeset: {}", id)))?;
+    let signature = signature.ok_or_else(|| {
+        bad(format!(
+            "{} carries no signature: nothing to verify",
+            id
+        ))
+    })?;
+    let public = match key_hex {
+        Some(k) => k.to_string(),
+        None => signer.ok_or_else(|| {
+            bad(format!(
+                "{} records no signing key, so pass --key with the public key to check against",
+                id
+            ))
+        })?,
+    };
+    crate::sign::verify(&public, &id, &message, &author, parent.as_deref(), &signature)?;
+    println!("{} verifies against {}", id, public);
+    Ok(())
+}
+
 /// Read a git repository into this one.
 pub fn cmd_git_import(path: &str, prefix: Option<&str>) -> ZResult<()> {
     let (_root, conn) = open_repo()?;
@@ -1700,6 +1791,7 @@ pub fn dispatch_changeset_text(sub: crate::ChangesetCmd) -> ZResult<()> {
         crate::ChangesetCmd::CommitAll => cmd_changeset_commit_all(),
         crate::ChangesetCmd::Diff { id } => cmd_changeset_diff(&id),
         crate::ChangesetCmd::List => cmd_changeset_list(),
+        crate::ChangesetCmd::Sign { id, key } => cmd_sign(&id, key.as_deref()),
     }
 }
 

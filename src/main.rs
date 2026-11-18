@@ -30,6 +30,7 @@ mod rebase;
 mod repo;
 mod s3;
 mod secrets;
+mod sign;
 mod sigv4;
 mod sparse;
 mod stash;
@@ -453,6 +454,19 @@ enum Cmd {
     },
     /// Remove unreachable objects and vacuum the database
     Gc,
+    /// Manage the key that signs changesets
+    Key {
+        #[command(subcommand)]
+        sub: KeyCmd,
+    },
+    /// Check a changeset's signature against a public key
+    Verify {
+        /// Changeset id, or the current branch head when omitted
+        id: Option<String>,
+        /// The public key to check against, hex. Defaults to the one recorded with it.
+        #[arg(long)]
+        key: Option<String>,
+    },
     /// Verify repository integrity
     Fsck {
         /// Delete objects nothing references
@@ -497,6 +511,13 @@ enum ChangesetCmd {
     Diff { id: String },
     /// List pending changesets
     List,
+    /// Sign a pending changeset with the local key
+    Sign {
+        id: String,
+        /// Where the signing key lives; defaults to ~/.gesta/signing.key
+        #[arg(long)]
+        key: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -615,6 +636,16 @@ enum SecretCmd {
     List,
     /// Remove one entry
     Remove { name: String },
+}
+
+#[derive(Subcommand)]
+enum KeyCmd {
+    /// Create a signing key, refusing to overwrite one that exists
+    Generate {
+        /// Where to write it; defaults to ~/.gesta/signing.key
+        #[arg(long)]
+        path: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -845,6 +876,7 @@ fn run() -> ZResult<()> {
         }
         Cmd::Log { limit, oneline, .. } => cli::cmd_log(limit, oneline),
         Cmd::Changeset { sub } => match sub {
+            ChangesetCmd::Sign { id, key } => cli::cmd_sign(&id, key.as_deref()),
             ChangesetCmd::Create { message, author, session, intent } => {
                 let session = session.or_else(|| std::env::var("GESTA_SESSION").ok());
                 cli::cmd_changeset_create_meta(
@@ -957,6 +989,10 @@ fn run() -> ZResult<()> {
         }
         Cmd::Fsck { prune, worktree } => cli_remote::cmd_fsck(prune, worktree),
         Cmd::Gc => cli_remote::cmd_gc(),
+        Cmd::Key { sub } => match sub {
+            KeyCmd::Generate { path } => cli::cmd_key_generate(path.as_deref()),
+        },
+        Cmd::Verify { id, key } => cli::cmd_verify(id.as_deref(), key.as_deref()),
         Cmd::Stats => cli_remote::cmd_stats(),
         Cmd::Ignore { sub } => match sub {
             IgnoreCmd::Add { pattern } => cli_remote::cmd_ignore_add(&pattern),

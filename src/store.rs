@@ -101,6 +101,9 @@ pub fn init_schema(conn: &Connection) -> ZResult<()> {
             parent     TEXT,
             parent2    TEXT,
             branch     TEXT NOT NULL DEFAULT 'main',
+            -- Signature over this changeset's identity, and the public key it verifies with.
+            signature  TEXT,
+            signer     TEXT,
             -- Provenance: which session produced this change and why. When an agent
             -- writes most of the code, the reason behind a change is part of the
             -- change; a message alone loses it.
@@ -329,6 +332,9 @@ pub fn migrate(conn: &Connection) -> ZResult<bool> {
 
     conn.execute_batch("ALTER TABLE objects ADD COLUMN compressed INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(conn, "changesets", "git_commit", "TEXT")?;
+    // A signature over the changeset's identity, and the public key it verifies against.
+    ensure_column(conn, "changesets", "signature", "TEXT")?;
+    ensure_column(conn, "changesets", "signer", "TEXT")?;
     if !table_columns(conn, "changesets")?.iter().any(|c| c == "parent2") {
         conn.execute_batch("ALTER TABLE changesets ADD COLUMN parent2 TEXT")?;
     }

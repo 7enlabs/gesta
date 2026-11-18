@@ -726,6 +726,75 @@ def main():
                 (got[1] or "")[:160],
             )
 
+    if want("sign"):
+        # A commit message claims an author; a signature is the only part a verifier can check.
+        import tempfile as _tf
+        d = _tf.mkdtemp()
+        key = os.path.join(d, "signing.key")
+        sh(f"{ZF} init", cwd=d)
+        made = sh(f"{ZF} key generate --path {key}", cwd=d)
+        record("a signing key can be generated", made[0] == 0, (made[1] or "")[:160])
+        pub = ""
+        for line in (made[1] or "").splitlines():
+            if line.startswith("public key:"):
+                pub = line.split(":", 1)[1].strip()
+
+        with open(os.path.join(d, "a.txt"), "w") as fh:
+            fh.write("signed\n")
+        created = sh(f'{ZF} changeset create "signed change" --author alice', cwd=d)
+        m = re.search(r"(cs[0-9a-f]+)", created[1] or "")
+        signed = sh(f"{ZF} changeset sign {m.group(1)} --key {key}", cwd=d) if m else (1, "")
+        record("a pending changeset can be signed", signed[0] == 0, (signed[1] or "")[:160])
+
+        ok = sh(f"{ZF} verify {m.group(1)}", cwd=d) if m else (1, "")
+        record(
+            "the signature verifies against the recorded key",
+            ok[0] == 0 and "verifies" in (ok[1] or ""),
+            (ok[1] or "")[:160],
+        )
+
+        # Tamper with the recorded message and the signature must fail.
+        if m:
+            import sqlite3 as _sq
+            con = _sq.connect(os.path.join(d, ".gesta", "gesta.db"))
+            con.execute("UPDATE changesets SET message = 'tampered' WHERE id = ?", (m.group(1),))
+            con.commit()
+            con.close()
+            bad_ok = sh(f"{ZF} verify {m.group(1)}", cwd=d)
+            record(
+                "a changed message breaks the signature",
+                bad_ok[0] != 0 and "does not match" in (bad_ok[1] or ""),
+                (bad_ok[1] or "")[:160],
+            )
+            con = _sq.connect(os.path.join(d, ".gesta", "gesta.db"))
+            con.execute("UPDATE changesets SET message = 'signed change' WHERE id = ?", (m.group(1),))
+            con.commit()
+            con.close()
+
+        # A different key must not verify it.
+        other = os.path.join(d, "other.key")
+        sh(f"{ZF} key generate --path {other}", cwd=d)
+        other_pub = ""
+        again = sh(f"{ZF} key generate --path {other}", cwd=d)
+        record(
+            "generating over an existing key is refused",
+            again[0] != 0 and "already exists" in (again[1] or ""),
+            (again[1] or "")[:160],
+        )
+
+        unsigned_path = os.path.join(d, "b.txt")
+        with open(unsigned_path, "w") as fh:
+            fh.write("x\n")
+        c2 = sh(f'{ZF} changeset create "unsigned" --author bob', cwd=d)
+        m2 = re.search(r"(cs[0-9a-f]+)", c2[1] or "")
+        if m2:
+            v = sh(f"{ZF} verify {m2.group(1)}", cwd=d)
+            record(
+                "verifying an unsigned changeset says there is nothing to verify",
+                v[0] != 0 and "no signature" in (v[1] or ""),
+                (v[1] or "")[:160],
+            )
+
     if want("gc"):
         # A repository that only grows is a repository that gets slower and bigger forever. The
         # check plants an object nothing references and asks gc to remove exactly that one.
