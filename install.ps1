@@ -70,13 +70,23 @@ function Show-MissingSdk {
     Write-Host 'The linker stops at:'
     Write-Host "  LINK : fatal error LNK1181: cannot open input file 'kernel32.lib'"
     Write-Host ''
-    Write-Host 'Fix it one of two ways:'
+    # Both routes need elevation, and `winget install` alone does not work: it sees the Build
+    # Tools already present and reports "no available upgrade" without adding the component.
+    # That was tried and it changed nothing, so the installer no longer suggests it.
+    Write-Host 'Adding the SDK needs administrator rights. Two routes that work:' -ForegroundColor Yellow
     Write-Host ''
-    Write-Host '  1. Add the SDK to the build tools you already have:'
-    Write-Host '       winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.Windows11SDK.22621"'
+    Write-Host '  1. Add the component to the build tools already installed. Open an elevated'
+    Write-Host '     PowerShell (right click, "Run as administrator") and run:'
+    Write-Host ''
+    Write-Host '       & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe" modify --installPath "C:\BuildTools" --add Microsoft.VisualStudio.Component.Windows11SDK.22621 --quiet --norestart'
+    Write-Host ''
+    Write-Host '     Without elevation the installer exits with code 5007 and changes nothing.'
     Write-Host ''
     Write-Host '  2. Open Visual Studio Installer, choose Modify, tick "Windows 11 SDK" under'
-    Write-Host '     Individual components, then run this installer again.'
+    Write-Host '     Individual components, then run this installer again. The installer asks for'
+    Write-Host '     elevation itself when opened from the Start menu.'
+    Write-Host ''
+    Write-Host '  Either route downloads about 1 GB. After it finishes, run this again.'
     Write-Host ''
     Write-Host 'Nothing was changed on this machine.'
 }
@@ -102,9 +112,15 @@ function Test-Prerequisites {
             if (-not $linker) {
                 Write-Host ''
                 Write-Host 'Neither the MSVC compiler nor the Windows SDK is present.' -ForegroundColor Yellow
-                Write-Host 'Install the C++ build tools with the SDK:'
+                Write-Host 'Install the C++ build tools with the SDK. This needs administrator rights:'
+                Write-Host ''
                 Write-Host '  winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.Windows11SDK.22621"'
                 Write-Host ''
+                Write-Host 'Run that from an elevated PowerShell. On a machine with the build tools already'
+                Write-Host 'installed, winget reports "no available upgrade" and adds nothing: use the two'
+                Write-Host 'routes shown below instead.'
+                Write-Host ''
+                Show-MissingSdk
             } else {
                 Show-MissingSdk
             }

@@ -53,11 +53,24 @@ The SDK check looks for `kernel32.lib` under `Windows Kits\10\Lib\<version>\um\<
 a `Lib` folder: the machine above has `Windows Kits\10` holding `Catalogs` and `Redist` and no
 `Lib` at all, so a shallow check calls it installed.
 
-The fix, offered by the installer:
+The fix needs administrator rights, and `winget install` does not provide it. That command was
+tried on this machine and reported "Found an existing package already installed ... No available
+upgrade found": it saw the build tools, added no component, and the SDK stayed missing. Adding a
+component to an existing install is a different operation from installing the product.
 
+Two routes that work, both elevated:
+
+```powershell
+# elevated PowerShell
+& "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe" modify `
+    --installPath "C:\BuildTools" `
+    --add Microsoft.VisualStudio.Component.Windows11SDK.22621 `
+    --quiet --norestart
 ```
-winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.Windows11SDK.22621"
-```
+
+Or open Visual Studio Installer, Modify, tick "Windows 11 SDK" under Individual components. Without
+elevation the quiet route exits with code 5007 and changes nothing, which is at least honest; the
+GUI asks for elevation itself.
 
 `GESTA_CHECK=1` reports and changes nothing, so it is safe to run first on any machine. It exits
 non zero when something is missing, which makes it usable in a script.
