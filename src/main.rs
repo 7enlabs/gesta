@@ -203,6 +203,9 @@ enum Cmd {
         /// Do the safe part: commit snapshots that match the disk, drop ones it moved past
         #[arg(long)]
         fix: bool,
+        /// With --fix, set uncommitted work aside as a stash instead of refusing it
+        #[arg(long, requires = "fix")]
+        stash: bool,
     },
     /// Search the working tree, or every version in the history
     Grep {
@@ -734,9 +737,9 @@ fn run() -> ZResult<()> {
         Cmd::Blame { file } => cli::cmd_blame(&file),
         Cmd::History { file } => cli::cmd_history(&file),
         Cmd::Show { spec } => cli::cmd_show(&spec),
-        Cmd::Brief { json: brief_json, fix } => {
+        Cmd::Brief { json: brief_json, fix, stash } => {
             if fix {
-                cli::cmd_brief_fix(brief_json)
+                cli::cmd_brief_fix(brief_json, stash)
             } else if brief_json {
                 cli::cmd_brief_json()
             } else {

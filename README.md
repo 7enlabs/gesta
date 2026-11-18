@@ -78,7 +78,7 @@ gesta blame src/main.rs
 | `stash list` | Saved stashes, newest first |
 | `stash pop [--id N]` | Write a stash back, refusing over local changes |
 | `stash drop [--id N]` | Delete a stash without applying it |
-| `brief [--json] [--fix]` | Where the session stands, and `--fix` does the safe part |
+| `brief [--json] [--fix] [--stash]` | Where the session stands, and `--fix` does the safe part |
 | `grep <text> [--history]` | Find text in the working tree, or in every recorded version |
 | `hook list` | Which hooks are installed |
 | `hook install <name> [--file F]` | Write a hook, reading stdin when no file is given |
@@ -142,6 +142,20 @@ committed cs68f126bd1a15
 $ gesta brief --fix
 left alone: 1 file(s) -- the working tree differs from the head and no snapshot describes it: snapshot it with `gesta changeset create`, or set it aside with `gesta stash save`
 ```
+
+`--stash` adds one more action, and it takes a flag because it is the one that changes what a
+person sees on disk: uncommitted work is set aside as a stash instead of refused. The work is
+kept, the tree goes back to the head, and `gesta stash pop` brings it back.
+
+```
+$ gesta brief --fix --stash
+stashed 2 file(s) as stash 1
+$ gesta stash pop
+applied stash 1 (2 file(s)): set aside by brief --fix
+```
+
+A stopped rebase is still refused even with the flag, since stashing mid rebase would hide a
+conflict that has to be resolved first.
 
 ### Searching
 

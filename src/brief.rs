@@ -201,15 +201,25 @@ pub struct Fixed {
     pub dropped: Vec<String>,
     /// Left alone, with the reason. A fix that silently skips work is worse than no fix.
     pub skipped: Vec<(String, String)>,
+    /// A stash made from uncommitted work: its id and how many files it holds.
+    pub stashed: Vec<(i64, usize)>,
+}
+
+/// What a fix is allowed to do beyond the two actions that need no judgement.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Options {
+    /// Set the uncommitted work aside as a stash instead of refusing it.
+    ///
+    /// Off by default. Committing a snapshot is safe because the snapshot already describes the
+    /// disk; a stash is safe because it keeps the work. What is not safe is deciding on someone's
+    /// behalf that their unfinished edit should disappear from the tree, so it takes a flag.
+    pub stash_uncommitted: bool,
 }
 
 /// Do the safe part of what `brief` reports, and name what was left.
 ///
-/// Only two actions qualify. A snapshot that matches the disk exactly is committed, since that
-/// is the work it recorded. A snapshot the disk has moved past is dropped, since committing it
-/// would record content nobody is looking at. Anything else, a rebase in progress or uncommitted
-/// work with no snapshot, is left to a person: those choices lose data when guessed.
-pub fn fix(conn: &Connection, root: &Path) -> ZResult<Fixed> {
+/// `Options::default()` is the state that needs no judgement; every extra action is opt in.
+pub fn fix_with(conn: &Connection, root: &Path, opts: Options) -> ZResult<Fixed> {
     let b = brief(conn, root)?;
     let mut out = Fixed::default();
 
@@ -244,12 +254,34 @@ pub fn fix(conn: &Connection, root: &Path) -> ZResult<Fixed> {
         }
     }
 
-    if out.committed.is_empty() && out.dropped.is_empty() && b.changed > 0 {
-        out.skipped.push((
-            format!("{} file(s)", b.changed),
-            "the working tree differs from the head and no snapshot describes it: snapshot it with `gesta changeset create`, or set it aside with `gesta stash save`".to_string(),
-        ));
+    // The tree is read again, because committing or dropping a snapshot does not touch the disk:
+    // the files still differ from the new head, and the count from before is now wrong.
+    let changed = brief(conn, root)?.changed;
+    if changed == 0 {
+        return Ok(out);
     }
+    if opts.stash_uncommitted {
+        match crate::stash::save(conn, root, "set aside by brief --fix", "gesta brief --fix") {
+            Ok((id, files)) => out.stashed.push((id, files)),
+            Err(e) => out.skipped.push((
+                format!("{} file(s)", changed),
+                format!("could not stash: {}", e),
+            )),
+        }
+        // A stash that claimed to work but left the tree dirty would be worse than a refusal.
+        let left = brief(conn, root)?.changed;
+        if left > 0 {
+            out.skipped.push((
+                format!("{} file(s)", left),
+                "the tree still differs after stashing: check `gesta status`".to_string(),
+            ));
+        }
+        return Ok(out);
+    }
+    out.skipped.push((
+        format!("{} file(s)", changed),
+        "the working tree differs from the head and no snapshot describes it: snapshot it with `gesta changeset create`, or set it aside with `gesta stash save`".to_string(),
+    ));
     Ok(out)
 }
 
@@ -280,6 +312,20 @@ pub fn fixed_to_json(f: &Fixed) -> Json {
             Json::arr(f.dropped.iter().map(|s| Json::str(s.clone())).collect()),
         ),
         ("skipped", pair(&f.skipped)),
+        (
+            "stashed",
+            Json::arr(
+                f.stashed
+                    .iter()
+                    .map(|(id, n)| {
+                        Json::obj(vec![
+                            ("id", Json::int(*id)),
+                            ("files", Json::int(*n as i64)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
     ])
 }
 
@@ -402,7 +448,7 @@ mod tests {
         let cs = crate::repo::create_changeset(&conn, &dir, "snap", "a")
             .unwrap()
             .unwrap();
-        let f = fix(&conn, &dir).unwrap();
+        let f = fix_with(&conn, &dir, Options::default()).unwrap();
         assert_eq!(f.committed, vec![cs.id.clone()]);
         assert!(f.dropped.is_empty());
         assert_eq!(brief(&conn, &dir).unwrap().next, Next::Ready);
@@ -417,7 +463,7 @@ mod tests {
             .unwrap()
             .unwrap();
         std::fs::write(dir.join("a.txt"), "three\n").unwrap();
-        let f = fix(&conn, &dir).unwrap();
+        let f = fix_with(&conn, &dir, Options::default()).unwrap();
         assert_eq!(f.dropped, vec![cs.id.clone()], "the stale snapshot stayed");
         assert!(f.committed.is_empty(), "committing it would record stale content");
         // The drops removed the row rather than committing wrong content.
@@ -440,7 +486,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join("a.txt"), "two\n").unwrap();
         let before = brief(&conn, &dir).unwrap();
-        let f = fix(&conn, &dir).unwrap();
+        let f = fix_with(&conn, &dir, Options::default()).unwrap();
         assert!(f.committed.is_empty() && f.dropped.is_empty());
         assert!(!f.skipped.is_empty(), "a refusal must say why");
         assert!(f.skipped[0].1.contains("rebase --continue"));
@@ -453,7 +499,7 @@ mod tests {
     fn fix_leaves_uncommitted_work_alone_and_names_the_command() {
         let (conn, dir) = repo_with_one_commit("fix-work");
         std::fs::write(dir.join("a.txt"), "two\n").unwrap();
-        let f = fix(&conn, &dir).unwrap();
+        let f = fix_with(&conn, &dir, Options::default()).unwrap();
         assert!(f.committed.is_empty() && f.dropped.is_empty());
         assert!(f.skipped[0].1.contains("changeset create"));
         assert_eq!(
@@ -461,6 +507,63 @@ mod tests {
             "two\n",
             "the edit was touched"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn stash_is_not_used_unless_it_is_asked_for() {
+        let (conn, dir) = repo_with_one_commit("opt-off");
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        let f = fix_with(&conn, &dir, Options::default()).unwrap();
+        assert!(f.stashed.is_empty(), "the edit was set aside without being asked");
+        assert_eq!(brief(&conn, &dir).unwrap().changed, 1, "the edit left the tree");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn asking_for_it_sets_the_work_aside_and_leaves_a_clean_tree() {
+        let (conn, dir) = repo_with_one_commit("opt-on");
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "new\n").unwrap();
+        let f = fix_with(&conn, &dir, Options { stash_uncommitted: true }).unwrap();
+        assert_eq!(f.stashed.len(), 1);
+        assert_eq!(f.stashed[0].1, 2, "both the edit and the new file were saved");
+        assert!(f.skipped.is_empty(), "nothing should be left: {:?}", f.skipped);
+        assert_eq!(brief(&conn, &dir).unwrap().changed, 0, "the tree is still dirty");
+        // The head state came back, which is what makes the tree clean.
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "one\n");
+        assert!(!dir.join("b.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stashing_after_committing_a_snapshot_still_catches_what_is_left() {
+        // Committing changes the head but not the disk, so a count taken before it is wrong.
+        // This is the defect the second read of the tree exists to prevent.
+        let (conn, dir) = repo_with_one_commit("opt-both");
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        crate::repo::create_changeset(&conn, &dir, "snap", "a").unwrap();
+        std::fs::write(dir.join("c.txt"), "later\n").unwrap();
+        let f = fix_with(&conn, &dir, Options { stash_uncommitted: true }).unwrap();
+        assert_eq!(f.committed.len(), 1, "the snapshot was not committed");
+        assert_eq!(f.stashed.len(), 1, "the file added after the snapshot was not stashed");
+        assert_eq!(brief(&conn, &dir).unwrap().changed, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stopped_rebase_is_refused_even_when_stashing_was_asked_for() {
+        let (conn, dir) = repo_with_one_commit("opt-rebase");
+        crate::rebase::load(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO rebase(id, branch, onto, pending, current, done, original_head, created_at)
+             VALUES(1, 'side', 'main', '[\"x\"]', 'x', '[]', 'b1', 1)",
+            [],
+        )
+        .unwrap();
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        let f = fix_with(&conn, &dir, Options { stash_uncommitted: true }).unwrap();
+        assert!(f.stashed.is_empty(), "stashing mid rebase would hide a conflict");
+        assert_eq!(brief(&conn, &dir).unwrap().changed, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

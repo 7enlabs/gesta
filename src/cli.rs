@@ -734,9 +734,15 @@ pub fn cmd_history(file: &str) -> ZResult<()> {
 }
 
 /// Do the safe half of what `brief` reports.
-pub fn cmd_brief_fix(json_out: bool) -> ZResult<()> {
+pub fn cmd_brief_fix(json_out: bool, stash: bool) -> ZResult<()> {
     let (root, conn) = open_repo()?;
-    let f = crate::brief::fix(&conn, &root)?;
+    let f = crate::brief::fix_with(
+        &conn,
+        &root,
+        crate::brief::Options {
+            stash_uncommitted: stash,
+        },
+    )?;
     if json_out {
         emit(crate::brief::fixed_to_json(&f));
         return Ok(());
@@ -747,10 +753,17 @@ pub fn cmd_brief_fix(json_out: bool) -> ZResult<()> {
     for id in &f.dropped {
         println!("dropped {} (the disk had moved past it)", id);
     }
+    for (id, files) in &f.stashed {
+        println!("stashed {} file(s) as stash {}", files, id);
+    }
     for (what, why) in &f.skipped {
         println!("left alone: {} -- {}", what, why);
     }
-    if f.committed.is_empty() && f.dropped.is_empty() && f.skipped.is_empty() {
+    if f.committed.is_empty()
+        && f.dropped.is_empty()
+        && f.stashed.is_empty()
+        && f.skipped.is_empty()
+    {
         println!("nothing to fix");
     }
     Ok(())

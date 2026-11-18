@@ -181,6 +181,60 @@ def main():
             r[1][:120],
         )
 
+    if want("brief-stash"):
+        # Setting work aside is opt in, and the work has to come back. A stash that loses the
+        # edit is worse than a refusal.
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        sh(f"{ZF} init", cwd=tmp)
+        with open(os.path.join(tmp, "a.txt"), "w") as fh:
+            fh.write("v1\n")
+        sh(f"{ZF} changeset create base --author t", cwd=tmp)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=tmp)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=tmp)
+
+        with open(os.path.join(tmp, "a.txt"), "w") as fh:
+            fh.write("v2\n")
+        with open(os.path.join(tmp, "b.txt"), "w") as fh:
+            fh.write("new\n")
+
+        # Without the flag nothing moves.
+        before = sh(f"{ZF} brief --fix", cwd=tmp)
+        record(
+            "uncommitted work is refused unless stashing is asked for",
+            "left alone" in before[1]
+            and open(os.path.join(tmp, "a.txt")).read() == "v2\n"
+            and os.path.exists(os.path.join(tmp, "b.txt")),
+            before[1][:180],
+        )
+
+        r = sh(f"{ZF} brief --fix --stash", cwd=tmp)
+        record(
+            "asking for a stash sets the work aside and cleans the tree",
+            "stashed" in r[1]
+            and open(os.path.join(tmp, "a.txt")).read() == "v1\n"
+            and not os.path.exists(os.path.join(tmp, "b.txt")),
+            r[1][:180],
+        )
+
+        pop = sh(f"{ZF} stash pop", cwd=tmp)
+        record(
+            "the stashed work comes back whole",
+            pop[0] == 0
+            and open(os.path.join(tmp, "a.txt")).read() == "v2\n"
+            and os.path.exists(os.path.join(tmp, "b.txt")),
+            pop[1][:180],
+        )
+
+        # The flag needs the command it modifies.
+        r = sh(f"{ZF} brief --stash", cwd=tmp)
+        record(
+            "the stash flag refuses to run without --fix",
+            r[0] != 0,
+            r[1][:160],
+        )
+
     if want("brief"):
         # One call that answers where the session stands. An agent that asks this with four
         # commands pays four round trips and holds four outputs in context.
