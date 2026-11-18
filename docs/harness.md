@@ -183,16 +183,24 @@ Six jobs, each written twice, priced by the same ledger:
 ```
 job                 gesta        git   ask
 state                 146        186   what is the state of this tree
-history                95         43   what changed recently
-diff                  239        164   what did the last change do
+history                39         43   what changed recently
+diff                   20         10   what did the last change do
 list-files             20         20   what files exist at the head
 read-one-file          17         17   show one file as committed
 search                 44         38   where does this word appear
 
-cost ratio      1.15x    quality gap     +0.0 points
+cost ratio      0.92x    quality gap     +0.0 points
 ```
 
-gesta costs 15% more per answered question and answers all six. Both tools match on the two cheapest
-jobs, and the excess lives in `history` and `diff`, where gesta is more verbose than it needs to be.
-That is a finding about this tool rather than about version control, and it is the kind of finding a
-pass rate cannot produce.
+gesta answers all six at 8% below git's cost per answer. Two of the earlier figures were the
+measurement's fault rather than the tool's, and both mistakes are the kind this comparison exists to
+catch:
+
+- `history` was compared as gesta's full record against git's one-line form. Pointing gesta at its
+  own one-line form made it cheaper than git, 39 bytes against 43.
+- `diff` was compared as gesta's full JSON review against git's diffstat, then as a name list that
+  gesta could not answer because the first commit has no parent to name. Both tools now fall back to
+  their first-commit form together, so neither is charged for a shape the other did not have to use.
+
+What remains is honest: `diff` costs gesta twice git's bytes for the same answer, `search` costs 6
+more, and `state` costs 40 fewer because gesta's status is one screen where git's is three.

@@ -85,7 +85,10 @@ JOBS = [
     {
         "name": "history",
         "ask": "what changed recently",
-        "gesta": ["{G} log --limit 5"],
+        # Both sides use the one-line form. Comparing gesta's full record with git's one-line form
+        # measures a format choice rather than a cost, and the finding would be about the wrong
+        # thing.
+        "gesta": ["{G} log --limit 5 --oneline"],
         "git": ["git log --oneline -5"],
     },
     {
@@ -94,8 +97,18 @@ JOBS = [
         # The working tree is clean, so an unstaged diff answers nothing in either tool. The
         # question is about the last change, and gesta answers it without being handed an id:
         # `review` walks the stack and reports what each step did.
-        "gesta": ["{G} review --json"],
-        "git": ["git show --stat HEAD"],
+        # A diffstat against a diffstat. Comparing gesta's full JSON review with git's summary
+        # measures how much detail each prints rather than what an answer costs, and the number
+        # would be about the format instead of the tool.
+        # The closest thing each tool has to a summary: names on both sides, so the comparison is
+        # about the cost of an answer rather than the amount of detail a format prints.
+        #
+        # gesta names revisions by changeset, and the first commit has no parent to name. The job
+        # therefore comes in two forms and the runner picks the one the repository supports.
+        "gesta": ["{G} diff --name-only --from {PARENT} --to main"],
+        "gesta_first": ["{G} diff --name-only --to main"],
+        "git": ["git diff --name-only HEAD~1 HEAD"],
+        "git_first": ["git show --name-only --pretty=format: HEAD"],
     },
     {
         "name": "list-files",
@@ -178,6 +191,20 @@ def main(argv: list[str]) -> int:
             print(f"gesta could not commit the tree: {commit.err[:200]}")
             return 2
 
+        # The parent of the head, so a "last change" job has two revisions to compare. gesta names
+        # revisions by changeset id rather than by HEAD~1, and inventing a Git spelling for it would
+        # measure the vocabulary.
+        parent = ""
+        log = run(f"{gesta} log --json", root)
+        try:
+            entries = _js.loads(log.out)
+            if isinstance(entries, dict):
+                entries = entries.get("changesets", [])
+            if entries:
+                parent = entries[0].get("parent") or ""
+        except Exception:
+            parent = ""
+
         check = run(f"{gesta} ls", root)
         if check.code != 0:
             print(f"gesta has no tree after setup: {check.err[:200]}")
@@ -186,11 +213,19 @@ def main(argv: list[str]) -> int:
         ledgers = {"gesta": eff.Ledger(), "git": eff.Ledger()}
         rows = []
         for job in JOBS:
-            for tool, commands in (("gesta", job["gesta"]), ("git", job["git"])):
+            for tool in ("gesta", "git"):
+                # A job whose first form needs a parent falls back to its first-commit form when the
+                # repository has only one changeset. Both tools take the same fallback, so neither
+                # is charged for a shape the other did not have to use.
+                key = tool if parent else tool + "_first"
+                commands = job.get(key) or job[tool]
                 # The binary is named by the caller, so a job is a command line rather than an
                 # assumption about PATH. A tool measured through a missing name exits 127 and every
                 # job fails for a reason that has nothing to do with the tool.
-                runs = [run(cmd.replace("{G}", gesta), root) for cmd in commands]
+                runs = [
+                    run(cmd.replace("{G}", gesta).replace("{PARENT}", parent), root)
+                    for cmd in commands
+                ]
                 # A job counts as answered when every command in it succeeded and said something.
                 ok = all(r.code == 0 for r in runs) and any(r.bytes_read for r in runs)
                 ledgers[tool].add(price(job["name"], runs, ok))

@@ -2725,6 +2725,123 @@ pub fn cmd_diff_range_json(from: Option<&str>, to: Option<&str>) -> ZResult<()> 
 ///
 /// This is the answer to reviewing what an agent produced. A net diff between two
 /// points hides the order things happened in, and the order is most of the reasoning.
+/// The machine-readable review, which is what an agent should use.
+///
+/// A reviewer that parses the text has to reproduce the layout, and the layout exists for a person.
+/// This carries the same answer as data: each step, its risk band and score, the reasons behind the
+/// score, the files it touched, and the stale references found outside them.
+pub fn cmd_review_json(
+    from: Option<&str>,
+    to: Option<&str>,
+    min_risk: Option<&str>,
+) -> ZResult<()> {
+    let (_root, conn) = open_repo()?;
+    let branch = current_branch(&conn)?;
+    let target = to.unwrap_or(&branch);
+
+    let floor = match min_risk {
+        Some("low") => 0,
+        Some("medium") => 4,
+        Some("high") => 9,
+        Some(other) => {
+            return Err(bad(format!(
+                "unknown risk band: {} (use low, medium or high)",
+                other
+            )))
+        }
+        None => 0,
+    };
+
+    let steps = crate::repo::review_stack(&conn, from, target)?;
+    // The same tree the text form reads, so the two cannot disagree about what a change affects.
+    let tree = match crate::store::branch_head(&conn, target)? {
+        Some(head) => crate::repo::tree_at(&conn, &head)?,
+        None => Vec::new(),
+    };
+
+    let mut items = Vec::new();
+    let mut hidden = 0i64;
+    for step in &steps {
+        if step.risk.score < floor {
+            hidden += 1;
+            continue;
+        }
+        let files = step
+            .files
+            .iter()
+            .map(|(path, removed, added)| {
+                crate::json::Json::obj(vec![
+                    ("path", crate::json::Json::str(path.clone())),
+                    (
+                        "removed",
+                        crate::json::Json::arr(
+                            removed
+                                .iter()
+                                .map(|l| crate::json::Json::str(l.clone()))
+                                .collect(),
+                        ),
+                    ),
+                    (
+                        "added",
+                        crate::json::Json::arr(
+                            added
+                                .iter()
+                                .map(|l| crate::json::Json::str(l.clone()))
+                                .collect(),
+                        ),
+                    ),
+                ])
+            })
+            .collect();
+
+        let stale = crate::impact::stale_references(&conn, &step.files, &tree)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| {
+                crate::json::Json::obj(vec![
+                    ("name", crate::json::Json::str(s.name)),
+                    ("path", crate::json::Json::str(s.path)),
+                    ("line", crate::json::Json::int(s.line as i64)),
+                    ("text", crate::json::Json::str(s.text)),
+                    ("removed_from", crate::json::Json::str(s.removed_from)),
+                ])
+            })
+            .collect();
+
+        items.push(crate::json::Json::obj(vec![
+            ("changeset", crate::json::Json::str(step.id.clone())),
+            ("message", crate::json::Json::str(step.message.clone())),
+            ("author", crate::json::Json::str(step.author.clone())),
+            ("risk", crate::json::Json::str(step.risk.band())),
+            ("score", crate::json::Json::int(step.risk.score)),
+            (
+                "reasons",
+                crate::json::Json::arr(
+                    step.risk
+                        .reasons
+                        .iter()
+                        .map(|r| crate::json::Json::str(r.clone()))
+                        .collect(),
+                ),
+            ),
+            ("files", crate::json::Json::arr(files)),
+            ("stale", crate::json::Json::arr(stale)),
+        ]));
+    }
+
+    emit_object(vec![
+        ("branch", crate::json::Json::str(target.to_string())),
+        ("from", match from {
+            Some(f) => crate::json::Json::str(f.to_string()),
+            None => crate::json::Json::Null,
+        }),
+        ("shown", crate::json::Json::int(items.len() as i64)),
+        ("below_threshold", crate::json::Json::int(hidden)),
+        ("steps", crate::json::Json::arr(items)),
+    ]);
+    Ok(())
+}
+
 pub fn cmd_review(from: Option<&str>, to: Option<&str>, min_risk: Option<&str>) -> ZResult<()> {
     let (_root, conn) = open_repo()?;
     let branch = current_branch(&conn)?;

@@ -2466,6 +2466,41 @@ def main():
             f"columns: {', '.join(cols)}",
         )
 
+    if want("review-json"):
+        # `review --json` used to print text: the flag was accepted and ignored, which is the same
+        # fault as a check that never runs, seen from the caller's side.
+        import tempfile as _tf
+        import json as _jd
+
+        d = _tf.mkdtemp()
+        sh(f"{ZF} init", cwd=d)
+        with open(os.path.join(d, "a.txt"), "w") as fh:
+            fh.write("one\n")
+        sh(f'{ZF} changeset create "first" --author t', cwd=d)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=d)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+
+        rc, out = sh(f"{ZF} review --json", cwd=d)
+        try:
+            doc = _jd.loads(out)
+            ok = (
+                doc.get("shown") is not None
+                and isinstance(doc.get("steps"), list)
+                and doc.get("schema")
+            )
+            why = out[:240]
+        except Exception as exc:
+            ok, why = False, f"not one JSON document: {exc}; body: {out[:200]}"
+        record("review --json prints one parseable document", ok, why)
+
+        rc2, out2 = sh(f"{ZF} review", cwd=d)
+        record(
+            "and the text form still reads as text",
+            rc2 == 0 and out2.strip().startswith(("[", "\n[", "nothing")),
+            out2[:200],
+        )
+
     if want("efficiency"):
         # What a task costs to complete, which is the figure the published harness benchmark built
         # its finding on: cost moved 17.5x across harnesses while quality stayed within 17 points.
@@ -2502,6 +2537,13 @@ def main():
             "the comparison reports whether both tools answered everything",
             "both tools answered every job" in out or "passed" in out,
             out[-400:],
+        )
+        # A comparison where one side fails jobs is not a cost comparison. It must say which side
+        # fell short rather than print a ratio computed over an unequal set.
+        record(
+            "neither tool is charged for a form the other did not use",
+            "quality gap     +0.0" in out,
+            out[-300:],
         )
 
     if want("suites"):

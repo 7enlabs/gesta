@@ -1045,7 +1045,13 @@ fn run() -> ZResult<()> {
         Cmd::Land { source, onto, expect, author } => {
             cli::cmd_land(&source, &onto, expect.as_deref(), &author)
         }
-        Cmd::Review { from, to, min_risk } => cli::cmd_review(from.as_deref(), to.as_deref(), min_risk.as_deref()),
+        Cmd::Review { from, to, min_risk } => {
+            if json {
+                cli::cmd_review_json(from.as_deref(), to.as_deref(), min_risk.as_deref())
+            } else {
+                cli::cmd_review(from.as_deref(), to.as_deref(), min_risk.as_deref())
+            }
+        }
         Cmd::Mcp => cli::cmd_mcp(),
         Cmd::Serve { bind, port, tls, key } => {
             cli_remote::cmd_serve(&bind, port, tls.as_deref(), key.as_deref())

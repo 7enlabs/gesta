@@ -21,8 +21,10 @@ version is current and freezes when the number changes, so `0.6.0` is a record a
 - Setup and checks are not charged, because they are the harness's work rather than the tool's.
 - Division is by passes, not attempts. A run with no passes reports the absence of a figure rather
   than zero, which would read as free.
-- `bench/harness/compare.py` prices gesta and git on the same six questions. Measured: gesta answers
-  all six at 1.15x git's cost per answer, with the excess in history and diff.
+- `review --json` used to print text: the flag was accepted and ignored. It carries the same answer
+  as data now, with each step's risk band, score, reasons, files and stale references.
+- `bench/harness/compare.py` prices gesta and git on the same six questions, in the form each tool
+  has for that answer. Measured: gesta answers all six at 0.92x git's cost per answer.
 - Eight tests require the cost model to separate a quiet tool from a chatty one, and to refuse a
   ratio against zero passes.
 
