@@ -192,7 +192,7 @@ them.
 | No undo | Operation log records a pointer snapshot after every ref change; `undo` restores the previous snapshot and deletes that operation so a second undo walks further back | `record_and_undo_restores_the_previous_head`, e2e check |
 | No `fsck` | Checks missing objects, dangling parents, branch heads pointing nowhere, and reports orphan objects; `--prune` deletes them | e2e check with a deliberately corrupted hash |
 | No `.gitignore` | Gitignore-style matcher: `*`, `**`, `?`, anchored `/`, directory-only `/`, negation `!`, plus `.zenignore` and a database-backed list | 10 glob unit tests |
-| Disk usage 9.0x git | zlib compression per object, applied only when it actually shrinks the row (small files stay raw), and the redundant `working_copy` table was deleted because nothing read it | 2.63x on the same workload |
+| Disk usage 9.0x git | zlib compression per object, applied only when it actually shrinks the row (small files stay raw), and the redundant `working_copy` table was deleted because nothing read it | 3.26x on the same workload |
 | No remote | `clone`/`push`/`pull` over a zlib bundle written through the real serialise/parse path, with per-object hash verification on receipt | 4 unit tests + 2 e2e checks |
 | No `diff` / `show` / `restore` / `tag` | All implemented | e2e checks |
 | Deletions not tracked | `changeset create` records deletions; `status` reports them | e2e check |
@@ -203,8 +203,8 @@ them.
 |---|---|---|
 | End-to-end capability checks | 6 of 20 | **20 of 20** |
 | Unit tests | 24 | **57** |
-| Disk vs git, 21 versions of a 42 KB file | 8.9x | **2.63x** |
-| Disk vs git, 1000 small files | 4.32x | **4.32x** (unchanged) |
+| Disk vs git, 21 versions of a 42 KB file | 8.9x | **3.26x** |
+| Disk vs git, 1000 small files | 6.08x | **6.08x** (unchanged) |
 | `changeset create` 2000 files | 47 ms | 54 ms |
 | `commit` 2000 files | 93 ms | 95 ms |
 | `status` 2000 files | 62 ms | 45 ms |
@@ -219,7 +219,7 @@ them.
    merge across two clones, and a second clone seeing the pushed history.
    Access control landed in v0.4.0: read and write tokens, hashed storage
    option, refusal to serve a public address without tokens. Still missing: TLS.
-2. **Small-file overhead.** 4.32x git for a tree of 1000 tiny files. The cause is
+2. **Small-file overhead.** 6.08x git for a tree of 1000 tiny files. The cause is
    per-row SQLite and index overhead, not content. Fixing it needs packing
    several small objects into one row, which is a schema change.
 3. **No rebase, cherry-pick, bisect, hooks, submodules, LFS, `.gitattributes`.**
@@ -239,7 +239,7 @@ and pull over HTTP.
 
 It still cannot replace git for a team outside a trusted network. There is no
 TLS and no authentication, so anyone who can reach the port can push. Small file
-heavy trees cost 4.32x git in disk. Both are real blockers for shared use, and
+heavy trees cost 6.08x git in disk. Both are real blockers for shared use, and
 neither is a small change.
 
 Calling it a git replacement today would be wrong. Calling it usable for agent
@@ -472,7 +472,7 @@ two checks exist only for that case, including a pattern that matches nothing.
 
 ### What is still missing
 
-Many tiny files still cost 4.32x git, because per-row overhead dominates when an
+Many tiny files still cost 6.08x git, because per-row overhead dominates when an
 object is a few dozen bytes; the fix is packing several small blobs per row.
 There is no rebase, cherry-pick, bisect, hooks, submodules, LFS or
 `.gitattributes`. A token cannot be revoked before its expiry without editing the

@@ -21,6 +21,8 @@ without its mistakes reads as if it were obvious.
 | # | Decision | Reason |
 |---|---|---|
 | C1 | `set_branch_head` updates the branch tree incrementally from the changeset's own file list. | The one operation an agent does most must not cost the size of the repository. Measured with `bench/scale.py` (median of three rounds, binary read from the container's own disk): an ordinary one file commit goes from 28.7 ms at 500 files to 54.3 ms at 8000, which is 1.89x for a repository 16 times larger, with the middle half of samples inside 5 to 12 percent. |
+| G1 | Git import and export are written against the documented object format, not by calling the git binary. | A bridge that shells out cannot run where git is not installed, which is the machine an agent works on. A round trip proves the format is right: equal commit ids mean the tree, the parents, the author line and the message all match, because the id is the hash of those four. |
+| G2 | An import records the git commit id it came from. | Importing the same repository twice adds nothing, and a later export can tell which changesets came from git. |
 | C1b | The rebuild is kept, and costs the size of the repository. | A merge, a land and a remote apply cannot carry the tree forward, so they rebuild it from history. Measured with `bench/rebuild_cost.py`: 22.7 ms at 500 files, 57.2 ms at 2000, 187.8 ms at 8000, which is 8.26x for 16 times the files. That is the price of the correctness the fallback buys, and it is why the common path does not take it. |
 | C2 | The incremental path falls back to a rebuild when the changeset's parent is not the previous head. | Merge, undo and remote apply all re-parent. Updating incrementally across a re-parent would silently write a wrong tree. |
 | C3 | Deltas are capped at a chain of 16. | An unbounded chain makes a read walk the whole history. The cap bounds a read and keeps the compression that matters. |
@@ -124,3 +126,5 @@ These cost more time than the decisions above, so they stay written down.
 | N2 | A local server and a SQL backend. | Both give up "one binary, one machine, no daemon". They are a separate design, not an increment. |
 | N3 | A lock file for concurrent access. | It turns a working concurrent read into a failure, and a crashed process leaves it stuck with no honest way to prove it stale. WAL plus retries behaves better. |
 | N4 | Guessing at another tool's behaviour to claim compatibility. | An unverified claim is worse than a missing feature. |
+| N5 | Reading packfiles. | A repository whose objects are all packed has no loose objects. `git gc` gives them back. A pack reader is its own piece of work and pretending otherwise would produce a bridge that fails on the first real repository. |
+| N6 | Packing several small objects into one row. | Measured at 6.08x git for a tree of 1000 tiny files, which is the worst number in this document. Fixing it is a schema change and has not been done. |

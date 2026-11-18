@@ -78,6 +78,9 @@ gesta blame src/main.rs
 | `stash list` | Saved stashes, newest first |
 | `stash pop [--id N]` | Write a stash back, refusing over local changes |
 | `stash drop [--id N]` | Delete a stash without applying it |
+| `git import <path>` | Read a git repository into this one, no git binary needed |
+| `git export <path>` | Write a git repository that git reads, same commit ids |
+| `gc` | Remove unreachable objects and vacuum the database |
 | `brief [--json] [--fix] [--stash]` | Where the session stands, and `--fix` does the safe part |
 | `grep <text> [--history] [--regex]` | Find text in the working tree, or in every recorded version |
 | `hook list` | Which hooks are installed |
@@ -296,6 +299,42 @@ Branches are pointers plus reachability. `status` and `latest_hash` walk the par
 Merge is real three way. It computes the merge base, applies both sides, writes the merged result to disk, records a changeset with two parents, and refuses to move the head if any file conflicts.
 
 Text output is for a person reading a terminal. Anything that parses results should use `--json` or the MCP server, not scrape lines: a message containing a space or a quote would break a scraper, and a JSON parser does not care.
+
+## Working with git repositories
+
+A git repository can be read into this one and written back out, without calling the git
+binary. A round trip keeps the commit ids: they are the hash of the tree, the parents, the
+author line and the message, so equal ids prove all four survived.
+
+```sh
+gesta git import ../existing-project        # every branch, every commit
+gesta git import ../existing-project --path-prefix src/
+gesta git export ../git-export             # a repository git reads
+gesta git export ../git-export --branch main
+```
+
+```sh
+$ gesta git import ../existing-project
+imported 3 commit(s) as changesets, 5 path change(s), 0 already present
+branches: feature, main
+
+$ gesta git export ../git-export
+exported 5 commit(s)
+head: 028ccfd82fa6295f68053d2da35ac5ca8be11daa
+
+$ cd ../git-export && git log --oneline --all
+222e77b feature commit
+028ccfd second commit
+10e6dc0 first commit
+```
+
+Those ids are the same as the repository that was imported, and `git fsck` accepts the result.
+
+Importing twice adds nothing: each changeset records the git commit it came from.
+
+What is missing: packfiles. A repository whose objects are all in a pack has no loose objects to
+read, so `git gc` (or `git repack -a -d`) gives them back first. Writing a pack reader is a
+different piece of work and is not pretended to be here.
 
 ## Remote over HTTP
 
@@ -525,7 +564,7 @@ Measured in the workspace container, release build.
 
 An earlier version of `status` and `changeset create` asked for the committed hash of each file separately, and each lookup re-walked the whole parent chain. That made both operations quadratic in history depth: on 3,000 files, `status` took 55 ms at one changeset, 878 ms at fifty, and 6.8 s at two hundred. They now fetch the committed tree in one ranked query, so the cost no longer depends on how deep the history is.
 
-Disk usage, 21 versions of a 42 KB file edited one line at a time: 267 KB against git's 101 KB, so 2.63x. Before compression it was 8.9x. A tree of 1,000 tiny files costs 4.32x git, because per-row overhead dominates when each object is a few dozen bytes.
+Disk usage, 21 versions of a 42 KB file edited one line at a time: 256 KB against git's 79 KB, so 3.26x. Before compression it was 8.9x. A tree of 1,000 tiny files costs 6.08x git, because per-row overhead dominates when each object is a few dozen bytes. Both numbers are from `bench/size_compare.py`, reading the binary from the container's own disk.
 
 `blame` does not slow down as history grows. It reads the precomputed table instead of replaying versions.
 
@@ -534,7 +573,7 @@ Disk usage, 21 versions of a 42 KB file edited one line at a time: 267 KB agains
 - **TLS needs a certificate you supply or pin.** `serve --tls self-signed` works on a private network once a client pins the fingerprint; a public deployment needs a real certificate from a CA.
 - **Tokens expire but are not revocable per session.** An entry can carry an expiry date, and removing its line revokes it, but there is no "revoke this one now" call.
 - **No SSH transport.**
-- **Small files cost more than git.** 4.32x for a tree of tiny files. Fixing it means packing several objects per row, which is a schema change.
+- **Small files cost more than git.** 6.08x for a tree of tiny files. Fixing it means packing several objects per row, which is a schema change.
 - **Blame is line-sequence based.** A line moved and edited in the same commit loses its original author.
 - **No rebase, cherry-pick, bisect, hooks, submodules, LFS, or `.gitattributes`.**
 - **Conflicts are resolved by editing files**, then committing the result. There is no interactive resolver.
@@ -591,6 +630,6 @@ Each of these is pinned by a test, and each one exists because the first impleme
 
 ## Status
 
-Version 0.5.0. Usable for one developer or a set of agents, on one machine, on a private network over TLS, or by agents that never check out the tree. Still not a full git replacement: a tree of many tiny files costs 4.32x git in disk, there is no rebase, cherry-pick, bisect, hooks or LFS, and a token cannot be revoked before its expiry without editing the auth file.
+Version 0.5.0. Usable for one developer or a set of agents, on one machine, on a private network over TLS, or by agents that never check out the tree. Still not a full git replacement: a tree of many tiny files costs 6.08x git in disk, and a token cannot be revoked before its expiry without editing the auth file. Rebase, cherry-pick, bisect and hooks exist; LFS does not.
 
 `docs/upgrade-plan.md` holds the measurements behind each decision and the list of what is still missing.

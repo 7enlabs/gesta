@@ -276,6 +276,52 @@ def main():
             r[1][:240],
         )
 
+    if want("gc"):
+        # A repository that only grows is a repository that gets slower and bigger forever. The
+        # check plants an object nothing references and asks gc to remove exactly that one.
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        sh(f"{ZF} init", cwd=tmp)
+        with open(os.path.join(tmp, "a.txt"), "w") as fh:
+            fh.write("v1\n")
+        sh(f"{ZF} changeset create base --author t", cwd=tmp)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=tmp)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=tmp)
+
+        db = os.path.join(tmp, ".gesta", "gesta.db")
+        import hashlib
+        import sqlite3
+        conn = sqlite3.connect(db)
+        for i in range(4):
+            h = hashlib.sha256(f"junk{i}".encode()).hexdigest()
+            conn.execute(
+                "INSERT OR IGNORE INTO objects(hash, content, size, compressed, created_at) "
+                "VALUES(?,?,?,0,1)",
+                (h, f"junk{i}".encode(), 5),
+            )
+        conn.commit()
+        before = conn.execute("SELECT COUNT(*) FROM objects").fetchone()[0]
+        conn.close()
+
+        r = sh(f"{ZF} gc", cwd=tmp)
+        conn = sqlite3.connect(db)
+        after = conn.execute("SELECT COUNT(*) FROM objects").fetchone()[0]
+        conn.close()
+        record(
+            "gc removes the objects nothing references",
+            r[0] == 0 and "removed 4" in r[1] and after == before - 4,
+            f"before={before} after={after} {r[1][:120]}",
+        )
+
+        fs = sh(f"{ZF} fsck", cwd=tmp)
+        body = sh(f"{ZF} show main:a.txt", cwd=tmp)
+        record(
+            "gc leaves the repository consistent and readable",
+            fs[0] == 0 and body[0] == 0 and body[1].strip() == "v1",
+            f"fsck={fs[1][:80]} content={body[1].strip()[:40]}",
+        )
+
     if want("git"):
         # Interoperability is the claim that matters most, so it is checked against the real git
         # binary: import a repository git made, export one, and let git validate the result.

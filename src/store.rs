@@ -996,9 +996,116 @@ pub fn ancestors_bfs(conn: &Connection, id: &str) -> ZResult<Vec<String>> {
     Ok(out)
 }
 
+/// How many objects the store holds. Used by `gc` to report what it did.
+#[cfg(test)]
+pub fn object_count(conn: &Connection) -> ZResult<i64> {
+    Ok(conn.query_row("SELECT COUNT(*) FROM objects", [], |r| r.get(0))?)
+}
+
+/// Collect every object reachable from the repository state, and delete the rest.
+///
+/// An object is reachable when it is the content of a file in a committed tree, or the body
+/// of a changeset, or the target of a branch head. A packfile is not considered because the
+/// database only stores loose objects; a `git gc` on the export will handle packfiles.
+pub fn gc(conn: &Connection) -> ZResult<u64> {
+    let mut reachable: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Commits and their trees.
+    let mut stmt = conn.prepare(
+        "SELECT id FROM changesets WHERE status = 'committed'",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    for row in rows {
+        let cs = row?;
+        reachable.insert(cs.clone());
+        let tree = crate::repo::tree_at(conn, &cs)?;
+        for (_, hash) in tree {
+            reachable.insert(hash);
+        }
+    }
+
+    // Pending changesets (not yet committed but stored).
+    let mut stmt = conn.prepare(
+        "SELECT id FROM changesets WHERE status = 'pending'",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    for row in rows {
+        let cs = row?;
+        reachable.insert(cs.clone());
+        let tree = crate::repo::tree_at(conn, &cs)?;
+        for (_, hash) in tree {
+            reachable.insert(hash);
+        }
+    }
+
+    // Stashed changes.
+    let stashes = crate::stash::list(conn)?;
+    for s in stashes {
+        for (_, hash) in &s.files {
+            if let Some(h) = hash {
+                reachable.insert(h.clone());
+            }
+        }
+    }
+
+    // Branch heads.
+    let mut stmt = conn.prepare("SELECT head FROM branches WHERE head IS NOT NULL")?;
+    let rows = stmt.query_map([], |r| r.get::<_, Option<String>>(0))?;
+    for row in rows {
+        if let Some(h) = row? {
+            reachable.insert(h);
+        }
+    }
+
+    // Tags point at changesets, which are already reachable through the branch walk, so there
+    // is nothing extra to collect here. The table has no hash column; reading one is a mistake
+    // that only shows up when a repository has a tag.
+    let _ = "tags point at changesets, which are collected above";
+
+    // Delete every object not in the reachable set.
+    let all: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT hash FROM objects")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    let mut deleted = 0u64;
+    for hash in all {
+        if !reachable.contains(&hash) {
+            conn.execute("DELETE FROM objects WHERE hash = ?1", rusqlite::params![&hash])?;
+            deleted += 1;
+        }
+    }
+
+    // Vacuum to reclaim space and rebuild indexes.
+    conn.execute("VACUUM", [])?;
+
+    Ok(deleted)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn gc_removes_unreachable_objects() {
+        let conn = mem_db();
+        let dir = std::env::temp_dir().join(format!("gesta-gc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        crate::repo::tests::commit_files(&conn, "gc1", "gc1", &[("a.txt", "v1\n")]);
+        set_branch_head(&conn, "main", "gc1").unwrap();
+        set_state(&conn, "current_branch", "main").unwrap();
+
+        // An object nothing points at.
+        put_object(&conn, "unreachable content").unwrap();
+        let before = object_count(&conn).unwrap();
+
+        let deleted = gc(&conn).unwrap();
+        assert_eq!(deleted, 1, "the unreachable object was not removed");
+        assert_eq!(object_count(&conn).unwrap() + deleted as i64, before);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     pub fn mem_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -1437,4 +1544,3 @@ pub(crate) mod tests {
         }
     }
 }
-

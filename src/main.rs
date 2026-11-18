@@ -409,6 +409,8 @@ enum Cmd {
         #[command(subcommand)]
         sub: SparseCmd,
     },
+    /// Remove unreachable objects and vacuum the database
+    Gc,
     /// Verify repository integrity
     Fsck {
         /// Delete objects nothing references
@@ -860,6 +862,7 @@ fn run() -> ZResult<()> {
             cli_remote::cmd_serve(&bind, port, tls.as_deref(), key.as_deref())
         }
         Cmd::Fsck { prune, worktree } => cli_remote::cmd_fsck(prune, worktree),
+        Cmd::Gc => cli_remote::cmd_gc(),
         Cmd::Stats => cli_remote::cmd_stats(),
         Cmd::Ignore { sub } => match sub {
             IgnoreCmd::Add { pattern } => cli_remote::cmd_ignore_add(&pattern),

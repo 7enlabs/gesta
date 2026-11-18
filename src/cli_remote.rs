@@ -442,6 +442,14 @@ fn clone_s3(url: &str, target: &Path, pin: Option<&str>, depth: Option<usize>) -
 
 // fsck / stats / ignore.
 
+/// Remove unreachable objects and vacuum the database.
+pub fn cmd_gc() -> ZResult<()> {
+    let (_root, conn) = open_repo()?;
+    let deleted = crate::store::gc(&conn)?;
+    println!("gc: removed {} unreachable object(s), database vacuumed", deleted);
+    Ok(())
+}
+
 pub fn cmd_fsck(prune: bool, worktree: bool) -> ZResult<()> {
     let (root, conn) = open_repo()?;
     let mut problems = 0usize;
