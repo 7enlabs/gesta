@@ -90,6 +90,8 @@ gesta blame src/main.rs
 | `hook install <name> [--file F]` | Write a hook, reading stdin when no file is given |
 | `hook remove <name>` | Remove a hook |
 | `hook status [--json]` | Whether each hook still matches what was installed |
+| `remote inspect [--check-identity]` | What a push would carry, without carrying it |
+| `anonymise [--author A] [--to S] [--dry-run]` | Replace the author on existing changesets |
 | `rebase <onto> [--branch B]` | Replay a branch's changesets onto another point |
 | `rebase --continue` | Finish a stopped rebase using what is on disk |
 | `rebase --abort` | Put the branch back where the rebase started |

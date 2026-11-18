@@ -23,6 +23,7 @@ mod http;
 mod json;
 mod mcp;
 mod error;
+mod privacy;
 mod merge;
 mod ops;
 mod packfile;
@@ -211,6 +212,20 @@ enum Cmd {
         /// Create a bare repository with no working tree
         #[arg(long)]
         bare: bool,
+    },
+    /// Replace the author on existing changesets, for a push that already disclosed one
+    Anonymise {
+        /// Author string to replace. Repeat for several. With none, every changeset on the branch.
+        #[arg(long = "author")]
+        authors: Vec<String>,
+        /// The author string to put in its place
+        #[arg(long, default_value = "anonymous")]
+        to: String,
+        #[arg(long, default_value = "main")]
+        branch: String,
+        /// Report what would change without changing it
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Show repository state and working-tree changes
     Status,
@@ -693,6 +708,19 @@ enum RemoteCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Say what a push would send, without sending it
+    Inspect {
+        #[arg(default_value = "origin")]
+        remote: String,
+        #[arg(long, default_value = "main")]
+        branch: String,
+        /// Answer as JSON
+        #[arg(long)]
+        json_inspect: bool,
+        /// Exit non-zero when the payload would carry author identities
+        #[arg(long)]
+        check_identity: bool,
+    },
     /// Send this repository's branch to a remote
     Push {
         #[arg(default_value = "origin")]
@@ -880,6 +908,9 @@ fn run() -> ZResult<()> {
         Cmd::Stash { sub } => cli::cmd_stash(sub, json),
         Cmd::Hook { sub } => cli::cmd_hook(sub, json),
         Cmd::Init { bare } => cli::cmd_init(bare),
+        Cmd::Anonymise { authors, to, branch, dry_run } => {
+            cli::cmd_anonymise(&authors, &to, &branch, dry_run)
+        }
         Cmd::Status => cli::cmd_status(),
         Cmd::Diff { changeset, from, to, name_only } => {
             if from.is_some() || to.is_some() {
@@ -985,6 +1016,9 @@ fn run() -> ZResult<()> {
             RemoteCmd::Ls { remote } => cli_remote::cmd_remote_ls(&remote),
             RemoteCmd::Deepen { depth, unshallow, remote, branch, dry_run } => {
                 cli_remote::cmd_deepen(depth, unshallow, &remote, &branch, dry_run)
+            }
+            RemoteCmd::Inspect { remote, branch, json_inspect, check_identity } => {
+                cli_remote::cmd_inspect(&remote, &branch, json_inspect || json, check_identity)
             }
             RemoteCmd::Push { remote, branch } => cli_remote::cmd_push(&remote, &branch),
             RemoteCmd::Pull { remote, branch, author } => cli_remote::cmd_pull(&remote, &branch, &author),

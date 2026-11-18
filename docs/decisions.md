@@ -129,3 +129,21 @@ These cost more time than the decisions above, so they stay written down.
 | N5 | Reading packfiles. | A repository whose objects are all packed has no loose objects. `git gc` gives them back. A pack reader is its own piece of work and pretending otherwise would produce a bridge that fails on the first real repository. |
 | N6 | Packing several small objects into one row. | It was built and measured, and it made the repository larger: 6.6x git became 7.7x. A pointer into a segment costs more than the seven bytes it replaces, because it is a hash, two integers and a row header. The bodies did shrink, from 98,304 bytes to a 1,959 byte segment, but `object_packed` and its index spent 172,032 bytes finding them. Recorded in docs/storage.md so the idea is not tried again without the number. |
 | N7 | Removing the per-path tables to close the storage gap. | The 6.6x is spread over six tables that each hold a row per tracked path, and every one of them exists to make something faster: the maintained tree, the stat cache, the blame chain. Fewer rows is the fix, not smaller ones, and it costs a capability. Not done. |
+
+## P1. A push must be inspectable before it happens
+
+Pushing is when content leaves the machine, and a changeset carries an author string that is an address in practice. Until this existed, the only way to learn what a push disclosed was to push and look.
+
+`remote inspect` reports the changesets, the object count, the payload size, and every author string, then separates the ones that name a person. `--check-identity` turns that into a refusal for a caller that wants a gate. A remote that cannot be asked what it already holds is reported as an estimate over the whole branch rather than guessed at, because a wrong number that looks precise is worse than an honest one.
+
+## P2. Rewriting an author drops the signature, and says so
+
+A signature covers the author field, because the author is part of what a reviewer is told the signer vouched for. Rewriting the author therefore invalidates it. Keeping a stale signature would turn a verified changeset into one that fails verification while still looking signed, which is worse than an unsigned changeset: the second is honest about what it proves.
+
+## P3. A changeset id must not depend on its author
+
+The id is derived once, when the changeset is created, and never recomputed. Everything from parent pointers to remote refs to the branch head is expressed in terms of those ids, so a rewrite that changed an id would have to rewrite the whole graph and every remote that ever received it. This is why `anonymise` can exist at all.
+
+## P4. A replacement that is itself an identity is refused
+
+Swapping one address for another is not anonymising. Accepting it would let somebody believe the payload is clean while it names a person exactly as before. The refusal costs nothing and prevents a false sense of safety.

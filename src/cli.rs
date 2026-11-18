@@ -176,6 +176,78 @@ fn pending_out_of_date(
     Ok(stale)
 }
 
+/// Replace the author on existing changesets.
+///
+/// The dry run exists because this is not a change to file content: a person asks for it after
+/// discovering that an identity went somewhere it should not have, and wants to see the size of the
+/// problem before agreeing to it.
+pub fn cmd_anonymise(
+    authors: &[String],
+    to: &str,
+    branch: &str,
+    dry_run: bool,
+) -> ZResult<()> {
+    let (_root, conn) = open_repo()?;
+    if dry_run {
+        // The same query the rewrite uses, so the preview and the action cannot disagree.
+        let mut stmt = conn.prepare(
+            "SELECT id, author FROM changesets WHERE branch = ?1 ORDER BY created_at",
+        )?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map(rusqlite::params![branch], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let hit: Vec<&(String, String)> = rows
+            .iter()
+            .filter(|(_, a)| {
+                if authors.is_empty() {
+                    a.contains('@') || a.contains('<') || !a.is_empty()
+                } else {
+                    authors.iter().any(|m| m == a)
+                }
+            })
+            .collect();
+        if hit.is_empty() {
+            println!("nothing on {} carries that author", branch);
+            return Ok(());
+        }
+        println!("would rewrite {} changeset(s) on {}", hit.len(), branch);
+        let mut seen: Vec<&str> = Vec::new();
+        for (_, a) in &hit {
+            if !seen.contains(&a.as_str()) {
+                seen.push(a.as_str());
+            }
+        }
+        for a in seen {
+            println!("  {} -> {}", a, to);
+        }
+        return Ok(());
+    }
+
+    let report = crate::privacy::rewrite_authors(&conn, branch, authors, to)?;
+    if report.rewritten == 0 {
+        println!("nothing on {} carries that author", branch);
+        return Ok(());
+    }
+    for a in &report.authors {
+        println!("  {} -> {}", a, to);
+    }
+    println!(
+        "rewrote {} changeset(s) on {}",
+        report.rewritten, branch
+    );
+    if report.dropped_signatures > 0 {
+        // Saying this plainly matters: the changesets are no longer signed, and a reader who
+        // assumes they still are would trust something that no longer holds.
+        println!(
+            "  {} signature(s) dropped, because each one covered the author it just lost",
+            report.dropped_signatures
+        );
+    }
+    Ok(())
+}
+
 pub fn cmd_status() -> ZResult<()> {
     let (root, conn) = open_repo()?;
     let branch = current_branch(&conn)?;

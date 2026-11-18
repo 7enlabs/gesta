@@ -108,6 +108,125 @@ fn remote_token(conn: &rusqlite::Connection, name: &str) -> ZResult<Option<Strin
         .flatten())
 }
 
+/// Say what a push would carry, without sending anything.
+///
+/// Pushing is the moment content leaves the machine, and until now the only way to learn what went
+/// was to push and then look. A changeset carries an author string, an address in practice, so a
+/// bundle handed to somebody else's server discloses who wrote what even when the file content is
+/// unremarkable. Reporting the payload first turns that from something found out afterwards into
+/// something decided.
+pub fn cmd_inspect(
+    remote_name: &str,
+    branch: &str,
+    json: bool,
+    check_identity: bool,
+) -> ZResult<()> {
+    let (_root, conn) = open_repo()?;
+    let url = remote_url(&conn, remote_name)?;
+
+    // Only a local remote can be asked what it already holds without inventing an answer. For a
+    // served or object-store remote the payload is reported as an estimate over the whole branch,
+    // which is exactly what a first push sends and the case most worth looking at.
+    let known = if url.starts_with("s3://") || http::is_http_url(&url) {
+        None
+    } else {
+        let path = remote::resolve_remote(&url);
+        if crate::repo_dir(&path).is_dir() {
+            let remote_conn = open_db(&path)?;
+            match branch_head(&remote_conn, branch) {
+                Ok(Some(h)) => Some(ancestors(&remote_conn, &h)?.into_iter().collect::<HashSet<String>>()),
+                _ => Some(HashSet::new()),
+            }
+        } else {
+            Some(HashSet::new())
+        }
+    };
+
+    let empty = HashSet::new();
+    let bundle = remote::build_bundle(&conn, branch, known.as_ref().unwrap_or(&empty))?;
+    let wire = bundle.encode()?;
+
+    let mut authors: Vec<(String, String)> = bundle
+        .changesets
+        .iter()
+        .map(|c| (c.id.clone(), c.author.clone()))
+        .collect();
+    // An author that carries an address or an angle bracket is the part that names a person.
+    let identity: Vec<(String, String)> = authors
+        .iter()
+        .filter(|(_, a)| a.contains('@') || a.contains('<'))
+        .cloned()
+        .collect();
+    let largest = bundle.objects.iter().map(|(_, c)| c.len()).max().unwrap_or(0);
+    let estimated = known.is_none();
+    authors.truncate(20);
+
+    if json {
+        let items = authors
+            .iter()
+            .map(|(id, author)| {
+                crate::json::Json::obj(vec![
+                    ("changeset", crate::json::Json::str(id.clone())),
+                    ("author", crate::json::Json::str(author.clone())),
+                ])
+            })
+            .collect();
+        crate::cli::emit_object(vec![
+            ("remote", crate::json::Json::str(remote_name.to_string())),
+            ("branch", crate::json::Json::str(branch.to_string())),
+            ("url", crate::json::Json::str(url.clone())),
+            ("changesets", crate::json::Json::int(bundle.changesets.len() as i64)),
+            ("objects", crate::json::Json::int(bundle.objects.len() as i64)),
+            ("bytes", crate::json::Json::int(wire.len() as i64)),
+            ("largest_object", crate::json::Json::int(largest as i64)),
+            ("author_identities", crate::json::Json::int(identity.len() as i64)),
+            ("estimated", crate::json::Json::Bool(estimated)),
+            ("authors", crate::json::Json::Arr(items)),
+        ]);
+    } else {
+        println!("push from {} to {}", branch, remote_name);
+        println!("  url          {}", url);
+        if estimated {
+            println!("  estimate     the whole branch, because this remote cannot be asked");
+        }
+        println!("  changesets   {}", bundle.changesets.len());
+        println!("  objects      {}", bundle.objects.len());
+        println!("  payload      {} bytes", wire.len());
+        println!("  largest      {} bytes", largest);
+        if authors.is_empty() {
+            println!("  nothing to send");
+        }
+        for (id, author) in &authors {
+            println!("  {}  {}", id, author);
+        }
+        if bundle.changesets.len() > authors.len() {
+            println!("  ... and {} more", bundle.changesets.len() - authors.len());
+        }
+        if identity.is_empty() {
+            println!("  author identities: none");
+        } else {
+            println!(
+                "  author identities: {} changeset(s) carry one, readable by whoever holds the \
+                 remote",
+                identity.len()
+            );
+        }
+    }
+
+    if check_identity && !identity.is_empty() {
+        // A refusal here is a policy the caller asked for, not a broken payload, so it carries the
+        // same code a bad invocation does: the command was asked to do something it will not do.
+        return Err(Box::new(crate::error::Error::new(
+            crate::error::Code::Usage,
+            format!(
+                "{} changeset(s) carry an author identity in the payload",
+                identity.len()
+            ),
+        )));
+    }
+    Ok(())
+}
+
 pub fn cmd_push(remote_name: &str, branch: &str) -> ZResult<()> {
     let (root, conn) = open_repo()?;
     let url = remote_url(&conn, remote_name)?;

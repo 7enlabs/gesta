@@ -1155,6 +1155,178 @@ def main():
             ok, why = False, f"not JSON: {exc}"
         record("hook status --json reports the hashes and agrees with itself", ok, why)
 
+    if want("push-inspect"):
+        # Pushing is when content leaves the machine. Until now the only way to learn what went was
+        # to push and then look, and a changeset carries an author string that is an address in
+        # practice.
+        import tempfile as _tf
+        import json as _json
+        d = _tf.mkdtemp()
+        sh(f"{ZF} init", cwd=d)
+        with open(os.path.join(d, "a.txt"), "w") as fh:
+            fh.write("x\n")
+        sh(f'{ZF} changeset create "one" --author secret@private.example', cwd=d)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=d)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+
+        target = os.path.join(d, "..", "push_target_" + os.path.basename(d))
+        sh(f"{ZF} remote add net {target}", cwd=d)
+
+        before = sh(f"{ZF} remote inspect net", cwd=d)
+        body = before[1] or ""
+        record(
+            "inspect reports what a push would carry before it carries it",
+            "changesets   1" in body and "payload" in body,
+            body[:300],
+        )
+        record(
+            "and names the author string that would travel",
+            "secret@private.example" in body,
+            body[:300],
+        )
+        record(
+            "and says the identity is readable by whoever holds the remote",
+            "author identities: 1" in body,
+            body[:300],
+        )
+        record(
+            "nothing was sent by inspecting",
+            not os.path.isdir(target) or not os.path.isdir(os.path.join(target, ".gesta")),
+            f"remote exists: {os.path.isdir(target)}",
+        )
+
+        refused = sh(f"{ZF} remote inspect net --check-identity", cwd=d)
+        record(
+            "a caller can refuse a payload that carries identities",
+            refused[0] == 2 and "author identity" in (refused[1] or ""),
+            f"exit={refused[0]} {(refused[1] or '')[:200]}",
+        )
+
+        # An author without an address is not an identity in the same sense, so the check passes.
+        d2 = _tf.mkdtemp()
+        sh(f"{ZF} init", cwd=d2)
+        with open(os.path.join(d2, "a.txt"), "w") as fh:
+            fh.write("x\n")
+        sh(f'{ZF} changeset create "one" --author zen', cwd=d2)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=d2)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d2)
+        sh(f"{ZF} remote add net {os.path.join(d2, '..', 'pt2_' + os.path.basename(d2))}", cwd=d2)
+        plain = sh(f"{ZF} remote inspect net --check-identity", cwd=d2)
+        record(
+            "an author that is just a name does not trip the identity check",
+            plain[0] == 0 and "author identities: none" in (plain[1] or ""),
+            (plain[1] or "")[:240],
+        )
+
+        js = sh_out(f"{ZF} --json remote inspect net", cwd=d)
+        try:
+            payload = _json.loads(js[1])
+            ok = (
+                payload["changesets"] == 1
+                and payload["author_identities"] == 1
+                and payload["estimated"] is False
+                and payload["authors"][0]["author"] == "secret@private.example"
+                and payload.get("schema")
+            )
+            why = js[1][:260]
+        except Exception as exc:
+            ok, why = False, f"not JSON: {exc}"
+        record("inspect --json carries the payload size, the authors and the schema", ok, why)
+
+    if want("anonymise"):
+        # An identity that already left cannot be un-sent, only replaced. Two properties decide
+        # the design: a signature covers the author, and a changeset id does not.
+        import tempfile as _tf
+        d = _tf.mkdtemp()
+        sh(f"{ZF} init", cwd=d)
+        with open(os.path.join(d, "a.txt"), "w") as fh:
+            fh.write("x\n")
+        sh(f'{ZF} changeset create "one" --author secret@private.example', cwd=d)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=d)[1])
+        cs = m.group(1) if m else ""
+        sh(f"{ZF} changeset commit {cs}", cwd=d)
+
+        preview = sh(f"{ZF} anonymise --dry-run", cwd=d)
+        record(
+            "a dry run says how many changesets would change",
+            "would rewrite 1" in (preview[1] or ""),
+            (preview[1] or "")[:200],
+        )
+        still = sh(f"{ZF} log --json", cwd=d)
+        record(
+            "and the dry run changed nothing",
+            "secret@private.example" in (still[1] or ""),
+            (still[1] or "")[:160],
+        )
+
+        done = sh(f"{ZF} anonymise", cwd=d)
+        record(
+            "the rewrite reports the string it replaced",
+            "rewrote 1" in (done[1] or "") and "secret@private.example" in (done[1] or ""),
+            (done[1] or "")[:240],
+        )
+        after = sh(f"{ZF} log --json", cwd=d)
+        record(
+            "no stored record still carries the old author",
+            "secret@private.example" not in (after[1] or ""),
+            (after[1] or "")[:200],
+        )
+        record(
+            "the changeset id survived the rewrite",
+            cs in (after[1] or ""),
+            (after[1] or "")[:200],
+        )
+
+        pushed = os.path.join(d, "..", "anon_" + os.path.basename(d))
+        sh(f"{ZF} remote add net {pushed}", cwd=d)
+        insp = sh(f"{ZF} remote inspect net", cwd=d)
+        record(
+            "a later push no longer discloses the old author",
+            "author identities: none" in (insp[1] or ""),
+            (insp[1] or "")[:240],
+        )
+
+        # Replacing one address with another is not anonymising.
+        swap = sh(f'{ZF} anonymise --author anonymous --to new@example.com', cwd=d)
+        record(
+            "a replacement that is itself an identity is refused",
+            swap[0] != 0 and "still looks like an identity" in (swap[1] or ""),
+            (swap[1] or "")[:240],
+        )
+
+        # A signature covers the author, so it cannot survive. Leaving it would produce a
+        # changeset that looks signed and fails verification.
+        d2 = _tf.mkdtemp()
+        sh(f"{ZF} init", cwd=d2)
+        with open(os.path.join(d2, "a.txt"), "w") as fh:
+            fh.write("x\n")
+        sh(f'{ZF} changeset create "one" --author secret@private.example', cwd=d2)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=d2)[1])
+        cs2 = m.group(1) if m else ""
+        sh(f"{ZF} key generate", cwd=d2)
+        sh(f"{ZF} changeset sign {cs2}", cwd=d2)
+        sh(f"{ZF} changeset commit {cs2}", cwd=d2)
+        before_v = sh(f"{ZF} verify {cs2}", cwd=d2)
+        record(
+            "a signed changeset verifies before the rewrite",
+            before_v[0] == 0 and "verifies against" in (before_v[1] or ""),
+            (before_v[1] or "")[:200],
+        )
+        rew = sh(f"{ZF} anonymise", cwd=d2)
+        record(
+            "the rewrite says how many signatures it dropped",
+            "1 signature(s) dropped" in (rew[1] or ""),
+            (rew[1] or "")[:240],
+        )
+        after_v = sh(f"{ZF} verify {cs2}", cwd=d2)
+        record(
+            "and the changeset no longer claims to be signed",
+            after_v[0] != 0 and "carries no signature" in (after_v[1] or ""),
+            (after_v[1] or "")[:200],
+        )
+
     if want("gc"):
         # A repository that only grows is a repository that gets slower and bigger forever. The
         # check plants an object nothing references and asks gc to remove exactly that one.
