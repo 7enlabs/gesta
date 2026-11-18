@@ -181,30 +181,6 @@ pub fn search_history(
     Ok(hits)
 }
 
-/// Which changesets, tags or branches a search hit. Used by `grep --history --revs`.
-pub fn revs_touching(conn: &Connection, path: &str) -> ZResult<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT changeset_id FROM changeset_files WHERE path = ?1
-         ORDER BY changeset_id DESC LIMIT 20",
-    )?;
-    let rows = stmt.query_map(rusqlite::params![path], |r| r.get::<_, String>(0))?;
-    Ok(rows.filter_map(|r| r.ok()).collect())
-}
-
-/// The most recent changeset that changed a path, for a hit reported without a revision.
-pub fn last_touching(conn: &Connection, path: &str) -> ZResult<Option<String>> {
-    conn.query_row(
-        "SELECT changeset_id FROM changeset_files WHERE path = ?1
-         ORDER BY rowid DESC LIMIT 1",
-        rusqlite::params![path],
-        |r| r.get::<_, String>(0),
-    )
-    .ok()
-    .map(Some)
-    .ok_or_else(|| bad(format!("no changeset touches {}", path)))
-    .or_else(|_| Ok::<Option<String>, Box<dyn std::error::Error>>(None))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
