@@ -53,6 +53,20 @@ impl S3Config {
                     .to_string(),
             ));
         }
+        // A plain endpoint sends the signature and the object bodies in the clear. The signature
+        // is not a password, but it identifies the key and it covers the payload, so anyone on
+        // the path reads the repository and can replay within the signing window. Loopback is
+        // allowed because a local test server cannot be read by anyone else.
+        if let Some(rest) = endpoint.strip_prefix("http://") {
+            let host = rest.split(['/', ':']).next().unwrap_or("");
+            let loopback = host == "127.0.0.1" || host == "localhost" || host == "::1";
+            if !loopback {
+                return Err(bad(format!(
+                    "refusing a plain http endpoint ({}): the signature and the content would travel in the clear. Use https, or 127.0.0.1 for a local test server",
+                    endpoint
+                )));
+            }
+        }
         // Credentials come from the environment first, then from the encrypted
         // store. The order matters: an environment variable is what a test or a
         // one-off job sets, and the store is what a person sets once and forgets.
@@ -386,5 +400,39 @@ mod tests {
     fn a_url_without_a_bucket_is_refused() {
         assert!(S3Config::from_url("s3:///x").is_err());
         assert!(S3Config::from_url("https://example.com").is_err());
+    }
+    #[test]
+    fn a_plain_http_endpoint_is_refused_because_the_signature_would_be_readable() {
+        std::env::set_var("GESTA_S3_ENDPOINT", "http://s3.example.com");
+        std::env::set_var("GESTA_S3_ACCESS_KEY", "k");
+        std::env::set_var("GESTA_S3_SECRET_KEY", "s");
+        // `S3Config` deliberately has no Debug, because it holds the secret key and a
+        // derive would print it in any panic message.
+        let err = match S3Config::from_url("s3://bucket/prefix") {
+            Ok(_) => panic!("a plain endpoint was accepted"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("plain http"), "unexpected message: {}", err);
+    }
+
+    #[test]
+    fn a_loopback_endpoint_is_allowed_for_a_local_test_server() {
+        std::env::set_var("GESTA_S3_ENDPOINT", "http://127.0.0.1:9303");
+        std::env::set_var("GESTA_S3_ACCESS_KEY", "k");
+        std::env::set_var("GESTA_S3_SECRET_KEY", "s");
+        std::env::set_var("GESTA_S3_REGION", "us-east-1");
+        let (cfg, prefix) = S3Config::from_url("s3://bucket/prefix").unwrap();
+        assert_eq!(prefix, "prefix");
+        assert_eq!(cfg.bucket, "bucket");
+    }
+
+    #[test]
+    fn an_https_endpoint_is_accepted() {
+        std::env::set_var("GESTA_S3_ENDPOINT", "https://s3.ap-southeast-2.idrivee2.com");
+        std::env::set_var("GESTA_S3_ACCESS_KEY", "k");
+        std::env::set_var("GESTA_S3_SECRET_KEY", "s");
+        std::env::set_var("GESTA_S3_REGION", "ap-southeast-2");
+        let (cfg, _) = S3Config::from_url("s3://bucket/pre").unwrap();
+        assert_eq!(cfg.region, "ap-southeast-2");
     }
 }

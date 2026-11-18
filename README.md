@@ -78,7 +78,7 @@ gesta blame src/main.rs
 | `stash list` | Saved stashes, newest first |
 | `stash pop [--id N]` | Write a stash back, refusing over local changes |
 | `stash drop [--id N]` | Delete a stash without applying it |
-| `brief [--json]` | Everything a session needs before its first edit, in one call |
+| `brief [--json] [--fix]` | Where the session stands, and `--fix` does the safe part |
 | `grep <text> [--history]` | Find text in the working tree, or in every recorded version |
 | `hook list` | Which hooks are installed |
 | `hook install <name> [--file F]` | Write a hook, reading stdin when no file is given |
@@ -130,6 +130,18 @@ safe until it is finished.
 
 Answering this with separate commands costs four round trips and four blocks of output to keep
 in context. One object is what an agent can branch on.
+
+`--fix` acts on the two states that need no judgement: a snapshot that matches the disk is
+committed, and one the disk has moved past is dropped rather than committed. Anything else is
+refused with the reason and the command, because those choices lose data when guessed.
+
+```sh
+$ gesta brief --fix
+committed cs68f126bd1a15
+
+$ gesta brief --fix
+left alone: 1 file(s) -- the working tree differs from the head and no snapshot describes it: snapshot it with `gesta changeset create`, or set it aside with `gesta stash save`
+```
 
 ### Searching
 

@@ -125,6 +125,62 @@ def main():
                     bad.append(f"{f}:{line} {m.group(0)[:40]}")
         record("no hardcoded credential in src", not bad, "\n".join(bad[:10]))
 
+    if want("brief-fix"):
+        # The fix does the safe half and names what it refused. A fix that silently skips work
+        # is worse than no fix, so a refusal is checked as carefully as an action.
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        sh(f"{ZF} init", cwd=tmp)
+        with open(os.path.join(tmp, "a.txt"), "w") as fh:
+            fh.write("v1\n")
+        sh(f"{ZF} changeset create base --author t", cwd=tmp)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=tmp)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=tmp)
+
+        # A snapshot that matches the disk is committed.
+        with open(os.path.join(tmp, "a.txt"), "w") as fh:
+            fh.write("v2\n")
+        sh(f"{ZF} changeset create snap --author t", cwd=tmp)
+        r = sh(f"{ZF} brief --fix", cwd=tmp)
+        after = sh(f"{ZF} brief --json", cwd=tmp)[1]
+        record(
+            "fix commits a snapshot that matches the disk",
+            "committed cs" in r[1] and '"next": "ready"' in after,
+            r[1][:160],
+        )
+
+        # A snapshot the disk moved past is dropped, not committed.
+        with open(os.path.join(tmp, "a.txt"), "w") as fh:
+            fh.write("v3\n")
+        sh(f"{ZF} changeset create s2 --author t", cwd=tmp)
+        with open(os.path.join(tmp, "a.txt"), "w") as fh:
+            fh.write("v4\n")
+        r = sh(f"{ZF} brief --fix", cwd=tmp)
+        record(
+            "fix drops a snapshot the disk moved past",
+            "dropped cs" in r[1] and "committed" not in r[1],
+            r[1][:200],
+        )
+
+        # Uncommitted work with no snapshot: refuse and name the command.
+        with open(os.path.join(tmp, "a.txt"), "w") as fh:
+            fh.write("v5\n")
+        r = sh(f"{ZF} brief --fix", cwd=tmp)
+        keep = open(os.path.join(tmp, "a.txt")).read()
+        record(
+            "fix refuses to commit work it has no snapshot for, and keeps the edit",
+            "left alone" in r[1] and "changeset create" in r[1] and keep == "v5\n",
+            r[1][:220],
+        )
+
+        r = sh(f"{ZF} brief --fix", cwd=tmp)
+        record(
+            "fix reports nothing to do on a clean tree",
+            "nothing to fix" in r[1] or "left alone" in r[1],
+            r[1][:120],
+        )
+
     if want("brief"):
         # One call that answers where the session stands. An agent that asks this with four
         # commands pays four round trips and holds four outputs in context.

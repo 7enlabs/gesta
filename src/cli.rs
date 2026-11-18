@@ -733,6 +733,29 @@ pub fn cmd_history(file: &str) -> ZResult<()> {
     Ok(())
 }
 
+/// Do the safe half of what `brief` reports.
+pub fn cmd_brief_fix(json_out: bool) -> ZResult<()> {
+    let (root, conn) = open_repo()?;
+    let f = crate::brief::fix(&conn, &root)?;
+    if json_out {
+        emit(crate::brief::fixed_to_json(&f));
+        return Ok(());
+    }
+    for id in &f.committed {
+        println!("committed {}", id);
+    }
+    for id in &f.dropped {
+        println!("dropped {} (the disk had moved past it)", id);
+    }
+    for (what, why) in &f.skipped {
+        println!("left alone: {} -- {}", what, why);
+    }
+    if f.committed.is_empty() && f.dropped.is_empty() && f.skipped.is_empty() {
+        println!("nothing to fix");
+    }
+    Ok(())
+}
+
 /// Everything a session needs before its first edit, printed as a few short lines.
 pub fn cmd_brief() -> ZResult<()> {
     let (root, conn) = open_repo()?;

@@ -192,6 +192,97 @@ pub fn to_json(b: &Brief) -> Json {
     ])
 }
 
+/// What a fix did, so the caller reports it rather than guessing.
+#[derive(Debug, Default, PartialEq)]
+pub struct Fixed {
+    /// Pending changesets committed because they described the disk exactly.
+    pub committed: Vec<String>,
+    /// Pending changesets dropped because the disk had moved past them.
+    pub dropped: Vec<String>,
+    /// Left alone, with the reason. A fix that silently skips work is worse than no fix.
+    pub skipped: Vec<(String, String)>,
+}
+
+/// Do the safe part of what `brief` reports, and name what was left.
+///
+/// Only two actions qualify. A snapshot that matches the disk exactly is committed, since that
+/// is the work it recorded. A snapshot the disk has moved past is dropped, since committing it
+/// would record content nobody is looking at. Anything else, a rebase in progress or uncommitted
+/// work with no snapshot, is left to a person: those choices lose data when guessed.
+pub fn fix(conn: &Connection, root: &Path) -> ZResult<Fixed> {
+    let b = brief(conn, root)?;
+    let mut out = Fixed::default();
+
+    if b.next == Next::FinishRebase {
+        out.skipped.push((
+            "rebase".to_string(),
+            "a rebase stopped on a conflict: resolve it, then `gesta rebase --continue`".to_string(),
+        ));
+        return Ok(out);
+    }
+    if !b.conflicts.is_empty() {
+        out.skipped.push((
+            b.conflicts.join(", "),
+            "an unresolved conflict is waiting: resolve it by hand".to_string(),
+        ));
+        return Ok(out);
+    }
+
+    for id in &b.pending {
+        if b.stale.contains(id) {
+            // The snapshot describes content the disk no longer has. Committing it would put
+            // back what someone has already changed, so it goes.
+            match drop_pending(conn, id) {
+                Ok(()) => out.dropped.push(id.clone()),
+                Err(e) => out.skipped.push((id.clone(), e.to_string())),
+            }
+        } else {
+            match crate::repo::commit_one(conn, id) {
+                Ok(_) => out.committed.push(id.clone()),
+                Err(e) => out.skipped.push((id.clone(), e.to_string())),
+            }
+        }
+    }
+
+    if out.committed.is_empty() && out.dropped.is_empty() && b.changed > 0 {
+        out.skipped.push((
+            format!("{} file(s)", b.changed),
+            "the working tree differs from the head and no snapshot describes it: snapshot it with `gesta changeset create`, or set it aside with `gesta stash save`".to_string(),
+        ));
+    }
+    Ok(out)
+}
+
+fn drop_pending(conn: &Connection, id: &str) -> ZResult<()> {
+    conn.execute("DELETE FROM changeset_files WHERE changeset_id = ?1", rusqlite::params![id])?;
+    conn.execute(
+        "DELETE FROM changesets WHERE id = ?1 AND status = 'pending'",
+        rusqlite::params![id],
+    )?;
+    Ok(())
+}
+
+pub fn fixed_to_json(f: &Fixed) -> Json {
+    let pair = |v: &Vec<(String, String)>| {
+        Json::arr(
+            v.iter()
+                .map(|(a, b)| Json::obj(vec![("what", Json::str(a.clone())), ("why", Json::str(b.clone()))]))
+                .collect(),
+        )
+    };
+    Json::obj(vec![
+        (
+            "committed",
+            Json::arr(f.committed.iter().map(|s| Json::str(s.clone())).collect()),
+        ),
+        (
+            "dropped",
+            Json::arr(f.dropped.iter().map(|s| Json::str(s.clone())).collect()),
+        ),
+        ("skipped", pair(&f.skipped)),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,6 +392,74 @@ mod tests {
             b.next,
             Next::CommitWork,
             "the snapshot does not describe b.txt, so committing it would drop the file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn fix_commits_a_snapshot_that_matches_the_disk() {
+        let (conn, dir) = repo_with_one_commit("fix-commit");
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        let cs = crate::repo::create_changeset(&conn, &dir, "snap", "a")
+            .unwrap()
+            .unwrap();
+        let f = fix(&conn, &dir).unwrap();
+        assert_eq!(f.committed, vec![cs.id.clone()]);
+        assert!(f.dropped.is_empty());
+        assert_eq!(brief(&conn, &dir).unwrap().next, Next::Ready);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fix_drops_a_snapshot_the_disk_moved_past() {
+        let (conn, dir) = repo_with_one_commit("fix-drop");
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        let cs = crate::repo::create_changeset(&conn, &dir, "snap", "a")
+            .unwrap()
+            .unwrap();
+        std::fs::write(dir.join("a.txt"), "three\n").unwrap();
+        let f = fix(&conn, &dir).unwrap();
+        assert_eq!(f.dropped, vec![cs.id.clone()], "the stale snapshot stayed");
+        assert!(f.committed.is_empty(), "committing it would record stale content");
+        // The drops removed the row rather than committing wrong content.
+        let still: i64 = conn
+            .query_row("SELECT COUNT(*) FROM changesets WHERE id = ?1", [&cs.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(still, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fix_refuses_to_guess_when_a_rebase_stopped() {
+        let (conn, dir) = repo_with_one_commit("fix-rebase");
+        crate::rebase::load(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO rebase(id, branch, onto, pending, current, done, original_head, created_at)
+             VALUES(1, 'side', 'main', '[\"x\"]', 'x', '[]', 'b1', 1)",
+            [],
+        )
+        .unwrap();
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        let before = brief(&conn, &dir).unwrap();
+        let f = fix(&conn, &dir).unwrap();
+        assert!(f.committed.is_empty() && f.dropped.is_empty());
+        assert!(!f.skipped.is_empty(), "a refusal must say why");
+        assert!(f.skipped[0].1.contains("rebase --continue"));
+        // Nothing moved.
+        assert_eq!(brief(&conn, &dir).unwrap().changed, before.changed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fix_leaves_uncommitted_work_alone_and_names_the_command() {
+        let (conn, dir) = repo_with_one_commit("fix-work");
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        let f = fix(&conn, &dir).unwrap();
+        assert!(f.committed.is_empty() && f.dropped.is_empty());
+        assert!(f.skipped[0].1.contains("changeset create"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "two\n",
+            "the edit was touched"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
