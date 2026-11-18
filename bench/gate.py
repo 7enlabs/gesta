@@ -1327,6 +1327,153 @@ def main():
             (after_v[1] or "")[:200],
         )
 
+    if want("tags"):
+        # A tag has to store a changeset id, not the name it was given. Storing the name produces a
+        # tag that exists, resolves to nothing, and fails only when somebody reads through it.
+        import tempfile as _tf
+        d = _tf.mkdtemp()
+        sh(f"{ZF} init", cwd=d)
+        with open(os.path.join(d, "a.txt"), "w") as fh:
+            fh.write("a\n")
+        sh(f'{ZF} changeset create "one" --author t', cwd=d)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=d)[1])
+        cs = m.group(1) if m else ""
+        sh(f"{ZF} changeset commit {cs}", cwd=d)
+
+        bare = sh(f"{ZF} tag v1", cwd=d)
+        record(
+            "a tag with no revision points at the branch head",
+            bare[0] == 0 and cs in (bare[1] or ""),
+            (bare[1] or "")[:160],
+        )
+
+        at_branch = sh(f"{ZF} tag v2 --changeset main", cwd=d)
+        record(
+            "a tag can point at a branch, and stores the changeset it resolves to",
+            cs in (at_branch[1] or ""),
+            (at_branch[1] or "")[:200],
+        )
+        read = sh(f"{ZF} show v2:a.txt", cwd=d)
+        record(
+            "reading through a tag of a branch works",
+            read[0] == 0 and "a" in (read[1] or ""),
+            (read[1] or "")[:160],
+        )
+
+        at_tag = sh(f"{ZF} tag v3 --changeset v1", cwd=d)
+        record(
+            "a tag can point at another tag",
+            at_tag[0] == 0 and cs in (at_tag[1] or ""),
+            (at_tag[1] or "")[:200],
+        )
+        read2 = sh(f"{ZF} show v3:a.txt", cwd=d)
+        record(
+            "reading through a tag of a tag works",
+            read2[0] == 0 and "a" in (read2[1] or ""),
+            (read2[1] or "")[:160],
+        )
+
+        nothing = sh(f"{ZF} tag v4 --changeset nosuchthing", cwd=d)
+        record(
+            "a tag that points at nothing is refused rather than stored",
+            nothing[0] != 0 and "has to point at something" in (nothing[1] or ""),
+            (nothing[1] or "")[:240],
+        )
+        listed = sh(f"{ZF} tag --list", cwd=d)
+        record(
+            "and the refused tag is not in the list",
+            "v4" not in (listed[1] or ""),
+            (listed[1] or "")[:240],
+        )
+
+        record(
+            "tag --list needs no name",
+            listed[0] == 0 and "v1" in (listed[1] or ""),
+            (listed[1] or "")[:240],
+        )
+        noname = sh(f"{ZF} tag", cwd=d)
+        record(
+            "a tag with neither a name nor --list says what is missing",
+            noname[0] != 0 and "needs a name" in (noname[1] or ""),
+            (noname[1] or "")[:200],
+        )
+
+        # A cycle written straight into the database must not hang the process.
+        import sqlite3 as _sq
+        try:
+            db = _sq.connect(os.path.join(d, ".gesta", "gesta.db"))
+            db.execute("INSERT INTO tags(name, changeset_id, message, created_at) VALUES('ca','cb',NULL,0)")
+            db.execute("INSERT INTO tags(name, changeset_id, message, created_at) VALUES('cb','ca',NULL,0)")
+            db.commit()
+            db.close()
+            cyc = sh(f"{ZF} show ca:a.txt", cwd=d)
+            record(
+                "a tag cycle is reported instead of looping",
+                cyc[0] != 0 and "never reach a changeset" in (cyc[1] or ""),
+                (cyc[1] or "")[:240],
+            )
+        except Exception as exc:
+            record("a tag cycle is reported instead of looping", False, f"could not set up: {exc}")
+
+    if want("blame-ignore"):
+        # A tree-wide reformat makes every line point at one changeset. That is true and useless:
+        # the reader wants the change that last touched the line in substance.
+        import tempfile as _tf
+        d = _tf.mkdtemp()
+        sh(f"{ZF} init", cwd=d)
+        with open(os.path.join(d, "a.txt"), "w") as fh:
+            fh.write("line one\nline two\nline three\n")
+        sh(f'{ZF} changeset create "real work" --author alice', cwd=d)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=d)[1])
+        real = m.group(1) if m else ""
+        sh(f"{ZF} changeset commit {real}", cwd=d)
+
+        with open(os.path.join(d, "a.txt"), "w") as fh:
+            fh.write("line one  \nline two  \nline three  \n")
+        sh(f'{ZF} changeset create "reformat everything" --author bot', cwd=d)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=d)[1])
+        reformat = m.group(1) if m else ""
+        sh(f"{ZF} changeset commit {reformat}", cwd=d)
+
+        plain = sh(f"{ZF} blame a.txt", cwd=d)
+        record(
+            "without a list every line belongs to the reformat",
+            "bot" in (plain[1] or "") and "alice" not in (plain[1] or ""),
+            (plain[1] or "")[:200],
+        )
+
+        ignored = sh(f"{ZF} blame a.txt --ignore-rev {reformat}", cwd=d)
+        record(
+            "naming the reformat attributes the lines to the change before it",
+            "alice" in (ignored[1] or "") and "bot" not in (ignored[1] or ""),
+            (ignored[1] or "")[:240],
+        )
+        record(
+            "and the report says how many lines moved",
+            "3 line(s) would point at an ignored revision" in (ignored[1] or ""),
+            (ignored[1] or "")[:260],
+        )
+
+        # A committed list means every clone inherits the same answer.
+        with open(os.path.join(d, ".gesta-blame-ignore-revs"), "w") as fh:
+            fh.write("# tree-wide reformat\n" + reformat + "\n")
+        auto = sh(f"{ZF} blame a.txt", cwd=d)
+        record(
+            "a committed ignore file is read without being asked",
+            "alice" in (auto[1] or "") and "ignored revision" in (auto[1] or ""),
+            (auto[1] or "")[:240],
+        )
+
+        # A comment explains why a revision is listed; a list nobody can explain stops being kept.
+        with open(os.path.join(d, ".gesta-blame-ignore-revs"), "w") as fh:
+            fh.write("# only a comment, no revisions\n")
+        nolist = sh(f"{ZF} blame a.txt", cwd=d)
+        record(
+            "a file of comments only leaves attribution alone",
+            "bot" in (nolist[1] or ""),
+            (nolist[1] or "")[:200],
+        )
+
     if want("gc"):
         # A repository that only grows is a repository that gets slower and bigger forever. The
         # check plants an object nothing references and asks gc to remove exactly that one.

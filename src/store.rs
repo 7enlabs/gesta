@@ -800,11 +800,38 @@ pub fn resolve_rev(conn: &Connection, rev: &str) -> ZResult<Option<String>> {
     if exists.is_some() {
         return Ok(exists);
     }
-    // A tag is also a valid revision.
-    let tagged: Option<String> = conn
-        .query_row("SELECT changeset_id FROM tags WHERE name = ?1", params![rev], |r| r.get(0))
-        .optional()?;
-    Ok(tagged)
+    // A tag is also a valid revision, and a tag may point at another tag. Following the chain
+    // rather than reading one row is what keeps a re-tag honest; the bound stops a cycle written
+    // by hand from hanging the process.
+    let mut cursor = rev.to_string();
+    for _ in 0..32 {
+        let tagged: Option<String> = conn
+            .query_row(
+                "SELECT changeset_id FROM tags WHERE name = ?1",
+                params![cursor],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match tagged {
+            None => return Ok(None),
+            Some(next) => {
+                // A tag that names a real changeset ends the walk, and that is the common case.
+                let is_changeset: Option<String> = conn
+                    .query_row("SELECT id FROM changesets WHERE id = ?1", params![next], |r| {
+                        r.get(0)
+                    })
+                    .optional()?;
+                if is_changeset.is_some() {
+                    return Ok(is_changeset);
+                }
+                cursor = next;
+            }
+        }
+    }
+    Err(bad(format!(
+        "the tag {} points at tags that never reach a changeset",
+        rev
+    )))
 }
 
 /// Content hash for `path` as of `changeset`, walking its ancestry.

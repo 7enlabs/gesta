@@ -147,3 +147,15 @@ The id is derived once, when the changeset is created, and never recomputed. Eve
 ## P4. A replacement that is itself an identity is refused
 
 Swapping one address for another is not anonymising. Accepting it would let somebody believe the payload is clean while it names a person exactly as before. The refusal costs nothing and prevents a false sense of safety.
+
+## T1. A tag stores a changeset id, never the name it was given
+
+`tag v2 main` used to store the string "main" as the changeset. The tag existed, appeared in the list, and resolved to nothing; the fault surfaced only when somebody read through it. Every revision name must be resolved before it is written, and a name that resolves to nothing must be refused rather than stored.
+
+## T2. A tag may point at a branch, a changeset, or another tag
+
+Following the chain at read time is what makes re-tagging honest. The walk is bounded, so a cycle written straight into the database is reported instead of hanging the process.
+
+## T3. Blame reads its ignore list from the repository, not from local configuration
+
+A tree-wide reformat or a symbol rename makes every line point at one changeset. True, and useless: the reader wants the change that last touched the line in substance. A list at the repository root means every clone inherits the same answer. A list that lives in local configuration gives two people two different histories of the same file, which is the one outcome a blame cannot afford.

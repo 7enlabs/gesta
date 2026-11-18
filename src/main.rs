@@ -261,7 +261,13 @@ enum Cmd {
         sub: ChangesetCmd,
     },
     /// Show which changeset introduced each line of a file
-    Blame { file: String },
+    Blame {
+        file: String,
+        /// Revision to attribute to the change before it, instead of itself. Repeat for several,
+        /// or name a file of revisions. With none, .gesta-blame-ignore-revs at the root is read.
+        #[arg(long = "ignore-rev")]
+        ignore_rev: Vec<String>,
+    },
     /// Show version history of a file
     History { file: String },
     /// Show a file as of a changeset or branch
@@ -400,7 +406,9 @@ enum Cmd {
     },
     /// Tag a changeset
     Tag {
-        name: String,
+        /// Name of the tag. Omit it with --list.
+        name: Option<String>,
+        /// Revision to tag: a changeset, a branch or another tag. Defaults to the branch head.
         #[arg(long)]
         changeset: Option<String>,
         #[arg(long)]
@@ -876,7 +884,7 @@ fn run() -> ZResult<()> {
         Cmd::Log {
             limit, envelope, ..
         } if json => cli::cmd_log_json(limit, envelope),
-        Cmd::Blame { file } if json => cli::cmd_blame_json(&file),
+        Cmd::Blame { file, .. } if json => cli::cmd_blame_json(&file),
         Cmd::History { file } if json => cli::cmd_history_json(&file),
         Cmd::Diff { changeset, from, to, .. } if json => {
             if from.is_some() || to.is_some() {
@@ -937,7 +945,7 @@ fn run() -> ZResult<()> {
             ChangesetCmd::Diff { id } => cli::cmd_changeset_diff(&id),
             ChangesetCmd::List => cli::cmd_changeset_list(),
         },
-        Cmd::Blame { file } => cli::cmd_blame(&file),
+        Cmd::Blame { file, ignore_rev } => cli::cmd_blame(&file, &ignore_rev),
         Cmd::History { file } => cli::cmd_history(&file),
         Cmd::Show { spec } => cli::cmd_show(&spec),
         Cmd::Ls { rev, path, long: _ } if json => cli::cmd_ls_json(rev.as_deref(), path.as_deref()),
@@ -993,7 +1001,9 @@ fn run() -> ZResult<()> {
             cli::cmd_revert(&id, reason.as_deref(), &author)
         }
         Cmd::Ops { limit } => cli::cmd_ops(limit),
-        Cmd::Tag { name, changeset, list } => cli::cmd_tag(&name, changeset.as_deref(), list),
+        Cmd::Tag { name, changeset, list } => {
+            cli::cmd_tag(name.as_deref(), changeset.as_deref(), list)
+        }
         Cmd::Branch { sub } => match sub {
             BranchCmd::Create { name, from } => cli::cmd_branch_create(&name, &from),
             BranchCmd::List => cli::cmd_branch_list(),

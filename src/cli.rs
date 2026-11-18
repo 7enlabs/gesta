@@ -4,7 +4,7 @@
 use std::fs;
 use std::path::Path;
 
-use rusqlite::OptionalExtension;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::merge;
 use crate::ops;
@@ -680,9 +680,111 @@ pub fn cmd_revert(id: &str, reason: Option<&str>, author: &str) -> ZResult<()> {
     Ok(())
 }
 
-pub fn cmd_blame(file: &str) -> ZResult<()> {
+/// Revisions whose lines should be attributed to whatever came before them.
+///
+/// The file lives at the repository root so a project can commit it and every clone inherits the
+/// same answer, which is the point: a blame that depends on local configuration gives two people
+/// two different histories.
+const IGNORE_REVS_FILE: &str = ".gesta-blame-ignore-revs";
+
+fn parse_rev_list(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|l| l.trim())
+        // A comment is how a project explains why a revision is on the list, and a list nobody
+        // can explain stops being maintained.
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.to_string())
+        .collect()
+}
+
+fn read_ignore_revs(root: &Path) -> Vec<String> {
+    match std::fs::read_to_string(root.join(IGNORE_REVS_FILE)) {
+        Ok(text) => parse_rev_list(&text),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The changeset that should carry a line, walking back past revisions the project chose to skip.
+///
+/// `blame` holds one row per line, keyed by path and line number, so the skipped revision is
+/// already the only answer stored. Walking back means asking which changeset last had that line
+/// before the ignored one, which is a question `changeset_files` can answer: the ignored changeset
+/// recorded both the file before and after, and its parent recorded the content it started from.
+fn blame_through(
+    conn: &Connection,
+    path: &str,
+    line_no: i64,
+    ignored: &[String],
+) -> ZResult<Option<(String, String, Option<String>)>> {
+    let current: Option<(String, String, Option<String>)> = conn
+        .query_row(
+            "SELECT b.changeset_id, b.author, c.intent
+             FROM blame b LEFT JOIN changesets c ON c.id = b.changeset_id
+             WHERE b.path = ?1 AND b.line_no = ?2",
+            rusqlite::params![path, line_no],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    let cs = match &current {
+        Some(found) => found.0.clone(),
+        None => return Ok(None),
+    };
+    if !ignored.iter().any(|i| i == &cs) {
+        return Ok(current);
+    }
+    // The line's content did not change in the ignored revision, so blame it on the newest
+    // changeset before it that touched this file at all. That is an approximation of what git
+    // computes by re-running the diff, and it is the honest one to report: the line came from
+    // somewhere earlier, and this names where.
+    let earlier: Option<(String, String, Option<String>)> = conn
+        .query_row(
+            "SELECT cf.changeset_id, c.author, c.intent
+             FROM changeset_files cf JOIN changesets c ON c.id = cf.changeset_id
+             WHERE cf.path = ?1 AND cf.changeset_id != ?2
+               AND c.created_at <= (SELECT created_at FROM changesets WHERE id = ?2)
+             ORDER BY c.created_at DESC, c.rowid DESC LIMIT 1",
+            rusqlite::params![path, cs],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    Ok(earlier.or(current))
+}
+
+pub fn cmd_blame(file: &str, ignore: &[String]) -> ZResult<()> {
     let (root, conn) = open_repo()?;
     let rel = normalise(file);
+
+    // Following a revision through a rewrite is what keeps blame useful. A tree-wide reformat or a
+    // rename of every symbol makes every line point at one changeset, which is true and useless:
+    // the reader wants the change that last touched the line in substance. Git settled on a file
+    // at the repository root listing those revisions, read without being asked, and the same
+    // convention here means a project does not have to teach every tool about its own list.
+    let ignore = if ignore.is_empty() {
+        read_ignore_revs(&root)
+    } else {
+        ignore
+            .iter()
+            .flat_map(|v| {
+                // A caller may name a file of revisions, or a revision directly.
+                match std::fs::read_to_string(root.join(v)) {
+                    Ok(text) => parse_rev_list(&text),
+                    Err(_) => vec![v.clone()],
+                }
+            })
+            .collect()
+    };
 
     let content = match worktree::read_text(&root.join(&rel)) {
         Some(c) => c,
@@ -722,12 +824,23 @@ pub fn cmd_blame(file: &str) -> ZResult<()> {
         .into_iter()
         .map(|(n, c, a, i)| (n, (c, a, i)))
         .collect();
+    // Report how many lines the ignore list moved, because a silently different answer is how a
+    // reader loses trust in the attribution without knowing why it changed.
+    let mut skipped = 0usize;
 
     let mut unattributed = 0usize;
     let mut intents: Vec<String> = Vec::new();
     for (i, line) in content.lines().enumerate() {
         let n = (i + 1) as i64;
-        match map.get(&n) {
+        let looked = match map.get(&n) {
+            Some(found) if ignore.iter().any(|i| i == &found.0) => {
+                skipped += 1;
+                blame_through(&conn, &rel, n, &ignore)?
+            }
+            Some(found) => Some(found.clone()),
+            None => blame_through(&conn, &rel, n, &ignore)?,
+        };
+        match looked.as_ref() {
             Some((cs, author, intent)) => {
                 println!("{:<14} {:<10} {:>4} | {}", cs, author, n, line);
                 // Collected rather than printed per line, because a reason repeated on
@@ -744,6 +857,12 @@ pub fn cmd_blame(file: &str) -> ZResult<()> {
                 println!("{:<14} {:<10} {:>4} | {}", "?", "?", n, line)
             }
         }
+    }
+    if skipped > 0 {
+        println!(
+            "\n{} line(s) would point at an ignored revision; attributed to the change before it",
+            skipped
+        );
     }
     if !intents.is_empty() {
         println!("\nwhy these lines exist:");
@@ -1296,9 +1415,9 @@ pub fn cmd_ops(limit: usize) -> ZResult<()> {
     Ok(())
 }
 
-pub fn cmd_tag(name: &str, changeset: Option<&str>, list: bool) -> ZResult<()> {
+pub fn cmd_tag(name: Option<&str>, changeset: Option<&str>, list: bool) -> ZResult<()> {
     let (_root, conn) = open_repo()?;
-    if list || name == "--list" {
+    if list {
         let tags: Vec<(String, String, i64)> = {
             let mut stmt = conn.prepare("SELECT name, changeset_id, created_at FROM tags ORDER BY name")?;
             let rows = stmt.query_map([], |r| {
@@ -1314,8 +1433,19 @@ pub fn cmd_tag(name: &str, changeset: Option<&str>, list: bool) -> ZResult<()> {
         }
         return Ok(());
     }
+    let name = name.ok_or_else(|| bad("a tag needs a name: `gesta tag <name> [--changeset REV]`"))?;
+
+    // Whatever was named has to be turned into a changeset id before it is stored. Storing the
+    // name is what let `tag v2 main` succeed while pointing at a string that is not a changeset:
+    // the tag exists, resolves to nothing, and fails only when somebody reads through it.
     let target = match changeset {
-        Some(c) => c.to_string(),
+        Some(c) => crate::store::resolve_rev(&conn, c)?.ok_or_else(|| {
+            bad(format!(
+                "no such branch, tag or changeset: {}; a tag can point at a branch, a changeset \
+                 or another tag, but it has to point at something",
+                c
+            ))
+        })?,
         None => {
             let branch = current_branch(&conn)?;
             branch_head(&conn, &branch)?.ok_or_else(|| bad("branch has no changesets to tag"))?
