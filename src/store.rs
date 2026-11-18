@@ -863,9 +863,9 @@ pub fn set_branch_head(conn: &Connection, branch: &str, changeset: &str) -> ZRes
     // Rebuilding reads every path in history, so committing one file cost the
     // size of the repository: 24 ms in a 500 file repository, 67 ms in an 8000
     // file one. Applying only what the changeset touched makes the cost follow
-    // the size of the change: the same one file commit now measures 29.3 ms at
-    // 500 files and 53.9 ms at 8000, which is 1.84x for a repository 16 times
-    // larger (bench/scale.py, binary read from the container's own disk).
+    // the size of the change: the same one file commit now measures 28.7 ms at
+    // 500 files and 54.3 ms at 8000, which is 1.89x for a repository 16 times
+    // larger (bench/scale.py, median of three rounds, spread 5 to 12 percent).
     //
     // The common case is a head that moves forward onto a commit whose parent is
     // the old head. Anything else (a merge, an undo, a remote apply) is not
