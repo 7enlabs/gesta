@@ -12,7 +12,7 @@ use crate::ops;
 use crate::remote;
 use crate::repo;
 use crate::store::{
-    ancestors, branch_head, current_branch, delta_stats, get_object, init_schema,
+    ancestors, branch_head, current_branch, delta_stats, init_schema,
     object_store_bytes, open_db, set_state,
 };
 use crate::worktree::IgnoreRules;
@@ -237,9 +237,16 @@ fn push_s3(conn: &Connection, url: &str, branch: &str) -> ZResult<()> {
             .collect();
         for (path, hash) in &bundle.snapshot {
             if !carried.contains(hash) {
-                let content = crate::store::get_object(conn, hash)
-                    .map_err(|_| bad(format!("cannot bundle {} for {}", hash, path)))?;
-                bundle.objects.push((hash.clone(), content));
+                // A shallow bundle carries the head tree explicitly, and that tree can hold a
+                // binary file. Text first, then bytes.
+                match crate::store::get_object(conn, hash) {
+                    Ok(content) => bundle.objects.push((hash.clone(), content)),
+                    Err(_) => {
+                        let bytes = crate::store::get_object_bytes(conn, hash)
+                            .map_err(|_| bad(format!("cannot bundle {} for {}", hash, path)))?;
+                        bundle.binaries.push((hash.clone(), bytes));
+                    }
+                }
                 bundle.hashes.push(hash.clone());
                 carried.insert(hash.clone());
             }
@@ -471,7 +478,10 @@ pub fn cmd_fsck(prune: bool, worktree: bool) -> ZResult<()> {
     };
     for (cs, path, old, new) in &refs {
         for h in [old, new].into_iter().flatten() {
-            if get_object(&conn, h).is_err() {
+            // Existence, not readability as text. A binary object is stored raw and is not
+            // valid UTF-8, so the text reader refuses it and fsck called a perfectly good object
+            // missing.
+            if crate::store::get_object_bytes(&conn, h).is_err() {
                 println!("MISSING object {} referenced by {} ({})", h, cs, path);
                 problems += 1;
             }
@@ -1269,12 +1279,14 @@ fn restore_from_snapshot(
         if path.split(['/', '\\']).any(|seg| seg == "..") {
             return Err(bad(format!("unsafe path in a bundle snapshot: {}", path)));
         }
-        let content = crate::store::get_object(conn, hash)?;
+        // Bytes, so a binary file arrives whole. Asking for text refused the clone with a
+        // message about UTF-8 from a repository that only held a PNG.
+        let content = crate::store::get_object_bytes(conn, hash)?;
         let target = root.join(path);
         if let Some(dir) = target.parent() {
             fs::create_dir_all(dir)?;
         }
-        fs::write(&target, content)?;
+        fs::write(&target, &content)?;
         written += 1;
     }
     Ok(written)

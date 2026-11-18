@@ -597,6 +597,71 @@ def main():
             (check[1] or "")[:200],
         )
 
+    if want("binary"):
+        # Binary files used to be refused outright, which blocked any repository holding an
+        # image, a font or an archive. They are stored raw and have to survive the whole round
+        # trip byte for byte.
+        import shutil as _shutil
+        import tempfile as _tf
+        import hashlib as _hl
+        d = _tf.mkdtemp()
+        sh(f"{ZF} init", cwd=d)
+        payload = bytes(range(256)) * 40
+        with open(os.path.join(d, "img.png"), "wb") as fh:
+            fh.write(payload)
+        with open(os.path.join(d, "note.md"), "w") as fh:
+            fh.write("text\n")
+        before = _hl.md5(payload).hexdigest()
+
+        made = sh(f"{ZF} changeset create withbinary --author t", cwd=d)
+        record("a binary file can be snapshotted", made[0] == 0, (made[1] or "")[:200])
+        m = re.search(r"(cs[0-9a-f]+)", made[1] or "")
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+
+        listed = sh(f"{ZF} ls", cwd=d)
+        record(
+            "the binary is in the tree",
+            "img.png" in (listed[1] or "") and "note.md" in (listed[1] or ""),
+            (listed[1] or "")[:200],
+        )
+
+        check = sh(f"{ZF} fsck", cwd=d)
+        record(
+            "fsck accepts a binary object as present",
+            check[0] == 0 and "consistent" in (check[1] or ""),
+            (check[1] or "")[:200],
+        )
+
+        # Restore from the store and compare the bytes, which is the only proof that matters.
+        os.remove(os.path.join(d, "img.png"))
+        got = sh(f"{ZF} checkout img.png", cwd=d)
+        with open(os.path.join(d, "img.png"), "rb") as fh:
+            after = _hl.md5(fh.read()).hexdigest()
+        record(
+            "checkout restores the binary byte for byte",
+            got[0] == 0 and after == before,
+            f"{got[0]} {before} vs {after}",
+        )
+
+        # And a clone has to carry it.
+        remote_dir = _tf.mkdtemp()
+        clone_dir = _tf.mkdtemp()
+        _shutil.rmtree(clone_dir, ignore_errors=True)
+        sh(f"{ZF} remote add o {remote_dir}", cwd=d)
+        pushed = sh(f"{ZF} remote push o --branch main", cwd=d)
+        cloned = sh(f"{ZF} remote clone {remote_dir} {clone_dir}", cwd=d)
+        cloned_file = os.path.join(clone_dir, "img.png")
+        ok = cloned[0] == 0 and os.path.exists(cloned_file)
+        if ok:
+            with open(cloned_file, "rb") as fh:
+                ok = _hl.md5(fh.read()).hexdigest() == before
+        record(
+            "a clone carries the binary unchanged",
+            ok,
+            f"push {pushed[0]} clone {cloned[0]} {(cloned[1] or '')[:120]}",
+        )
+
     if want("gc"):
         # A repository that only grows is a repository that gets slower and bigger forever. The
         # check plants an object nothing references and asks gc to remove exactly that one.

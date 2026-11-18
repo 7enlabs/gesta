@@ -133,12 +133,12 @@ pub fn checkout_sparse(
             kept += 1;
             continue;
         }
-        let content = crate::store::get_object(conn, hash)?;
+        let content = crate::store::get_object_bytes(conn, hash)?;
         let target = root.join(path);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&target, content)?;
+        std::fs::write(&target, &content)?;
         written += 1;
     }
     Ok((written, kept))

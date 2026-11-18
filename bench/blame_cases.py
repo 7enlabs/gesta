@@ -1,9 +1,18 @@
-import subprocess, re, sys
+import subprocess, re, sys, os, tempfile
 
-ZF = "/tmp/zfm4"
+# Build the binary and a scratch repository here instead of pointing at a fixed path under /tmp:
+# a cleaned-up scratch directory made every case report FAIL with an empty answer, which looked
+# like a blame defect and was a missing file.
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ZF = os.path.join(ROOT, "target", "release", "gesta")
+WORK = tempfile.mkdtemp(prefix="gesta-blame-")
+
 
 def sh(c):
-    return subprocess.run(c, shell=True, capture_output=True, text=True)
+    return subprocess.run(c, shell=True, capture_output=True, text=True, cwd=WORK)
+
+
+sh(f"{ZF} init")
 
 def commit(a):
     o = sh(f"{ZF} changeset create m --author {a}")
@@ -13,8 +22,9 @@ def commit(a):
     sh(f"{ZF} changeset commit {m.group(1)}")
     return True
 
-def w(t):
-    open("f.txt", "w").write(t)
+def w(text):
+    with open(os.path.join(WORK, "f.txt"), "w") as fh:
+        fh.write(text)
 
 def own():
     out = sh(f"{ZF} blame f.txt").stdout.strip().splitlines()

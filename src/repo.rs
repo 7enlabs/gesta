@@ -181,8 +181,15 @@ pub fn create_changeset(
             // empty body, so read it here rather than opening every file in the
             // tree on every snapshot.
             let content = if f.content.is_empty() {
+                // Could be a binary file or a cache hit. Read the bytes and
+                // classify.
                 match crate::worktree::read_file(&root.join(&f.rel)) {
                     crate::worktree::ReadOutcome::Text(c) => c,
+                    crate::worktree::ReadOutcome::Binary => {
+                        let bytes = std::fs::read(root.join(&f.rel))?;
+                        let _ = crate::store::put_object_bytes(conn, &bytes)?;
+                        String::new()
+                    }
                     _ => continue,
                 }
             } else {
@@ -349,7 +356,16 @@ pub fn commit_one(conn: &Connection, id: &str) -> ZResult<usize> {
 /// had, lines that appeared belong to the commit being made.
 fn recompute_blame(conn: &Connection, files: &[(String, String)]) -> ZResult<()> {
     for (path, hash) in files {
-        let current = get_object(conn, hash)?;
+        // A binary file has no lines, so there is nothing to attribute. Asking for it as text
+        // failed the whole commit with a message about UTF-8, which stopped any repository
+        // holding an image from taking a snapshot at all.
+        let current = match get_object(conn, hash) {
+            Ok(text) => text,
+            Err(_) => {
+                conn.execute("DELETE FROM blame WHERE path = ?1", params![path])?;
+                continue;
+            }
+        };
         let cur_lines: Vec<&str> = current.lines().collect();
 
         // The commit that put this version in place. A file always has a version
@@ -1046,13 +1062,14 @@ pub fn checkout_file(
         }
     };
 
-    let content = get_object(conn, &hash)?;
+    let content = crate::store::get_object_bytes(conn, &hash)?;
     let target = root.join(rel);
     if let Some(parent) = target.as_path().parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&target, content.as_bytes())?;
-    Ok(content.len())
+    let len = content.len();
+    fs::write(&target, &content)?;
+    Ok(len)
 }
 
 /// The full file tree as of `changeset`: for every path reachable from it, the
@@ -1215,12 +1232,14 @@ pub fn materialise(conn: &Connection, root: &Path, branch: &str) -> ZResult<usiz
     }
 
     for (path, hash) in &files {
-        let content = get_object(conn, hash)?;
+        // Bytes, not text: a binary file is stored raw and is not valid UTF-8, and asking for
+        // it as a string refused the whole materialise with a message about encoding.
+        let content = crate::store::get_object_bytes(conn, hash)?;
         let target = root.join(path);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&target, content.as_bytes())?;
+        fs::write(&target, &content)?;
     }
     Ok(files.len())
 }
@@ -1240,12 +1259,12 @@ pub fn restore_worktree(conn: &Connection, root: &Path, branch: &str) -> ZResult
 
     let mut written = 0usize;
     for (path, hash) in &files {
-        let content = get_object(conn, hash)?;
+        let content = crate::store::get_object_bytes(conn, hash)?;
         let target = root.join(path);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&target, content.as_bytes())?;
+        fs::write(&target, &content)?;
         written += 1;
     }
 

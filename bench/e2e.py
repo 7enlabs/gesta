@@ -311,11 +311,13 @@ def c18_binary_skipped():
     with open(os.path.join(d, "img.png"), "wb") as fh:
         fh.write(bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x01]))
     rc, out = run("changeset", "create", "with binary", "--author", "a", cwd=d)
-    rc2, st = run("status", cwd=d)
+    # A binary file is tracked now, stored raw. What must not happen is it being skipped without
+    # a word, which is what the old check guarded. The snapshot is still pending here, so the
+    # proof is that the create succeeded and named the file.
     record(
-        "binary files are reported, not silently tracked",
-        "binary" in out.lower() or "binary" in st.lower(),
-        f"{out} | {st}",
+        "a binary file is tracked, not skipped silently",
+        rc == 0 and "img.png" in out,
+        f"create {rc}: {out}",
     )
 
 

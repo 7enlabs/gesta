@@ -13,6 +13,7 @@ use rusqlite::params;
 use rusqlite::Connection;
 
 use crate::store::hash_content;
+use std::fs;
 use crate::worktree::{read_file, IgnoreRules, ReadOutcome};
 use crate::ZResult;
 
@@ -56,7 +57,7 @@ pub fn scan_with_cache(
     // element several times, which is measurable when the elements hold strings.
     let estimate = known.len().max(64);
     let mut files = Vec::with_capacity(estimate);
-    let mut skipped_binary = Vec::new();
+    let skipped_binary: Vec<String> = Vec::new();
 
     let mut rehashed = 0usize;
     let mut cached = 0usize;
@@ -121,7 +122,15 @@ pub fn scan_with_cache(
                 pending_writes.push((rel.clone(), mtime, size, hash.clone()));
                 files.push(ScannedFile { rel, hash, content });
             }
-            ReadOutcome::Binary => skipped_binary.push(rel),
+            ReadOutcome::Binary => {
+                // Binary files are stored as raw bytes, no compression, no delta.
+                let bytes = fs::read(&path)?;
+                let hash = crate::store::hash_bytes(&bytes);
+                crate::store::put_object_bytes(conn, &bytes)?;
+                pending_writes.push((rel.clone(), mtime, size, hash.clone()));
+                // Binary files have no text content in the scan result.
+                files.push(ScannedFile { rel, hash, content: String::new() });
+            }
             ReadOutcome::Unreadable(e) => unreadable.push(format!("{}: {}", rel, e)),
         }
     }
@@ -249,16 +258,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// A binary file is tracked now, with its bytes stored raw and no text content in the
+    /// scan result. It used to be skipped entirely, which meant a repository holding an image
+    /// could not take a snapshot at all.
     #[test]
-    fn binary_files_are_reported_not_returned_as_text() {
+    fn a_binary_file_is_tracked_with_its_bytes_and_no_text_content() {
         let d = tmpdir("bin");
         std::fs::write(d.join("a.txt"), "text\n").unwrap();
         std::fs::write(d.join("b.bin"), [0u8, 1, 2, 3]).unwrap();
         let conn = mem_db();
         let rules = IgnoreRules::with_defaults(&[]);
         let r = scan_with_cache(&conn, &d, &rules).unwrap();
-        assert_eq!(r.files.len(), 1);
-        assert_eq!(r.skipped_binary, vec!["b.bin".to_string()]);
+
+        assert_eq!(r.files.len(), 2, "the binary should be in the scan");
+        let bin = r
+            .files
+            .iter()
+            .find(|f| f.rel == "b.bin")
+            .expect("b.bin is missing from the scan");
+        assert!(bin.content.is_empty(), "a binary must not arrive as text");
+        assert_eq!(bin.hash, crate::store::hash_bytes(&[0u8, 1, 2, 3]));
+
+        // Its bytes are in the store, so a checkout can write them back.
+        let bytes = crate::store::get_object_bytes(&conn, &bin.hash).unwrap();
+        assert_eq!(bytes, vec![0u8, 1, 2, 3]);
         let _ = std::fs::remove_dir_all(&d);
     }
 

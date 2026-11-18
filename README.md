@@ -68,6 +68,7 @@ gesta blame src/main.rs
 | `blame <file>` | Which changeset introduced each line |
 | `history <file>` | Version chain with hash, time, author |
 | `show [<rev>:]<file>` | File content at a changeset or branch |
+| `ls [<rev>] [--path P] [--long] [--json]` | Every path the revision holds |
 | `checkout <file \| .> [--changeset <id>]` | Materialise files from history |
 | `restore <file \| .>` | Discard uncommitted changes |
 | `sub add <path> <remote>` | Record a path as a subrepository |
@@ -581,9 +582,10 @@ Disk usage, 21 versions of a 42 KB file edited one line at a time: 256 KB agains
 - **TLS needs a certificate you supply or pin.** `serve --tls self-signed` works on a private network once a client pins the fingerprint; a public deployment needs a real certificate from a CA.
 - **Tokens expire but are not revocable per session.** An entry can carry an expiry date, and removing its line revokes it, but there is no "revoke this one now" call.
 - **No SSH transport.**
-- **Small files cost more than git.** 6.08x for a tree of tiny files. Fixing it means packing several objects per row, which is a schema change.
+- **Small files cost more than git.** 6.6x for a tree of tiny files, and 10.2x on a markdown vault of 11,000 files. Packing several objects into one row was built and measured: it made the file larger, because a pointer into a segment is a hash, two integers and a row header. The cost is spread over six tables that each hold a row per tracked path, so the fix is fewer rows, not smaller ones, and that costs a capability. The measurement is in `docs/storage.md`.
 - **Blame is line-sequence based.** A line moved and edited in the same commit loses its original author.
-- **No rebase, cherry-pick, bisect, hooks, submodules, LFS, or `.gitattributes`.**
+- **Binary files are stored but not diffed.** They are kept raw and restored byte for byte, and `blame` has nothing to attribute for them. There is no LFS: a large binary costs its full size in every version that changes it.
+- **No submodules in the git sense and no `.gitattributes`.** `sub` records a child repository as a pointer, which covers the case without git's file.
 - **Conflicts are resolved by editing files**, then committing the result. There is no interactive resolver.
 - **Large histories are still lightly measured.** Behaviour up to 5,000 files and 200 changesets is known. Beyond that, unmeasured.
 

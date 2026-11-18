@@ -10,7 +10,7 @@ use rusqlite::Connection;
 
 use crate::store::branch_head;
 use crate::repo::tree_at;
-use crate::store::{new_changeset_id, put_object};
+use crate::store::{new_changeset_id, put_object, put_object_bytes};
 use crate::{bad, ZResult};
 
 /// A changeset built from caller-supplied content, with no working tree involved.
@@ -117,7 +117,14 @@ pub fn changeset_from_content(
             // file. Refusing is the only honest answer.
             return Err(bad(format!("{} appears twice in one changeset", path)));
         }
-        let new_hash = put_object(&tx, content)?;
+        // Binary files arrive with empty content; read bytes from disk and store
+        // Raw bytes. Text files use the provided string.
+        let new_hash = if content.is_empty() {
+            let bytes = std::fs::read(path)?;
+            put_object_bytes(&tx, &bytes)?
+        } else {
+            put_object(&tx, content)?
+        };
         let old_hash = committed.get(path).cloned().flatten();
         if old_hash.as_deref() == Some(new_hash.as_str()) {
             continue; // identical to the head: nothing to record

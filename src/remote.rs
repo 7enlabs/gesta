@@ -26,6 +26,10 @@ pub struct Bundle {
     pub changesets: Vec<ChangesetRow>,
     /// Every object reachable from those changesets.
     pub objects: Vec<(String, String)>,
+    /// Objects that are not text, kept as raw bytes. A separate list so the text path is
+    /// untouched: a bundle written by an older build decodes exactly as it did before, and a
+    /// reader that only handles text never sees these.
+    pub binaries: Vec<(String, Vec<u8>)>,
     /// file_versions rows for those changesets.
     pub versions: Vec<(String, i64, String, String, i64)>,
     /// changeset_files rows.
@@ -126,6 +130,9 @@ impl Bundle {
         for (hash, content) in &self.objects {
             s.push_str(&format!("ob\t{}\t{}\n", hash, enc_base64(content.as_bytes())));
         }
+        for (hash, bytes) in &self.binaries {
+            s.push_str(&format!("bn\t{}\t{}\n", hash, enc_base64(bytes)));
+        }
         for (hash, base, ops) in &self.deltas {
             let packed = enc_base64(&crate::delta::to_bytes(ops));
             s.push_str(&format!("dl\t{}\t{}\t{}\n", hash, base, packed));
@@ -156,6 +163,7 @@ impl Bundle {
             head: None,
             changesets: Vec::new(),
             objects: Vec::new(),
+            binaries: Vec::new(),
             versions: Vec::new(),
             files: Vec::new(),
             hashes: Vec::new(),
@@ -230,6 +238,14 @@ impl Bundle {
                         .map_err(|e| bad(format!("object {} is not UTF-8: {}", hash, e)))?;
                     b.hashes.push(hash.to_string());
                     b.objects.push((hash.to_string(), s));
+                }
+                ["bn", hash, content] => {
+                    // A binary object. Its bytes are base64 like any other payload; what makes
+                    // it binary is that they are not valid UTF-8.
+                    let bytes = dec_base64(content)
+                        .ok_or_else(|| bad(format!("object {} has invalid payload", hash)))?;
+                    b.hashes.push(hash.to_string());
+                    b.binaries.push((hash.to_string(), bytes));
                 }
                 ["end"] => break,
                 _ => {} // forward compatibility: ignore unknown records
@@ -391,6 +407,7 @@ pub fn build_bundle(conn: &Connection, branch: &str, have: &HashSet<String>) -> 
         head: head.clone(),
         changesets: Vec::new(),
         objects: Vec::new(),
+        binaries: Vec::new(),
         versions: Vec::new(),
         files: Vec::new(),
         hashes: Vec::new(),
@@ -500,7 +517,18 @@ pub fn build_bundle(conn: &Connection, branch: &str, have: &HashSet<String>) -> 
         }
         match get_object(conn, hash) {
             Ok(content) => b.objects.push((hash.clone(), content)),
-            Err(_) => return Err(bad(format!("cannot bundle missing object {}", hash))),
+            Err(_) => {
+                // Distinguish "not there" from "there but binary". The bundle format carries
+                // text objects only, so a repository holding an image could not be pushed, and
+                // the message said the object was missing while it was present and readable.
+                match crate::store::get_object_bytes(conn, hash) {
+                    Ok(bytes) => b.binaries.push((hash.clone(), bytes)),
+                    Err(_) => {
+                        return Err(bad(format!("cannot bundle missing object {}", hash)))
+                    }
+                }
+                continue;
+            }
         }
     }
     Ok(b)
@@ -524,6 +552,19 @@ pub fn apply_bundle_opts(conn: &Connection, b: &Bundle, move_branch: bool) -> ZR
             )));
         }
         put_object(&tx, content)?;
+    }
+
+    // Binary objects, checked the same way: the hash is the contract and a payload that does not
+    // reproduce it is refused rather than stored.
+    for (hash, bytes) in &b.binaries {
+        let expect = crate::store::hash_bytes(bytes);
+        if &expect != hash {
+            return Err(bad(format!(
+                "object {} fails its own hash check (got {})",
+                hash, expect
+            )));
+        }
+        crate::store::put_object_bytes(&tx, bytes)?;
     }
 
     // A delta is resolved after the whole objects land, because its base is one of
@@ -895,6 +936,7 @@ mod tests {
             head: None,
             changesets: Vec::new(),
             objects: vec![("0".repeat(64), "tampered".into())],
+            binaries: Vec::new(),
             versions: Vec::new(),
             files: Vec::new(),
             hashes: Vec::new(),

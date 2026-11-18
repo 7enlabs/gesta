@@ -354,6 +354,26 @@ pub fn hash_content(s: &str) -> String {
     hash_bytes(s.as_bytes())
 }
 
+
+/// Store raw bytes as an object. No compression, no delta.
+/// Binary files use this: compression often inflates them and deltas are
+/// not meaningful for non-text content.
+pub fn put_object_bytes(conn: &Connection, bytes: &[u8]) -> ZResult<String> {
+    let h = hash_bytes(bytes);
+    let exists: Option<i64> = conn
+        .query_row("SELECT 1 FROM objects WHERE hash = ?1", params![h], |r| r.get(0))
+        .optional()?;
+    if exists.is_some() {
+        return Ok(h);
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO objects(hash, content, size, compressed, created_at)
+         VALUES(?1, ?2, ?3, 0, ?4)",
+        params![h, bytes, bytes.len() as i64, now()],
+    )?;
+    Ok(h)
+}
+
 fn compress(content: &str) -> ZResult<Vec<u8>> {
     let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
     enc.write_all(content.as_bytes())?;
@@ -564,6 +584,35 @@ pub fn get_object(conn: &Connection, hash: &str) -> ZResult<String> {
         )));
     }
     Ok(rebuilt)
+}
+
+/// Read an object as raw bytes.
+///
+/// Binary files are stored uncompressed and are not valid UTF-8, so the text reader would
+/// refuse them with a message about encoding. A caller that is about to write bytes to a file
+/// wants them as bytes.
+pub fn get_object_bytes(conn: &Connection, hash: &str) -> ZResult<Vec<u8>> {
+    // A delta is always line deltas over text; a binary object never has one.
+    let delta: Option<i64> = conn
+        .query_row("SELECT 1 FROM deltas WHERE hash = ?1", params![hash], |r| r.get(0))
+        .optional()?;
+    if delta.is_some() {
+        return Ok(get_object(conn, hash)?.into_bytes());
+    }
+    let row: Option<(Vec<u8>, i64)> = conn
+        .query_row(
+            "SELECT content, compressed FROM objects WHERE hash = ?1",
+            params![hash],
+            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    let (blob, compressed) =
+        row.ok_or_else(|| bad(format!("object {} not found (store may be corrupted)", hash)))?;
+    if compressed == 1 {
+        decompress_bytes(&blob)
+    } else {
+        Ok(blob)
+    }
 }
 
 fn read_whole(conn: &Connection, hash: &str) -> ZResult<String> {
