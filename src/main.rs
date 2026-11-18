@@ -12,6 +12,7 @@ mod cli_remote;
 mod conflict;
 mod content;
 mod delta;
+mod grep;
 mod history;
 mod hooks;
 mod http;
@@ -192,6 +193,28 @@ enum Cmd {
     Show {
         /// Path, optionally as `rev:path`
         spec: String,
+    },
+    /// Search the working tree, or every version in the history
+    Grep {
+        /// Text to find
+        pattern: String,
+        /// Search every recorded version instead of the files on disk
+        #[arg(long)]
+        history: bool,
+        #[arg(long)]
+        ignore_case: bool,
+        /// Match whole words only
+        #[arg(long)]
+        word: bool,
+        /// Only paths starting with this prefix
+        #[arg(long)]
+        path: Option<String>,
+        /// How many versions to read when searching history
+        #[arg(long, default_value_t = 5000)]
+        limit: i64,
+        /// Print `path:line` only, for piping into another tool
+        #[arg(long)]
+        files_with_matches: bool,
     },
     /// Write files back to disk from a changeset
     Checkout {
@@ -701,6 +724,36 @@ fn run() -> ZResult<()> {
         Cmd::Blame { file } => cli::cmd_blame(&file),
         Cmd::History { file } => cli::cmd_history(&file),
         Cmd::Show { spec } => cli::cmd_show(&spec),
+        Cmd::Grep {
+            pattern,
+            history,
+            ignore_case,
+            word,
+            path,
+            limit,
+            files_with_matches,
+        } => {
+            if json {
+                cli::cmd_grep_json(
+                    &pattern,
+                    history,
+                    ignore_case,
+                    word,
+                    path.as_deref(),
+                    limit,
+                )
+            } else {
+                cli::cmd_grep(
+                    &pattern,
+                    history,
+                    ignore_case,
+                    word,
+                    path.as_deref(),
+                    limit,
+                    files_with_matches,
+                )
+            }
+        }
         Cmd::Checkout { file, changeset } => cli::cmd_checkout(&file, changeset.as_deref()),
         Cmd::Restore { file } => cli::cmd_restore(&file),
         Cmd::Undo => cli::cmd_undo(),

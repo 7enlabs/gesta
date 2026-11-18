@@ -125,6 +125,64 @@ def main():
                     bad.append(f"{f}:{line} {m.group(0)[:40]}")
         record("no hardcoded credential in src", not bad, "\n".join(bad[:10]))
 
+    if want("grep"):
+        # Searching history is the capability a working tree cannot offer: the string that was
+        # deleted is usually the one being looked for.
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        os.makedirs(os.path.join(tmp, "src"), exist_ok=True)
+        sh(f"{ZF} init", cwd=tmp)
+        with open(os.path.join(tmp, "src", "a.txt"), "w") as fh:
+            fh.write("first line\nneedle here\n")
+        sh(f"{ZF} changeset create one --author t", cwd=tmp)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=tmp)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=tmp)
+
+        r = sh(f"{ZF} grep needle", cwd=tmp)
+        record(
+            "grep finds text in the working tree with its line number",
+            r[0] == 0 and "src/a.txt:2" in r[1],
+            r[1][:200],
+        )
+
+        r = sh(f"{ZF} grep needle --json", cwd=tmp)
+        record(
+            "grep emits machine readable locations",
+            r[0] == 0 and '"line": 2' in r[1] and '"path": "src/a.txt"' in r[1],
+            r[1][:200],
+        )
+
+        r = sh(f"{ZF} grep hashes --word", cwd=tmp)
+        record(
+            "a whole word search refuses a longer identifier",
+            r[0] != 0,
+            r[1][:120],
+        )
+
+        # Remove the text, commit, and find it again in history only.
+        with open(os.path.join(tmp, "src", "a.txt"), "w") as fh:
+            fh.write("first line\n")
+        sh(f"{ZF} changeset create two --author t", cwd=tmp)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=tmp)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=tmp)
+
+        now = sh(f"{ZF} grep needle", cwd=tmp)
+        was = sh(f"{ZF} grep needle --history", cwd=tmp)
+        record(
+            "a deleted string is gone from the tree and still found in history",
+            now[0] != 0 and was[0] == 0 and "needle here" in was[1],
+            f"tree={now[0]} history={was[1][:100]}",
+        )
+
+        r = sh(f"{ZF} grep nothing-matches-this", cwd=tmp)
+        record(
+            "a search with no match fails instead of printing nothing",
+            r[0] != 0 and "no match" in r[1],
+            r[1][:120],
+        )
+
     if want("concurrent"):
         # Two processes writing one repository must not lose anything. A stale pending snapshot
         # is the failure that leaves no trace: the commit succeeds and stores content that does

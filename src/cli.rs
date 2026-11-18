@@ -733,6 +733,104 @@ pub fn cmd_history(file: &str) -> ZResult<()> {
     Ok(())
 }
 
+/// Search the working tree or the history.
+pub fn cmd_grep(
+    needle: &str,
+    history: bool,
+    ignore_case: bool,
+    word: bool,
+    path: Option<&str>,
+    limit: i64,
+    files_with_matches: bool,
+) -> ZResult<()> {
+    let hits = grep_hits(needle, history, ignore_case, word, path, limit)?;
+    if files_with_matches {
+        let mut seen = std::collections::BTreeSet::new();
+        for h in &hits {
+            if seen.insert(h.path.clone()) {
+                println!("{}", h.path);
+            }
+        }
+        if hits.is_empty() {
+            return Err(bad(no_match(needle, history)));
+        }
+        return Ok(());
+    }
+    for h in &hits {
+        if history {
+            let short = &h.rev[..h.rev.len().min(14)];
+            println!("{}:{}:{}: {}", short, h.path, h.line, h.text);
+        } else {
+            println!("{}:{}: {}", h.path, h.line, h.text);
+        }
+    }
+    if hits.is_empty() {
+        return Err(bad(no_match(needle, history)));
+    }
+    Ok(())
+}
+
+/// The machine-readable form, which is what an agent should use: it decides what to do with a
+/// list of locations instead of parsing a terminal's layout.
+pub fn cmd_grep_json(
+    needle: &str,
+    history: bool,
+    ignore_case: bool,
+    word: bool,
+    path: Option<&str>,
+    limit: i64,
+) -> ZResult<()> {
+    let hits = grep_hits(needle, history, ignore_case, word, path, limit)?;
+    let rows: Vec<crate::json::Json> = hits
+        .iter()
+        .map(|h| {
+            crate::json::Json::obj(vec![
+                ("path", crate::json::Json::str(h.path.clone())),
+                ("line", crate::json::Json::int(h.line as i64)),
+                ("rev", crate::json::Json::str(h.rev.clone())),
+                ("text", crate::json::Json::str(h.text.clone())),
+            ])
+        })
+        .collect();
+    emit(crate::json::Json::obj(vec![
+        ("pattern", crate::json::Json::str(needle.to_string())),
+        ("history", crate::json::Json::Bool(history)),
+        ("count", crate::json::Json::int(hits.len() as i64)),
+        ("hits", crate::json::Json::arr(rows)),
+    ]));
+    Ok(())
+}
+
+fn no_match(needle: &str, history: bool) -> String {
+    format!(
+        "no match for {} in {}",
+        needle,
+        if history {
+            "the recorded history"
+        } else {
+            "the working tree"
+        }
+    )
+}
+
+fn grep_hits(
+    needle: &str,
+    history: bool,
+    ignore_case: bool,
+    word: bool,
+    path: Option<&str>,
+    limit: i64,
+) -> ZResult<Vec<crate::grep::Hit>> {
+    let (root, conn) = open_repo()?;
+    let pattern = crate::grep::Pattern::new(needle, ignore_case, word)?;
+    let filter = path.map(normalise);
+    if history {
+        crate::grep::search_history(&conn, &pattern, filter.as_deref(), limit)
+    } else {
+        crate::grep::search_worktree(&conn, &root, &pattern, filter.as_deref())
+    }
+}
+
 pub fn cmd_show(spec: &str) -> ZResult<()> {
     let (_root, conn) = open_repo()?;
     let (rev, path) = match spec.split_once(':') {

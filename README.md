@@ -12,12 +12,33 @@ gesta keeps the repository server side and answers questions about it directly. 
 
 ## Install
 
-```bash
-cargo build --release
-# Binary: target/release/gesta
+One command. It downloads a prebuilt binary where one exists for this machine and builds from
+source otherwise, then prints the next steps ([docs/install.md](docs/install.md)).
+
+Linux and macOS:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zencli/gesta/main/install.sh | sh
 ```
 
-Needs Rust. Dependencies: rusqlite (bundled SQLite), clap, sha2, hex, chrono, flate2.
+Windows, in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/zencli/gesta/main/install.ps1 | iex
+```
+
+A machine with no Rust still installs, because a prebuilt binary is tried first. Without one,
+the installer builds from source and says how to get Rust in one command.
+
+From source, without the installer:
+
+```sh
+cargo install --git https://github.com/zencli/gesta.git
+# or, in a checkout: cargo build --release
+```
+
+Dependencies: rusqlite (bundled SQLite), clap, sha2, hex, flate2, rustls, ring. No runtime, no
+service, no daemon.
 
 ## Quick start
 
@@ -57,6 +78,7 @@ gesta blame src/main.rs
 | `stash list` | Saved stashes, newest first |
 | `stash pop [--id N]` | Write a stash back, refusing over local changes |
 | `stash drop [--id N]` | Delete a stash without applying it |
+| `grep <text> [--history]` | Find text in the working tree, or in every recorded version |
 | `hook list` | Which hooks are installed |
 | `hook install <name> [--file F]` | Write a hook, reading stdin when no file is given |
 | `hook remove <name>` | Remove a hook |
@@ -88,6 +110,21 @@ gesta blame src/main.rs
 | `fsck [--prune] [--worktree]` | Verify integrity, optionally drop orphan objects; `--worktree` also compares the files on disk with the head |
 | `stats` | Object counts and compression ratio |
 | `ignore add/list/remove` | Ignore patterns |
+
+### Searching
+
+```sh
+gesta grep "read_config"                 # the working tree
+gesta grep "read_config" --history       # every recorded version, deleted files included
+gesta grep "hash" --word                # whole words, so `hashes` does not match
+gesta grep "TODO" --path src/ --json     # a list of {path, line, rev, text}
+```
+
+`--history` is the one that has no equivalent in a working tree: the string that was deleted is
+usually the one being looked for. Each distinct version is read once, so a body reached through
+a hundred changesets costs one read.
+
+An agent should use `--json` and read the locations, rather than parse a terminal's layout.
 
 ### Subrepositories
 
