@@ -2393,6 +2393,35 @@ pub fn cmd_review(from: Option<&str>, to: Option<&str>, min_risk: Option<&str>) 
                 println!("    +{}", l);
             }
         }
+
+        // What the change breaks outside itself. A diff shows what was edited and says nothing
+        // about what depended on it, and the failures that hurt are the ones where the change
+        // looks complete and a file nobody touched stops working.
+        if let Some(head) = crate::store::branch_head(&conn, target)? {
+            let tree = crate::repo::tree_at(&conn, &head)?;
+            match crate::impact::stale_references(&conn, &step.files, &tree) {
+                Ok(stale) if !stale.is_empty() => {
+                    println!(
+                        "    {} stale reference(s) in files this step did not touch:",
+                        stale.len()
+                    );
+                    for s in stale.iter().take(5) {
+                        println!(
+                            "      {} line {}: `{}` was removed from {} and is still read here",
+                            s.path, s.line, s.name, s.removed_from
+                        );
+                        println!("        {}", s.text);
+                    }
+                    if stale.len() > 5 {
+                        println!("      ... {} more", stale.len() - 5);
+                    }
+                }
+                Ok(_) => {}
+                // A review that fails because a file could not be read would stop a reader
+                // from seeing the findings it did produce. Say so and carry on.
+                Err(e) => println!("    impact check skipped: {}", e),
+            }
+        }
     }
     println!(
         "\n{} step(s) shown, {} below the {} threshold",

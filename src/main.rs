@@ -17,6 +17,7 @@ mod git_bridge;
 mod gitobj;
 mod grep;
 mod history;
+mod impact;
 mod hooks;
 mod http;
 mod json;

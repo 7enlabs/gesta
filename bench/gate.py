@@ -795,6 +795,54 @@ def main():
                 (v[1] or "")[:160],
             )
 
+    if want("impact"):
+        # A diff shows what was edited and says nothing about what depended on it. The failure
+        # that hurts is a rename that looks complete while an untouched file keeps the old name.
+        import tempfile as _tf
+        d = _tf.mkdtemp()
+        os.makedirs(os.path.join(d, "src"), exist_ok=True)
+        files = {
+            "src/model.rs": "pub struct Post { authorName: String }\n",
+            "src/feed.rs": "fn feed(p: Post) { let n = p.authorName; }\n",
+            "src/mail.rs": "fn mail(p: Post) { send(p.authorName); }\n",
+        }
+        for rel, body in files.items():
+            with open(os.path.join(d, rel), "w") as fh:
+                fh.write(body)
+        sh(f"{ZF} init", cwd=d)
+        sh(f'{ZF} changeset create "add the model" --author t', cwd=d)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=d)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+
+        # Rename the field in two of the three files. The third is the untouched caller.
+        with open(os.path.join(d, "src", "model.rs"), "w") as fh:
+            fh.write("pub struct Post { author: String }\n")
+        with open(os.path.join(d, "src", "feed.rs"), "w") as fh:
+            fh.write("fn feed(p: Post) { let n = p.author; }\n")
+        sh(f'{ZF} changeset create "rename authorName to author" --author t', cwd=d)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=d)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+
+        review = sh(f"{ZF} review", cwd=d)
+        record(
+            "review finds the caller in a file the change did not touch",
+            "src/mail.rs" in (review[1] or "") and "authorName" in (review[1] or ""),
+            (review[1] or "")[:400],
+        )
+        record(
+            "and it says which file removed the name",
+            "removed from src/model.rs" in (review[1] or ""),
+            (review[1] or "")[:400],
+        )
+        # The two files that were updated must not be reported as stale.
+        record(
+            "a file the change did update is not reported",
+            "src/feed.rs line" not in (review[1] or ""),
+            (review[1] or "")[:400],
+        )
+
     if want("gc"):
         # A repository that only grows is a repository that gets slower and bigger forever. The
         # check plants an object nothing references and asks gc to remove exactly that one.
