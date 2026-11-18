@@ -35,6 +35,7 @@ from pathlib import Path
 
 from tasks import TASKS, Task, by_name, names
 import criteria as crit
+import efficiency as eff
 import mutants as mut
 import stats
 
@@ -84,6 +85,25 @@ class Step:
     stderr_tail: str
     stop_reason: str = ""
     """`timeout` or `signal` when the clock or the system ended it, empty when the command did."""
+
+    phase: str = "solve"
+    """Which part of the task produced this step: `setup`, `solve`, or `checks`.
+
+    Setup and checks are the harness's own work. Counting them as the solver's turns would price a
+    task by how much bookkeeping the harness did, which is the opposite of measuring the tool.
+    """
+
+    stdout_bytes: int = 0
+    """Bytes the command wrote to stdout.
+
+    This is the part a model reads, so it is the cost side of the measurement. A harness that
+    answers in one call and 300 bytes is cheaper than one that answers in four calls and 4,000, and
+    a tool that prints progress a caller did not ask for is paying to be ignored.
+    """
+
+    stderr_bytes: int = 0
+    """Bytes written to the error stream, which a caller also pays for when it appears in a
+    transcript."""
 
     stdout_full: str = ""
     """Complete stdout, kept only for a command that asked for `--json`.
@@ -145,6 +165,7 @@ def sh(
     cwd: str,
     env: dict[str, str],
     budget: int,
+    phase: str = "solve",
 ) -> Step:
     """Run one shell line, and say what ended it."""
     started = time.monotonic()
@@ -161,10 +182,13 @@ def sh(
         out = proc.stdout or ""
         return Step(
             command=command,
+            phase=phase,
             exit_code=proc.returncode,
             seconds=round(time.monotonic() - started, 3),
             stdout_tail=out[-800:],
             stderr_tail=(proc.stderr or "")[-800:],
+            stdout_bytes=len(out.encode("utf-8", "replace")),
+            stderr_bytes=len((proc.stderr or "").encode("utf-8", "replace")),
             # Only when JSON was asked for, and only up to a bound: a document larger than this is
             # a design problem the criterion should not paper over.
             stdout_full=out if ("--json" in command and len(out) <= 1_000_000) else "",
@@ -270,7 +294,7 @@ def run_task(task: Task, gesta_bin: str, tries: int, budget: int, mutant=None) -
             if phase == "solve":
                 # `set` after the work lists every variable and its value; a check can source it.
                 script += f"\nset > {os.path.join(root, 'vars.sh')}\n"
-            step = sh(script, work, env, budget)
+            step = sh(script, work, env, budget, phase=phase)
             attempt.steps.append(step)
 
             if step.stop_reason:
@@ -292,7 +316,7 @@ def run_task(task: Task, gesta_bin: str, tries: int, budget: int, mutant=None) -
         # run the work twice, and for a task about undo that changes the answer.
         env_file = os.path.join(root, "vars.sh")
         for line in task.checks:
-            step = sh(f". {env_file} 2>/dev/null || true\n{line}", work, env, budget)
+            step = sh(f". {env_file} 2>/dev/null || true\n{line}", work, env, budget, phase="checks")
             attempt.checks.append(step)
             if step.stop_reason:
                 attempt.outcome = "timeout"
@@ -510,8 +534,14 @@ def main(argv: list[str]) -> int:
 
     out = Path(runs_dir) / run.run_id
     out.mkdir(parents=True, exist_ok=True)
+    ledger = eff.Ledger()
+    for a in run.attempts:
+        ledger.add(eff.price_attempt(a.task, a.outcome, a.steps))
+
     payload = {
         "summary": run.summary(),
+        "cost": ledger.summary(),
+        "cost_by_task": ledger.by_task(),
         "attempts": [asdict(a) for a in run.attempts],
     }
     (out / "run.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -565,6 +595,12 @@ def main(argv: list[str]) -> int:
             f"             {len(selected)} task(s) is a small sample: the interval is honest and "
             f"wide, and only a difference outside it is visible"
         )
+
+    print()
+    print("cost")
+    cost = ledger.summary()
+    for line in eff.fmt(cost).splitlines():
+        print(line)
 
     print()
     print("harness criteria")

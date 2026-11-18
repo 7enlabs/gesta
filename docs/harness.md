@@ -147,3 +147,52 @@ No task drives a language model. The harness scores a fixed reference answer and
 `pass^k` over attempts measures the nondeterminism of the tool and the filesystem, not of a model.
 Measuring a model through the same interface is possible and is not what the runs in `runs/`
 contain.
+
+## What a task costs, not only whether it passed
+
+A pass rate says a tool can do the work. It says nothing about what the work cost, and the published
+harness benchmark that held the model fixed found cost moving 17.5x across harnesses while quality
+stayed within about 17 points.
+
+So every attempt is priced in the units a caller pays: bytes read (everything the tool wrote, which
+is what enters a transcript), turns (how many commands the answer needed), and cost per pass (bytes
+over the tasks that passed, which is the only figure two harnesses can be compared on).
+
+```
+cost
+  6/6 passed
+  cost per pass   23 estimated tokens (94 bytes)
+  turns per pass  1.0
+```
+
+Three exclusions keep the figure honest, and each one is a way to get it wrong:
+
+- Setup and checks are not charged. They are the harness's work, and charging them lets a cheap
+  tool look expensive because the harness scanned a large tree to build a starting state.
+- A turn is a command the solver chose. `set -e` is not one, and neither is a setup line.
+- Division is by passes, not attempts. A harness that fails half its tasks cheaply has earned no
+  passes, which is reported as the absence of a figure rather than as zero.
+
+Cost and quality travel together. `compare.py` prints the ratio next to the quality gap, because a
+cost win with a quality loss is not a win.
+
+## Against git, on the same questions
+
+Six jobs, each written twice, priced by the same ledger:
+
+```
+job                 gesta        git   ask
+state                 146        186   what is the state of this tree
+history                95         43   what changed recently
+diff                  239        164   what did the last change do
+list-files             20         20   what files exist at the head
+read-one-file          17         17   show one file as committed
+search                 44         38   where does this word appear
+
+cost ratio      1.15x    quality gap     +0.0 points
+```
+
+gesta costs 15% more per answered question and answers all six. Both tools match on the two cheapest
+jobs, and the excess lives in `history` and `diff`, where gesta is more verbose than it needs to be.
+That is a finding about this tool rather than about version control, and it is the kind of finding a
+pass rate cannot produce.

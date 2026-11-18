@@ -13,6 +13,19 @@ version is current and freezes when the number changes, so `0.6.0` is a record a
 
 ## 0.6.0, 2026-11-18
 
+### Pricing a task, not only passing it
+
+- Every attempt now carries a cost: bytes read, turns, and cost per pass. A pass rate says the work
+  can be done and says nothing about what it cost, and the published harness benchmark that held
+  the model fixed found cost moving 17.5x across harnesses while quality stayed within 17 points.
+- Setup and checks are not charged, because they are the harness's work rather than the tool's.
+- Division is by passes, not attempts. A run with no passes reports the absence of a figure rather
+  than zero, which would read as free.
+- `bench/harness/compare.py` prices gesta and git on the same six questions. Measured: gesta answers
+  all six at 1.15x git's cost per answer, with the excess in history and diff.
+- Eight tests require the cost model to separate a quiet tool from a chatty one, and to refuse a
+  ratio against zero passes.
+
 ### Measuring the work rather than the calls
 
 `bench/harness` hands a job and a shell to a solver and asks whether a day of version control gets

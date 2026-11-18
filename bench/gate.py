@@ -2466,6 +2466,44 @@ def main():
             f"columns: {', '.join(cols)}",
         )
 
+    if want("efficiency"):
+        # What a task costs to complete, which is the figure the published harness benchmark built
+        # its finding on: cost moved 17.5x across harnesses while quality stayed within 17 points.
+        import shutil as _shq
+
+        binpath = _shq.which("gesta") or os.path.join(os.getcwd(), "target", "release", "gesta")
+        rc, out = sh(f"cd bench/harness && python3 test_efficiency.py", timeout=300)
+        record(
+            "the cost model passes its own tests",
+            rc == 0 and "every cost test passes" in out,
+            out[-400:],
+        )
+
+        rc, out = sh(
+            f"cd bench/harness && GESTA_BIN={binpath} python3 run.py", timeout=900
+        )
+        record(
+            "the run reports a cost per pass, not only a pass rate",
+            "cost per pass" in out and "turns per pass" in out,
+            out[out.find("cost") : out.find("cost") + 300] if "cost" in out else out[-300:],
+        )
+
+        # Against git on the same questions. A comparison that cannot run must say so rather than
+        # report a ratio computed from a tool that was not there.
+        rc, out = sh(
+            f"cd bench/harness && GESTA_BIN={binpath} python3 compare.py", timeout=600
+        )
+        record(
+            "gesta and git are priced on the same jobs",
+            rc == 0 and "cost ratio" in out and "quality gap" in out,
+            out[-500:],
+        )
+        record(
+            "the comparison reports whether both tools answered everything",
+            "both tools answered every job" in out or "passed" in out,
+            out[-400:],
+        )
+
     if want("suites"):
         suites = [
             "e2e", "http_remote", "http_auth", "mcp_json", "api_changeset",
