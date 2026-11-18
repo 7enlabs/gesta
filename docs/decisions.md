@@ -165,3 +165,11 @@ A tree-wide reformat or a symbol rename makes every line point at one changeset.
 A review that reports no stale reference reads as a clean bill of health. That is a stronger claim than the search can support: a name built at run time or reached through an alias is invisible to a text search. Counting the places where that could happen, and saying so only when nothing was found, turns a silent gap into a stated one without hedging a definite finding.
 
 The count comes from the same tree the search walked, so both answers describe one pass over one set of files. A count taken from a different set would answer a different question.
+
+## G1. A check that did not run is not a check that passed
+
+A gate reports on work nobody did when a skipped check counts as a pass. The failure is silent by construction: the run looks green, the sentence at the bottom says releasable, and the only thing wrong is that nothing was examined. Three outcomes must stay distinct, with different exit codes: passed, failed, and did not run.
+
+## G2. A step name that matches nothing must refuse
+
+`bench/gate.py <name>` runs one step. A mistyped name used to select nothing, print `0/0 gate steps pass`, and exit zero with the same sentence a full pass prints. Any selector must refuse a value it cannot honour, and should suggest the nearest name: a suggestion is the difference between an error somebody fixes and one they work around.

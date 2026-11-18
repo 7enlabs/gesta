@@ -18,6 +18,7 @@ ZF_DIR = "/work/gesta"
 ZF = os.path.join(ZF_DIR, "target/release/gesta")
 BUGHUNTER = os.environ.get("BUGHUNTER_DIR", "/work/hermes-health/sec/bughunter")
 results = []
+skipped = []
 
 
 def record(name, ok, detail=""):
@@ -26,6 +27,19 @@ def record(name, ok, detail=""):
     if not ok and detail:
         for line in str(detail).split("\n")[:8]:
             print(f"         {line}")
+
+
+def skip(name, why):
+    """A check that did not run.
+
+    Not a pass, and not a failure: a pass claims the thing was verified, and a failure claims it
+    was broken. Saying which is which is the whole point of a gate, and a skipped check counted as
+    a pass is how a scan reports green for three weeks without running.
+    """
+    skipped.append((name, why))
+    print(f"  [SKIP] {name}")
+    if why:
+        print(f"         {why}")
 
 
 def sh(cmd, cwd=ZF_DIR, timeout=900):
@@ -42,8 +56,18 @@ def sh_out(cmd, cwd=ZF_DIR, timeout=900):
 def main():
     only = sys.argv[1] if len(sys.argv) > 1 else None
 
+    # Every step this script knows, collected as the run asks for each one. A step name that never
+    # appears in this list cannot be selected, which is what makes a typo detectable.
+    known_steps = []
+    selected_any = [False]
+
     def want(step):
-        return only is None or only == step
+        known_steps.append(step)
+        if only is None or only == step:
+            if only is not None:
+                selected_any[0] = True
+            return True
+        return False
 
     if want("build"):
         rc, out = sh("bash -lc 'source $HOME/.cargo/env && cargo build --release'")
@@ -67,10 +91,20 @@ def main():
         record("cargo audit reports no vulnerability", rc == 0 and not vulns, out[-500:])
 
     if want("osv"):
-        if not os.path.exists("/tmp/osv"):
-            record("osv-scanner reports no issue", True, "skipped: /tmp/osv not present")
+        # Look for the tool where a tool actually lives. The old path was a one-off copy, so the
+        # check reported "did not run" on a worker that had the scanner installed all along, which
+        # is a skip that hides a working capability rather than a missing one.
+        import shutil as _sh
+        scanner = _sh.which("osv-scanner") or (
+            "/tmp/osv" if os.path.exists("/tmp/osv") else None
+        )
+        if scanner is None:
+            skip(
+                "osv-scanner reports no issue",
+                "no osv-scanner on PATH, so nothing was scanned",
+            )
         else:
-            rc, out = sh("/tmp/osv scan source --lockfile Cargo.lock", timeout=600)
+            rc, out = sh(f"{scanner} scan source --lockfile Cargo.lock", timeout=600)
             record("osv-scanner reports no issue",
                    rc == 0 and "No issues found" in out, out[-500:])
 
@@ -2092,6 +2126,44 @@ def main():
             except subprocess.TimeoutExpired:
                 srv.kill()
 
+    if want("gate"):
+        # A gate that cannot tell "checked and passed" from "did not check" is the failure it
+        # exists to prevent. These are the three outcomes, and they must be distinguishable.
+        rc, out = sh("python3 bench/gate.py tagz", timeout=120)
+        record(
+            "a mistyped step name refuses instead of passing",
+            rc == 2 and "nothing was checked" in out,
+            f"exit={rc} {out[-200:]}",
+        )
+        record(
+            "and it suggests the name that was meant",
+            "did you mean" in out,
+            out[-200:],
+        )
+
+        # Exercise the skip path with a step whose tool is definitely absent, so this check does
+        # not change meaning when a tool is installed or removed on the machine.
+        rc, out = sh(
+            "BUGHUNTER_DIR=/nonexistent/bughunter python3 bench/gate.py bughunter", timeout=120
+        )
+        record(
+            "a check that did not run is reported as incomplete, not as a pass",
+            rc == 3 and "did not run" in out and "incomplete" in out,
+            f"exit={rc} {out[-300:]}",
+        )
+        record(
+            "and an incomplete run never claims the tree is releasable",
+            "the tree is releasable" not in out,
+            out[-240:],
+        )
+
+        rc, out = sh("python3 bench/gate.py gateself", timeout=120)
+        record(
+            "a step name that matches nothing is still refused, so this check cannot lie about itself",
+            rc == 2,
+            f"exit={rc} {out[-160:]}",
+        )
+
     if want("suites"):
         suites = [
             "e2e", "http_remote", "http_auth", "mcp_json", "api_changeset",
@@ -2109,20 +2181,56 @@ def main():
 
     if want("bughunter"):
         if not os.path.isdir(BUGHUNTER):
-            record("bughunter scenarios", True, f"skipped: {BUGHUNTER} not present")
+            skip("bughunter scenarios", f"{BUGHUNTER} not present, so no scenario ran")
         else:
             rc, out = sh(f"bash {BUGHUNTER}/run.sh {ZF_DIR}", timeout=900)
             record("bughunter scenarios", rc == 0, out[-600:])
 
     passed = sum(1 for _, ok, _ in results if ok)
     total = len(results)
+
+    # A selector that matches nothing must not read as a clean run.
+    #
+    # This script takes a step name on the command line, and a mistyped name used to run nothing,
+    # print "0/0 gate steps pass" and exit zero with the same sentence a full pass prints. A check
+    # that did not run is not a check that passed, and a gate whose silence is indistinguishable
+    # from its approval is the failure it exists to prevent.
+    if only is not None and known_steps and not selected_any[0]:
+        # A suggestion is the difference between an error somebody fixes and an error somebody
+        # works around, so use a real similarity measure rather than a prefix guess.
+        import difflib as _dl
+        near = _dl.get_close_matches(only, sorted(set(known_steps)), n=6, cutoff=0.6)
+        # "step" means two things here: a name on the command line, and one assertion in the
+        # report below. Saying which one this is stops the number reading as a shrunken run.
+        print(f"\nno step name is {only!r}: nothing was checked, so nothing passed")
+        if near:
+            print(f"did you mean: {', '.join(near[:6])}")
+        print(
+            f"{len(set(known_steps))} step names exist, each holding several checks; "
+            f"run with no argument to run them all"
+        )
+        return 2
+
     print(f"\n{passed}/{total} gate steps pass")
+
+    # Name what did not run, and make the final sentence depend on it. "Releasable" over a run with
+    # a skipped check is a claim about work nobody did.
+    if skipped:
+        print(f"\n{len(skipped)} check(s) did not run:")
+        for n, why in skipped:
+            print(f"  ~ {n}: {why}")
+
     if passed < total:
         print("\nfailing:")
         for n, ok, _ in results:
             if not ok:
                 print(f"  - {n}")
         return 1
+
+    if skipped:
+        print("\nthe checks that ran passed, and the run is incomplete")
+        return 3
+
     print("the tree is releasable")
     return 0
 
