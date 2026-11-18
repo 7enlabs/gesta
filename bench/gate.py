@@ -235,6 +235,47 @@ def main():
             r[1][:160],
         )
 
+    if want("regex"):
+        # A regex is a different search, and a pattern the engine cannot express has to say so.
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        os.makedirs(os.path.join(tmp, "src"), exist_ok=True)
+        sh(f"{ZF} init", cwd=tmp)
+        with open(os.path.join(tmp, "src", "a.rs"), "w") as fh:
+            fh.write("fn read_config() {}\nfn write_config() {}\nlet hashes = 1;\nlet hash = 2;\n")
+        sh(f"{ZF} changeset create base --author t", cwd=tmp)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=tmp)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=tmp)
+
+        r = sh(f"{ZF} grep 'fn [a-z]+_config' --regex", cwd=tmp)
+        record(
+            "a regex matches by shape, which a literal cannot",
+            r[0] == 0 and r[1].count("_config") == 2,
+            r[1][:200],
+        )
+
+        literal = sh(f"{ZF} grep 'fn .*_config'", cwd=tmp)
+        record(
+            "the same text without the flag is read literally and finds nothing",
+            literal[0] != 0,
+            literal[1][:160],
+        )
+
+        r = sh(f"{ZF} grep hash --regex --word", cwd=tmp)
+        record(
+            "a regex with --word does not match a longer identifier",
+            r[0] == 0 and "hashes" not in r[1] and "hash = 2" in r[1],
+            r[1][:200],
+        )
+
+        r = sh(f"{ZF} grep 'foo(?=bar)' --regex", cwd=tmp)
+        record(
+            "a pattern the engine cannot express is refused with the construct named",
+            r[0] != 0 and ("look-around" in r[1] or "lookaround" in r[1]),
+            r[1][:240],
+        )
+
     if want("brief"):
         # One call that answers where the session stands. An agent that asks this with four
         # commands pays four round trips and holds four outputs in context.

@@ -811,18 +811,27 @@ pub fn cmd_brief_json() -> ZResult<()> {
     Ok(())
 }
 
+/// How a search was asked for, so the two entry points share one shape.
+///
+/// Gathered into a struct rather than passed as eight arguments: the call sites read as
+/// `Search { pattern: "x", history: true, ..Default::default() }`, and a new flag does not
+/// change every signature that carries it.
+#[derive(Default, Clone)]
+pub struct Search {
+    pub pattern: String,
+    pub history: bool,
+    pub ignore_case: bool,
+    pub word: bool,
+    pub regex: bool,
+    pub path: Option<String>,
+    pub limit: i64,
+    pub files_with_matches: bool,
+}
+
 /// Search the working tree or the history.
-pub fn cmd_grep(
-    needle: &str,
-    history: bool,
-    ignore_case: bool,
-    word: bool,
-    path: Option<&str>,
-    limit: i64,
-    files_with_matches: bool,
-) -> ZResult<()> {
-    let hits = grep_hits(needle, history, ignore_case, word, path, limit)?;
-    if files_with_matches {
+pub fn cmd_grep(s: Search) -> ZResult<()> {
+    let hits = grep_hits(&s)?;
+    if s.files_with_matches {
         let mut seen = std::collections::BTreeSet::new();
         for h in &hits {
             if seen.insert(h.path.clone()) {
@@ -830,12 +839,12 @@ pub fn cmd_grep(
             }
         }
         if hits.is_empty() {
-            return Err(bad(no_match(needle, history)));
+            return Err(bad(no_match(&s.pattern, s.history)));
         }
         return Ok(());
     }
     for h in &hits {
-        if history {
+        if s.history {
             let short = &h.rev[..h.rev.len().min(14)];
             println!("{}:{}:{}: {}", short, h.path, h.line, h.text);
         } else {
@@ -843,22 +852,15 @@ pub fn cmd_grep(
         }
     }
     if hits.is_empty() {
-        return Err(bad(no_match(needle, history)));
+        return Err(bad(no_match(&s.pattern, s.history)));
     }
     Ok(())
 }
 
 /// The machine-readable form, which is what an agent should use: it decides what to do with a
 /// list of locations instead of parsing a terminal's layout.
-pub fn cmd_grep_json(
-    needle: &str,
-    history: bool,
-    ignore_case: bool,
-    word: bool,
-    path: Option<&str>,
-    limit: i64,
-) -> ZResult<()> {
-    let hits = grep_hits(needle, history, ignore_case, word, path, limit)?;
+pub fn cmd_grep_json(s: Search) -> ZResult<()> {
+    let hits = grep_hits(&s)?;
     let rows: Vec<crate::json::Json> = hits
         .iter()
         .map(|h| {
@@ -871,12 +873,33 @@ pub fn cmd_grep_json(
         })
         .collect();
     emit(crate::json::Json::obj(vec![
-        ("pattern", crate::json::Json::str(needle.to_string())),
-        ("history", crate::json::Json::Bool(history)),
+        ("pattern", crate::json::Json::str(s.pattern.clone())),
+        ("history", crate::json::Json::Bool(s.history)),
         ("count", crate::json::Json::int(hits.len() as i64)),
         ("hits", crate::json::Json::arr(rows)),
     ]));
     Ok(())
+}
+
+/// Build the search from the flags, refusing `--regex` in a build that does not have it.
+fn build_pattern(
+    needle: &str,
+    ignore_case: bool,
+    word: bool,
+    regex: bool,
+) -> ZResult<crate::grep::Pattern> {
+    #[cfg(feature = "regex")]
+    if regex {
+        return crate::grep::Pattern::regex(needle, ignore_case, word);
+    }
+    #[cfg(not(feature = "regex"))]
+    if regex {
+        return Err(bad(
+            "this build has no regular expression support: rebuild with --features regex, or search for literal text",
+        ));
+    }
+    let _ = regex;
+    crate::grep::Pattern::new(needle, ignore_case, word)
 }
 
 fn no_match(needle: &str, history: bool) -> String {
@@ -891,19 +914,12 @@ fn no_match(needle: &str, history: bool) -> String {
     )
 }
 
-fn grep_hits(
-    needle: &str,
-    history: bool,
-    ignore_case: bool,
-    word: bool,
-    path: Option<&str>,
-    limit: i64,
-) -> ZResult<Vec<crate::grep::Hit>> {
+fn grep_hits(s: &Search) -> ZResult<Vec<crate::grep::Hit>> {
     let (root, conn) = open_repo()?;
-    let pattern = crate::grep::Pattern::new(needle, ignore_case, word)?;
-    let filter = path.map(normalise);
-    if history {
-        crate::grep::search_history(&conn, &pattern, filter.as_deref(), limit)
+    let pattern = build_pattern(&s.pattern, s.ignore_case, s.word, s.regex)?;
+    let filter = s.path.as_deref().map(normalise);
+    if s.history {
+        crate::grep::search_history(&conn, &pattern, filter.as_deref(), s.limit)
     } else {
         crate::grep::search_worktree(&conn, &root, &pattern, filter.as_deref())
     }

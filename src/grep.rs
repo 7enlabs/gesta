@@ -10,6 +10,23 @@ use rusqlite::Connection;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+/// Put a word boundary before a pattern unless it already starts with one.
+///
+/// A pattern that starts with a character that is not part of a word, such as a bracket or a
+/// dot, has a boundary there already. Adding one would refuse a match the caller asked for.
+#[cfg(feature = "regex")]
+fn bracket_word_start(pattern: &str) -> String {
+    let starts_wordy = pattern
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphanumeric() || c == '_');
+    if starts_wordy {
+        format!("\\b{}", pattern)
+    } else {
+        pattern.to_string()
+    }
+}
+
 /// One match: where it is and what the line says.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
@@ -26,6 +43,9 @@ pub struct Pattern {
     ignore_case: bool,
     /// Match whole words only, so `hash` does not find `hashes`.
     word: bool,
+    /// Set when the pattern is a regular expression.
+    #[cfg(feature = "regex")]
+    compiled: Option<regex::Regex>,
 }
 
 impl Pattern {
@@ -41,10 +61,69 @@ impl Pattern {
             },
             ignore_case,
             word,
+            #[cfg(feature = "regex")]
+            compiled: None,
+        })
+    }
+
+    /// A pattern read as a regular expression.
+    ///
+    /// The engine is the Rust one, which has no lookaround or backreferences. A pattern using
+    /// them is refused here, with the construct named, rather than quietly matching less than
+    /// the caller meant. `word` wraps the pattern in word boundaries instead of filtering
+    /// matches, because a regex match has no single position to check neighbours at.
+    #[cfg(feature = "regex")]
+    pub fn regex(needle: &str, ignore_case: bool, word: bool) -> ZResult<Pattern> {
+        if needle.is_empty() {
+            return Err(bad("an empty pattern matches every line, so it is refused"));
+        }
+        // The engine's own boundary at the end is enough when the pattern ends on a word
+        // character; adding a second one produced two boundaries in a row, which is refused.
+        let body = if word {
+            let open = bracket_word_start(needle);
+            let close = if needle
+                .chars()
+                .last()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            {
+                r"\b"
+            } else {
+                ""
+            };
+            format!(r"(?:{}){}", open, close)
+        } else {
+            needle.to_string()
+        };
+        let built = regex::RegexBuilder::new(&body)
+            .case_insensitive(ignore_case)
+            .build()
+            .map_err(|e| {
+                // The parser puts the position and the offending piece on later lines; taking
+                // only the first line dropped the part that explains what is wrong.
+                let detail: String = e
+                    .to_string()
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                bad(format!(
+                    "not a valid regular expression ({}). The engine has no lookaround such as an opening paren with a question mark and an equals sign, and no backreferences; express the same match another way.",
+                    detail
+                ))
+            })?;
+        Ok(Pattern {
+            needle: needle.to_string(),
+            ignore_case,
+            word,
+            compiled: Some(built),
         })
     }
 
     pub fn matches(&self, line: &str) -> bool {
+        #[cfg(feature = "regex")]
+        if let Some(re) = &self.compiled {
+            return re.is_match(line);
+        }
         let hay = if self.ignore_case {
             line.to_lowercase()
         } else {
@@ -242,5 +321,60 @@ mod tests {
         let hits = search_history(&conn, &p, None, 500).unwrap();
         assert_eq!(hits.len(), 1, "a deleted string must still be findable");
         assert_eq!(hits[0].rev, "h1");
+    }
+    #[cfg(feature = "regex")]
+    #[test]
+    fn a_regex_matches_more_than_a_literal_does() {
+        let body = "fn read_config() {}\nfn write_config() {}\n";
+        let literal = Pattern::new("fn .*_config", false, false).unwrap();
+        assert!(literal.scan("a", body, "").is_empty(), "a literal found a pattern");
+
+        let re = Pattern::regex("fn [a-z]+_config", false, false).unwrap();
+        assert_eq!(re.scan("a", body, "").len(), 2);
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn a_regex_with_word_uses_boundaries_so_a_prefix_does_not_match() {
+        let body = "let hashes = 1;\nlet hash = 2;\n";
+        let re = Pattern::regex("hash", false, true).unwrap();
+        let hits = re.scan("a", body, "");
+        assert_eq!(hits.len(), 1, "a prefix matched: {:?}", hits);
+        assert_eq!(hits[0].line, 2);
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn a_regex_ending_on_a_bracket_still_works_with_word() {
+        // The end boundary is only added when the pattern ends on a word character. Adding a
+        // second boundary after a bracket produced a pattern the engine refuses.
+        let re = Pattern::regex(r"read_config\(", false, true).unwrap();
+        assert_eq!(re.scan("a", "fn read_config(path)\n", "").len(), 1);
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn a_pattern_the_engine_cannot_express_is_refused_with_a_reason() {
+        let err = match Pattern::regex("foo(?=bar)", false, false) {
+            Ok(_) => panic!("a lookahead was accepted"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("look-around") || err.contains("lookaround"),
+            "the reason did not name the construct: {}",
+            err
+        );
+        // The detail from the parser survives, rather than the first empty line alone.
+        assert!(err.len() > 120, "the message lost its detail: {}", err);
+    }
+
+    #[cfg(feature = "regex")]
+    #[test]
+    fn case_insensitive_regex_and_literal_agree() {
+        let re = Pattern::regex("FN ", true, false).unwrap();
+        let lit = Pattern::new("FN ", true, false).unwrap();
+        let body = "fn main() {}\n";
+        assert_eq!(re.matches(body), lit.matches(body));
+        assert!(re.matches(body), "case insensitive regex missed a line");
     }
 }

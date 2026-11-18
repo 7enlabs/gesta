@@ -222,6 +222,9 @@ enum Cmd {
         /// Match whole words only
         #[arg(long)]
         word: bool,
+        /// Read the pattern as a regular expression
+        #[arg(long)]
+        regex: bool,
         /// Only paths starting with this prefix
         #[arg(long)]
         path: Option<String>,
@@ -756,29 +759,25 @@ fn run() -> ZResult<()> {
             history,
             ignore_case,
             word,
+            regex,
             path,
             limit,
             files_with_matches,
         } => {
+            let search = cli::Search {
+                pattern,
+                history,
+                ignore_case,
+                word,
+                regex,
+                path,
+                limit,
+                files_with_matches,
+            };
             if json {
-                cli::cmd_grep_json(
-                    &pattern,
-                    history,
-                    ignore_case,
-                    word,
-                    path.as_deref(),
-                    limit,
-                )
+                cli::cmd_grep_json(search)
             } else {
-                cli::cmd_grep(
-                    &pattern,
-                    history,
-                    ignore_case,
-                    word,
-                    path.as_deref(),
-                    limit,
-                    files_with_matches,
-                )
+                cli::cmd_grep(search)
             }
         }
         Cmd::Checkout { file, changeset } => cli::cmd_checkout(&file, changeset.as_deref()),

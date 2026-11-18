@@ -1,0 +1,104 @@
+# Decisions
+
+Every choice that shaped this program, with the reason it was made. Each one can be revisited.
+The numbers are for reference in a discussion, not an ordering.
+
+This is not a changelog. A changelog says what changed; this says why the shape is what it is.
+Where a decision was reversed or a diagnosis was wrong, that is recorded too, because a decision
+without its mistakes reads as if it were obvious.
+
+## Shape of the program
+
+| # | Decision | Reason |
+|---|---|---|
+| S1 | One binary, no daemon, no service, no account. | An agent on a laptop is the target. Anything that has to be started is something that can be down. |
+| S2 | SQLite as the store, bundled so no system library is needed. | One file to copy, one file to back up, and transactions for free. A directory of loose object files cannot give an atomic commit without its own locking layer. |
+| S3 | Every command works without a network. | A repository is local first. Remotes are transport, not the model. |
+| S4 | The cost of a commit follows the size of the change, not the size of the repository. | The rule everything else bends around. A tree rebuilt per commit is the difference between an agent committing forty times a task and not committing at all. |
+
+## The cost rule
+
+| # | Decision | Reason |
+|---|---|---|
+| C1 | `set_branch_head` updates the branch tree incrementally from the changeset's own file list. | Rebuilding the whole tree per commit measured 24 ms at 500 files and 67 ms at 8000. That is O(repository) on the one operation an agent does most. |
+| C2 | The incremental path falls back to a rebuild when the changeset's parent is not the previous head. | Merge, undo and remote apply all re-parent. Updating incrementally across a re-parent would silently write a wrong tree. |
+| C3 | Deltas are capped at a chain of 16. | An unbounded chain makes a read walk the whole history. The cap bounds a read and keeps the compression that matters. |
+| C4 | `status` reads a maintained table instead of rebuilding the committed tree. | Rebuilding cost about 2 ms on 2000 files, on every `status` and every `diff`. |
+| C5 | The stat cache exists, and a file younger than a small window is re-read rather than trusted. | A cache hit needs size and mtime to match. A file written in the same clock tick as the last read has an mtime that proves nothing. |
+
+## Evidence over claims
+
+| # | Decision | Reason |
+|---|---|---|
+| E1 | `fsck --worktree` hashes every tracked path and compares it to the disk. | A check that reads the database and not the disk is half a check. It is opt in because it reads every file. |
+| E2 | `fsck --worktree` never reports a file the user made, a path outside the sparse scope, or a branch that is not current. | A check that cries wolf is turned off. Three tests hold that line. |
+| E3 | A revert raises a change's risk score and never lowers it. | A rule that can quietly hide a change someone wanted to see is worse than a noisy one. |
+| E4 | `land` materialises the working tree when the target branch is the checked-out one. | Without it the head moved and the disk did not: `show main:a.txt` returned the new content while `status` called the file deleted. |
+| E5 | A shallow clone carries a snapshot of the head tree inside the bundle. | Truncating the history is exactly removing the changesets that created the old files. Restoring from the chain gave 5 files out of 200. |
+| E6 | Bundle completeness counts the snapshot and every object the snapshot names. | A head that had not moved left its objects out of the bundle, so the bundle contradicted itself. |
+
+## Things that must not be lost
+
+| # | Decision | Reason |
+|---|---|---|
+| K1 | A stash records a deletion as a row with no hash. | Collecting only added and modified paths reported "nothing to stash" when the only change was a removal, and the intent to delete disappeared on the next branch switch. |
+| K2 | A three way merge refuses to append a replacement that is already the tail of what was emitted. | Two sides expanding adjacent lines to the same content produced the line twice with no conflict reported. |
+| K3 | Merge overlap is decided by the content the regions produce, not by where they sit. | Two wrong fixes came first: skipping hunks inside an already handled region broke a merge into an empty base, and treating a partial overlap as a conflict never fired because the regions are adjacent. |
+| K4 | `undo` restores the working tree and the database row together. | An undo that leaves the disk ahead of the head is a silent divergence. |
+| K5 | `--fix` refuses anything a person's judgement could change, and names the command. | A fix that silently skips work is worse than no fix, because the caller believes the state is clean. |
+| K6 | Setting uncommitted work aside takes an explicit flag. | Committing a snapshot is safe because the snapshot describes the disk. A stash is safe because it keeps the work. Removing someone's unfinished edit from the tree is not safe, so it is never the default. |
+
+## Secrets and transport
+
+| # | Decision | Reason |
+|---|---|---|
+| P1 | A secret never appears in `argv`, in a URL, or in the repository. | `argv` is readable through `ps` and lands in shell history. A URL is logged by every proxy on the path. |
+| P2 | The secret store is one file per user, not per repository. | A repository can be copied or pushed; the credential must not travel with it. |
+| P3 | Credentials are read from the environment first, then the sealed store. | The environment is what a test or a one-off job sets; the store is what a person sets once and forgets. |
+| P4 | The sealed store uses ChaCha20-Poly1305 with a single pass KDF. | The threat model is a leaked backup, not an attacker holding the file and a GPU. The single pass is stated rather than hidden. |
+| P5 | `S3Config` has no `Debug`. | It holds the secret key, and a derived `Debug` prints it in any panic message. The test avoids needing it rather than adding it for convenience. |
+| P6 | A plain `http://` endpoint is refused except on loopback. | The signature names the key, covers the payload and can be replayed inside its signing window. Loopback is allowed because a local test server cannot be read by anyone else. |
+| P7 | The S3 remote is kept. | It is the only remote that needs no listening process. It costs 670 lines and one gate step; the 1.6 MB of binary difference belongs to rustls, which the HTTPS remote needs on its own. |
+
+## The interface an agent meets
+
+| # | Decision | Reason |
+|---|---|---|
+| A1 | `brief` returns a named state, not a paragraph. | A program branches on `commit-work`; a summary gets read once and forgotten. |
+| A2 | A stopped rebase outranks everything in `brief`. | Nothing else is safe until it is finished. |
+| A3 | New work beyond a snapshot outranks committing that snapshot. | The snapshot does not describe the new file, so committing it would drop the file. |
+| A4 | `grep --history` reads each distinct version once. | Reading per changeset repeated the whole history, which is the difference between a search that finishes and one that does not. |
+| A5 | Search and state are exposed over MCP as well as from a shell. | The protocol is how an agent reaches the tool. A capability only a shell can reach is a capability the agent effectively lacks. |
+| A6 | Every JSON object carries `schema: gesta@1`, including MCP results. | A renamed field breaks a caller silently: it keeps running and reads the wrong value. |
+| A7 | A top-level list stays a bare list, and `--envelope` asks for the versioned object. | A list cannot carry a key, and wrapping it would break the pipes people already write. |
+| A8 | `grep --regex` is a separate feature from the default build. | A build that only needs literal search keeps a smaller binary. A pattern the engine cannot express is refused with the construct named. |
+
+## Install and delivery
+
+| # | Decision | Reason |
+|---|---|---|
+| I1 | Install is one command, and a prebuilt binary is tried before asking for a toolchain. | The machine that most needs an installer is the one without the compiler. |
+| I2 | The Windows installer targets PowerShell 5.1 and writes the user PATH. | Every Windows 10 and 11 machine has 5.1. Elevation is why installs get abandoned. |
+| I3 | No releases, no tags. | The project ships from the branch. A version number in the manifest tracks the interface, not a packaged artifact. |
+
+## Mistakes kept on the record
+
+These cost more time than the decisions above, so they stay written down.
+
+| # | What happened | What it taught |
+|---|---|---|
+| M1 | A fixture set `parent = NULL`, so the incremental tree path was never exercised by any test. | A test that does not walk the code path it names proves nothing. |
+| M2 | `commit_one` re-parented the changeset before calling `set_branch_head`, so the condition that enables the incremental path was always false. | The bug was in the order of two lines, and every test passed. |
+| M3 | Two merge "fixes" were wrong before the third was right. | Compute the hunk positions by hand before changing merge logic. A few lines of Python settled in a minute what two rounds of guessing did not. |
+| M4 | Four tests shared one temporary directory because the name used the process id. | A fixture that collides across threads produces failures that look like product defects. |
+| M5 | An investigation blamed a traversal and a diff function for missing files; both were innocent. | Check the fixture before believing the diagnosis. `status --json` on a clean fixture settled it in one call. |
+| M6 | `--branch main` was used with `cargo install --git`, which fails because the remote has no such tracking ref. | Run the installer from the published URL, not from a checkout. Three defects only appeared that way. |
+
+## Not done, and why
+
+| # | Not done | Reason |
+|---|---|---|
+| N1 | A workspace per agent by copying the tree. | The cost of a workspace is the whole tree. Sparse checkout, cheap branches and stash cover the need without a copy. |
+| N2 | A local server and a SQL backend. | Both give up "one binary, one machine, no daemon". They are a separate design, not an increment. |
+| N3 | A lock file for concurrent access. | It turns a working concurrent read into a failure, and a crashed process leaves it stuck with no honest way to prove it stale. WAL plus retries behaves better. |
+| N4 | Guessing at another tool's behaviour to claim compatibility. | An unverified claim is worse than a missing feature. |

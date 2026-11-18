@@ -79,7 +79,7 @@ gesta blame src/main.rs
 | `stash pop [--id N]` | Write a stash back, refusing over local changes |
 | `stash drop [--id N]` | Delete a stash without applying it |
 | `brief [--json] [--fix] [--stash]` | Where the session stands, and `--fix` does the safe part |
-| `grep <text> [--history]` | Find text in the working tree, or in every recorded version |
+| `grep <text> [--history] [--regex]` | Find text in the working tree, or in every recorded version |
 | `hook list` | Which hooks are installed |
 | `hook install <name> [--file F]` | Write a hook, reading stdin when no file is given |
 | `hook remove <name>` | Remove a hook |
@@ -181,6 +181,19 @@ a hundred changesets costs one read.
 
 An agent should use `--json` and read the locations, rather than parse a terminal's layout.
 
+`--regex` reads the pattern as a regular expression:
+
+```sh
+gesta grep "^fn " --regex              # lines that start with a function signature
+gesta grep "fn [a-z]+_config" --regex  # by shape
+gesta grep "hash" --regex --word       # a regex that still respects word boundaries
+```
+
+The engine has no lookaround and no backreferences, because the Rust one does not. A pattern
+that uses them is refused with the construct named and the position, rather than matching less
+than you meant. Regex support is a build feature; a build without it says so instead of quietly
+searching literally.
+
 ### Subrepositories
 
 `sub add` records a path that points at another repository. The pointer holds the
@@ -271,6 +284,8 @@ Dedup comes free from the hash: identical content is one row, however many files
 Compression is not applied blindly. A zlib stream carries a fixed header, so a short file grows when packed. `put_object` compares the packed size to the raw size and keeps whichever is smaller.
 
 ## Design notes
+
+Why the shape is what it is, and what went wrong on the way: [docs/decisions.md](docs/decisions.md).
 
 Changesets are explicit. `changeset create` snapshots the tree and `changeset commit` moves the head. An agent can look at what it is about to commit before it lands.
 

@@ -37,10 +37,15 @@ webpki-roots = { version = "0.26", optional = true }
 # Self-signed certificate generation for `serve --tls self-signed`, so a private
 # network can be encrypted without an external CA.
 rcgen = { version = "0.13", optional = true }
+# Regular expressions for `grep --regex`, behind a feature so a build that only needs literal
+# search keeps a smaller binary. The engine is the Rust one, which has no lookaround or
+# backreferences: a pattern relying on them is refused rather than silently mismatched.
+regex = { version = "1.13", optional = true, default-features = false, features = ["std", "perf", "unicode"] }
 
 [features]
-default = ["tls"]
+default = ["tls", "regex"]
 tls = ["dep:rustls", "dep:rustls-pki-types", "dep:webpki-roots", "dep:rcgen"]
+regex = ["dep:regex"]
 
 [profile.release]
 opt-level = 3
