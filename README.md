@@ -688,6 +688,6 @@ Each of these is pinned by a test, and each one exists because the first impleme
 
 ## Status
 
-Version 0.5.0. Usable for one developer or a set of agents, on one machine, on a private network over TLS, or by agents that never check out the tree. Still not a full git replacement: a tree of many tiny files costs 6.08x git in disk, and a token cannot be revoked before its expiry without editing the auth file. Rebase, cherry-pick, bisect and hooks exist; LFS does not.
+Version 0.6.0. Usable for one developer or a set of agents, on one machine, on a private network over TLS, or by agents that never check out the tree. Still not a full git replacement: a tree of many tiny files costs 6.08x git in disk, and a token cannot be revoked before its expiry without editing the auth file. Rebase, cherry-pick, bisect and hooks exist; LFS does not.
 
-`docs/upgrade-plan.md` holds the measurements behind each decision and the list of what is still missing.
+`CHANGELOG.md` says what changed at each version. `docs/upgrade-plan.md` holds the measurements behind each decision and the list of what is still missing.

@@ -2338,6 +2338,62 @@ def main():
             out[-400:],
         )
 
+    if want("changelog"):
+        # A changelog that drifts from the version is worse than none: it tells a reader what
+        # changed in a release that never shipped that way.
+        import re as _re
+
+        cargo = ""
+        try:
+            with open("Cargo.toml", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("version"):
+                        cargo = line.split("=")[1].strip().strip('"')
+                        break
+        except OSError:
+            pass
+        body = ""
+        try:
+            with open("CHANGELOG.md", encoding="utf-8") as fh:
+                body = fh.read()
+        except OSError:
+            pass
+
+        record(
+            "a changelog exists",
+            bool(body),
+            "CHANGELOG.md" if body else "CHANGELOG.md is missing",
+        )
+        record(
+            "the changelog carries a section for the current version",
+            bool(cargo) and f"## {cargo}," in body,
+            f"version {cargo}: " + ("found" if f"## {cargo}," in body else "no section"),
+        )
+
+        # Only one section may claim to be current, and no section may be empty.
+        sections = _re.findall(r"^## (.+)$", body, _re.M)
+        versions = [s for s in sections if _re.match(r"\d+\.\d+\.\d+", s)]
+        record(
+            "every version section carries a date",
+            all(_re.search(r"\d{4}-\d{2}-\d{2}", s) for s in versions) if versions else False,
+            "; ".join(versions[:6]),
+        )
+        record(
+            "the newest version section is the current one",
+            bool(versions) and versions[0].startswith(cargo),
+            f"newest {versions[0] if versions else 'none'} against {cargo}",
+        )
+
+        # A section with no bullet means a version was bumped without saying what happened.
+        parts = _re.split(r"^## ", body, flags=_re.M)[1:]
+        stripped = [p for p in parts if not p.lstrip().startswith(("How to read",))]
+        thin = [p.splitlines()[0] for p in stripped if "- " not in p]
+        record(
+            "no version section is empty",
+            not thin,
+            f"empty: {', '.join(thin[:4])}" if thin else "every section lists what changed",
+        )
+
     if want("suites"):
         suites = [
             "e2e", "http_remote", "http_auth", "mcp_json", "api_changeset",

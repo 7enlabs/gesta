@@ -1,0 +1,200 @@
+# Changelog
+
+Every entry here comes from a commit in this repository, and every version boundary is a commit
+that changed the version in `Cargo.toml`. Nothing is dated by plan: a date is when the work landed.
+
+The project has no git tags. A tag would say "this is a release" and nothing here is published, so
+the version numbers in `Cargo.toml` are the only boundary and this file follows them.
+
+## How to read this
+
+Each section is the work that landed at that version, newest first. A section grows while its
+version is current and freezes when the number changes, so `0.6.0` is a record and not a plan.
+
+## 0.6.0, 2026-11-18
+
+### Measuring the work rather than the calls
+
+`bench/harness` hands a job and a shell to a solver and asks whether a day of version control gets
+done: eight tasks over init, commit, branch, land, review, undo, stash, brief and binary objects.
+Each carries a goal, a setup that builds a fresh repository, a reference answer, and checks.
+
+- Every task carries a reference answer, because a check that has never been passed cannot be told
+  apart from a broken one.
+- `--selftest` runs each setup with no work done and requires that not every check passes. It found
+  three tasks that performed their own goal inside the check, and one that restored the state it
+  started in and so could not tell work from no work.
+- `--mutate` plants four kinds of defect across the task set, nineteen plantings in all, and
+  requires that every one is caught by a task check or a criterion. It found four faults a passing
+  run could not: a criterion reading a truncated tail it could never parse, a criterion judging a
+  script's concatenated output as if it belonged to one command, and two plantings whose defect
+  never reached the path they claimed to test.
+- Attempts end as passed, failed, timed out, or broken, with the last two as separate outcomes. A
+  run stopped by a clock says nothing about the work.
+- Commands run in a scrubbed environment: an allowlist, an explicit list, and a secret-shaped name
+  dropped even when listed. Credentials are on neither list.
+
+### Two layers, with intervals
+
+- Every attempt is scored on the deliverable and separately on five obligations: quiet error stream
+  on success, a refusal that explains itself, no database path or SQL error reaching the reader, no
+  panic, and `--json` a parser can read.
+- `pass@k` and `pass^k` are reported together, with bootstrap intervals, because capability with
+  retries and reliability without them are different questions.
+- The bootstrap resamples tasks and never runs. One task reports `[0, 100]` rather than certainty
+  nobody earned.
+- `--selftest` and `--mutate` are gate steps, so a passing score cannot be produced by an instrument
+  that sees nothing.
+
+### MCP
+
+- `tools/list` carries `ttlMs` and `cacheScope`. The catalog is 4,426 bytes, about 1,106 estimated
+  tokens, and a client following the spec could not cache it, so it was paid on every model call.
+- `server/discover` reports the protocol version, the server identity, and instructions that say
+  which tool to read first and how it differs from its nearest neighbour.
+- An argument error is `-32602` instead of `-32603`. A missing `path` is the caller's mistake, and a
+  client that cannot tell that from a server fault either retries forever or reports a fault that
+  does not exist.
+- `bench/harness/mcp_eval.py` scores what calling a tool directly cannot: thirteen requests, each
+  naming the tool that answers it and the arguments it implies, with selection, argument accuracy,
+  per-tool precision and recall, and restraint scored apart. A request no tool answers must be
+  declined, because a forced fit turns "I cannot" into an action.
+
+### Saying where the rest is
+
+- Every capped list names the command that lists everything: `diff --json` for skipped binaries,
+  `review --json` for stale references, `remote inspect --json` for author strings.
+- `grep --max-line` cuts a long line and states its real length. Cutting is opt-in, because a caller
+  that receives a shortened line has no other place to fetch the original.
+
+### Tags and blame
+
+- `tag` resolves its target before storing it. `tag v2 main` used to store the string `main`, and
+  the tag existed, appeared in the list, and resolved to nothing.
+- A tag may point at a branch, a changeset, or another tag, with a bounded walk so a cycle is
+  reported rather than hanging. `tag --list` no longer demands a name it does not use.
+- `blame --ignore-rev` names a revision whose lines should be attributed to the change before it,
+  and `.gesta-blame-ignore-revs` at the repository root is read without being asked.
+
+### Saying what could not be seen
+
+- A review that finds no stale reference reports how many files could hide one, and the count of
+  places that build a name at run time or forward it through another name. Silence in that case
+  made a clean result and a blind result look identical.
+
+### Pushing, and taking it back
+
+- `remote inspect` reports what a push would carry before it carries it: changesets, bytes, and
+  every author string, with the ones naming a person counted apart. `--check-identity` makes that a
+  refusal.
+- `anonymise` replaces the author on changesets that already exist. A signature covers the author,
+  so the rewrite drops it and says how many; a replacement that is itself an address is refused,
+  because swapping one identity for another is not anonymising.
+
+### Hooks
+
+- A hook that changed after installation is refused rather than executed, and `hook status` shows
+  both hashes. `pre-land` runs before a branch merges into a shared target, which is when a change
+  stops being private and the last point where a failing suite costs one person instead of
+  everybody.
+
+### Review boundaries
+
+- `review --from <branch>` uses the merge base rather than the other branch's head. Reviewing a
+  feature against a main that had moved one commit used to list every changeset main already had.
+
+### The gate
+
+- Three outcomes with three exit codes: passed, failed, and did not run. A skipped check was
+  recorded as a pass, and a mistyped step name selected nothing and printed the same sentence a full
+  pass prints. `osv` looked for its scanner at a one-off path and reported "did not run" on a
+  machine that had it installed.
+
+### Beyond 0.5.0, not yet listed above
+
+The rest of this version, in the order it landed:
+
+- `grep --history` searches every recorded version, `--regex` and `--word` search by shape.
+- `brief` answers where a session stands in one call, and `brief --fix` does the safe half of what
+  it reports.
+- Subrepositories, with a path that points at another repository.
+- A JSON schema version on every document, because a machine parses it and a person does not.
+- Object storage over S3 with SigV4, needing no server, with credentials sealed and never in
+  `argv` or a URL.
+- A shallow clone takes only the newest changesets and can be extended later.
+- `land` refuses when the target moved since it was read.
+- Structured errors: ten codes, an exit status that carries the same distinction, and one JSON
+  document per invocation.
+- Git interoperability: import and export with matching commit ids, verified against real git.
+- `gc`, and the true storage numbers in `docs/storage.md`.
+- Packing small objects was measured, made things worse, and was removed. The numbers are recorded.
+- Binary files are stored raw rather than refused.
+- Non-ASCII paths no longer panic.
+- `fsck --worktree` checks the disk as well as the database.
+- `impact` finds callers a change breaks outside its own diff.
+- A landing can be refused by a hook, with both branches left untouched.
+
+### Fixed
+
+- A delta could not decode a line that was blank.
+- Undo to an empty branch left every file on disk.
+- Two paths differing only by a backslash collided on Unix.
+- A three-way merge duplicated a line the other side had already written.
+- A stash with a deletion reported there was nothing to save.
+- An installer left a partial file behind when a download failed.
+- A `winget` suggestion that changes nothing was replaced with the command that does.
+
+## 0.5.0, 2026-11-17
+
+### Delta compression, sparse checkout, structured conflicts, TLS
+
+- Deltas are sent on the wire, so a bundle follows the size of the change rather than the size of
+  the history.
+- Sparse checkout limits the working tree to a set of paths, with the scope applied to both sides of
+  the comparison so a file in the branch tree that was never written is not read as deleted.
+- `branch conflicts` reports a conflict as data, per region, with both sides and context.
+- TLS, behind a feature so a build without it stays small.
+
+### Remote
+
+- An S3 remote that needs no server, with SigV4 signing.
+- Remote credentials stored sealed, and a delta push no longer erases a bucket.
+- A branch list read from a bucket, and the hosting comparison in `docs/hosting.md`.
+
+### Safety
+
+- `undo` is reversible and keeps the working tree honest.
+- `land` uses a compare-and-swap, and the risk score learns from reverts.
+- `review` shows a stack step by step with a reason for every risk point.
+- `diff --from` and `diff --to` compare any two revisions.
+- A pending snapshot that no longer matches the disk is reported.
+- A name that is not found reports what does exist.
+
+### Cost
+
+- The committed tree is read from a maintained table instead of rebuilt, so commit cost follows the
+  size of the change rather than the size of the repository.
+- The ignore check allocates nothing per pattern.
+
+## 0.4.0, 2026-11-17
+
+- Access control for the HTTP remote: tokens, and an access log.
+- MCP server over stdio, so an agent can act over the protocol.
+- JSON output on every read command.
+- A stat cache, and a git comparison.
+- A release gate, which closed two dependency advisories on its first run.
+
+## 0.3.1, 2026-11-17
+
+- An HTTP remote, so two machines can share a repository without a shared filesystem.
+
+## 0.3.0, 2026-11-17
+
+- Three-way merge, undo, `fsck`, and bundles.
+- Usable as primary source control for one developer.
+
+## 0.2.0, 2026-11-17
+
+- First version. Source control for AI agents: changesets, branches, a working tree, and a store.
+- Named ZenForge at this point. Renamed to gesta later in the same day, and the MCP tool prefix
+  accepts the old name so a client configured before the rename keeps working.
