@@ -105,7 +105,10 @@ pub fn init_schema(conn: &Connection) -> ZResult<()> {
             -- writes most of the code, the reason behind a change is part of the
             -- change; a message alone loses it.
             session    TEXT,
-            intent     TEXT
+            intent     TEXT,
+            -- The git commit this changeset was imported from, so a second import of the same
+            -- repository recognises what is already here instead of duplicating it.
+            git_commit TEXT
         );
         CREATE TABLE IF NOT EXISTS changeset_files (
             changeset_id TEXT NOT NULL,
@@ -325,6 +328,7 @@ pub fn migrate(conn: &Connection) -> ZResult<bool> {
     }
 
     conn.execute_batch("ALTER TABLE objects ADD COLUMN compressed INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "changesets", "git_commit", "TEXT")?;
     if !table_columns(conn, "changesets")?.iter().any(|c| c == "parent2") {
         conn.execute_batch("ALTER TABLE changesets ADD COLUMN parent2 TEXT")?;
     }

@@ -13,6 +13,8 @@ mod cli_remote;
 mod conflict;
 mod content;
 mod delta;
+mod git_bridge;
+mod gitobj;
 mod grep;
 mod history;
 mod hooks;
@@ -149,6 +151,27 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum GitCmd {
+    /// Read a git repository into this one
+    Import {
+        /// The git repository, or a directory inside it
+        #[arg(default_value = ".")]
+        path: String,
+        /// Only paths under this prefix
+        #[arg(long)]
+        path_prefix: Option<String>,
+    },
+    /// Write this repository out as a git repository git can read
+    Export {
+        /// Where to write it; created if missing
+        path: String,
+        /// One branch, or every branch when omitted
+        #[arg(long)]
+        branch: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum Cmd {
     /// Create a repository in the current directory
     Init {
@@ -197,6 +220,11 @@ enum Cmd {
     Show {
         /// Path, optionally as `rev:path`
         spec: String,
+    },
+    /// Import from or export to a git repository, without calling git
+    Git {
+        #[command(subcommand)]
+        sub: GitCmd,
     },
     /// Everything a session needs before its first edit, in one call
     Brief {
@@ -745,6 +773,10 @@ fn run() -> ZResult<()> {
         Cmd::Blame { file } => cli::cmd_blame(&file),
         Cmd::History { file } => cli::cmd_history(&file),
         Cmd::Show { spec } => cli::cmd_show(&spec),
+        Cmd::Git { sub } => match sub {
+            GitCmd::Import { path, path_prefix } => cli::cmd_git_import(&path, path_prefix.as_deref()),
+            GitCmd::Export { path, branch } => cli::cmd_git_export(&path, branch.as_deref()),
+        },
         Cmd::Brief { json: brief_json, fix, stash } => {
             if fix {
                 cli::cmd_brief_fix(brief_json, stash)

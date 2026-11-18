@@ -276,6 +276,80 @@ def main():
             r[1][:240],
         )
 
+    if want("git"):
+        # Interoperability is the claim that matters most, so it is checked against the real git
+        # binary: import a repository git made, export one, and let git validate the result.
+        import shutil
+        import tempfile
+        if not shutil.which("git"):
+            record("git interoperability", False, "git is not on PATH, so it cannot be checked")
+        else:
+            src = tempfile.mkdtemp()
+            dst = tempfile.mkdtemp()
+            sh(f"{ZF} init", cwd=dst)
+            sh(f"git init -q -b main", cwd=src)
+            sh("git config user.email a@b.c && git config user.name T", cwd=src)
+            os.makedirs(os.path.join(src, "src"), exist_ok=True)
+            with open(os.path.join(src, "src", "a.rs"), "w") as fh:
+                fh.write("fn one() {}\n")
+            with open(os.path.join(src, "README.md"), "w") as fh:
+                fh.write("readme\n")
+            sh("git add -A && git commit -qm first", cwd=src)
+            with open(os.path.join(src, "src", "a.rs"), "a") as fh:
+                fh.write("fn two() {}\n")
+            sh("git add -A && git commit -qm second", cwd=src)
+
+            sh(f"{ZF} init", cwd=dst)
+            got = sh(f"{ZF} git import {src}", cwd=dst)
+            record(
+                "a git repository imports as changesets",
+                got[0] == 0 and "imported 2 commit" in got[1],
+                got[1][:200],
+            )
+
+            # The content has to be readable, not just the history: an import that stores git's
+            # object names in a SHA-256 store looks fine and finds nothing.
+            body = sh(f"{ZF} show main:src/a.rs", cwd=dst)
+            record(
+                "an imported file can be read back",
+                body[0] == 0 and "fn two()" in body[1],
+                body[1][:200],
+            )
+
+            again = sh(f"{ZF} git import {src}", cwd=dst)
+            record(
+                "importing a second time adds nothing",
+                again[0] == 0 and "imported 0 commit" in again[1],
+                again[1][:200],
+            )
+
+            out = tempfile.mkdtemp()
+            exp = sh(f"{ZF} git export {out}", cwd=dst)
+            record(
+                "the repository exports as a git repository",
+                exp[0] == 0 and "exported" in exp[1],
+                exp[1][:200],
+            )
+
+            # The real test: git has to accept it, with the same commit ids as the original.
+            fsck = sh("git fsck --no-progress", cwd=out)
+            record("git accepts the exported repository", fsck[0] == 0, fsck[1][:300])
+
+            original = sh("git rev-parse main", cwd=src)[1].strip()
+            round_tripped = sh("git rev-parse main", cwd=out)[1].strip()
+            record(
+                "a round trip keeps the commit id, which covers tree, parents, author and message",
+                original != "" and original == round_tripped,
+                f"original={original[:12]} exported={round_tripped[:12]}",
+            )
+
+            listing = sh("git ls-tree -r main", cwd=out)
+            record(
+                "the exported tree holds the nested files",
+                "src/a.rs" in listing[1] and "README.md" in listing[1],
+                listing[1][:200],
+            )
+
     if want("brief"):
         # One call that answers where the session stands. An agent that asks this with four
         # commands pays four round trips and holds four outputs in context.

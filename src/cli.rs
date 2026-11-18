@@ -2,6 +2,7 @@
 //! dispatcher and no single file grows past the point of review.
 
 use std::fs;
+use std::path::Path;
 
 use rusqlite::OptionalExtension;
 
@@ -729,6 +730,35 @@ pub fn cmd_history(file: &str) -> ZResult<()> {
             name,
             msg
         );
+    }
+    Ok(())
+}
+
+/// Read a git repository into this one.
+pub fn cmd_git_import(path: &str, prefix: Option<&str>) -> ZResult<()> {
+    let (_root, conn) = open_repo()?;
+    let git_root = Path::new(path);
+    let got = crate::git_bridge::import(&conn, git_root, prefix)?;
+    println!(
+        "imported {} commit(s) as changesets, {} path change(s), {} already present",
+        got.commits, got.files, got.skipped
+    );
+    if !got.branches.is_empty() {
+        println!("branches: {}", got.branches.join(", "));
+    }
+    Ok(())
+}
+
+/// Write this repository out as a git repository.
+pub fn cmd_git_export(path: &str, branch: Option<&str>) -> ZResult<()> {
+    let (_root, conn) = open_repo()?;
+    let out = crate::git_bridge::export(&conn, Path::new(path), branch)?;
+    println!("exported {} commit(s)", out.commits);
+    if !out.branches.is_empty() {
+        println!("branches: {}", out.branches.join(", "));
+    }
+    if !out.root.is_empty() {
+        println!("head: {}", out.root);
     }
     Ok(())
 }
