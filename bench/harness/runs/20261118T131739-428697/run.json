@@ -1,0 +1,473 @@
+{
+  "summary": {
+    "run_id": "20261118T131739-428697",
+    "gesta": "gesta",
+    "k": 1,
+    "mode": "sequential",
+    "seed": 0,
+    "tasks": 8,
+    "outcomes": {
+      "pass": 8
+    },
+    "unfinished": 0,
+    "complete": true
+  },
+  "attempts": [
+    {
+      "task": "first-commit",
+      "tries": 1,
+      "outcome": "pass",
+      "steps": [
+        {
+          "command": "set -e\ngesta init",
+          "exit_code": 0,
+          "seconds": 0.085,
+          "stdout_tail": "initialized repository at /tmp/gesta-task-first-commit-uv61als0/repo/.gesta\nbranch: main (no changesets yet)\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "set -e\nprintf 'alpha\\n' > notes.txt\nC=$(gesta changeset create \"add notes\" --author solver --json | cs_id)\ngesta changeset commit $C\nset > /tmp/gesta-task-first-commit-uv61als0/vars.sh\n",
+          "exit_code": 0,
+          "seconds": 0.215,
+          "stdout_tail": "committed cs28a557ac3da4 on branch main (1 file(s))\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        }
+      ],
+      "checks": [
+        {
+          "command": ". /tmp/gesta-task-first-commit-uv61als0/vars.sh 2>/dev/null || true\ngesta log --json | grep -q 'add notes'",
+          "exit_code": 0,
+          "seconds": 0.032,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": ". /tmp/gesta-task-first-commit-uv61als0/vars.sh 2>/dev/null || true\ngesta show main:notes.txt | grep -qx alpha",
+          "exit_code": 0,
+          "seconds": 0.048,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": ". /tmp/gesta-task-first-commit-uv61als0/vars.sh 2>/dev/null || true\ngesta fsck",
+          "exit_code": 0,
+          "seconds": 0.169,
+          "stdout_tail": "repository is consistent (1 object(s), 0 orphan(s))\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        }
+      ],
+      "note": ""
+    },
+    {
+      "task": "branch-and-land",
+      "tries": 1,
+      "outcome": "pass",
+      "steps": [
+        {
+          "command": "set -e\ngesta init\nprintf 'one\\ntwo\\n' > notes.txt\nC=$(gesta changeset create \"seed\" --author setup --json | cs_id)\ngesta changeset commit $C\ngesta branch create tidy\ngesta branch switch tidy",
+          "exit_code": 0,
+          "seconds": 0.421,
+          "stdout_tail": "initialized repository at /tmp/gesta-task-branch-and-land-hlenckz_/repo/.gesta\nbranch: main (no changesets yet)\ncommitted csed77c75d079c on branch main (1 file(s))\ncreated branch tidy from main at csed77c75d079c\nswitched to branch tidy (1 file(s) materialised, 0 removed, head csed77c75d079c)\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "set -e\nprintf 'one\\nbeta\\n' > notes.txt\nC=$(gesta changeset create \"tidy notes\" --author solver --json | cs_id)\ngesta changeset commit $C\ngesta land tidy --onto main\nset > /tmp/gesta-task-branch-and-land-hlenckz_/vars.sh\n",
+          "exit_code": 0,
+          "seconds": 0.287,
+          "stdout_tail": "committed csdd50bf0d6f2d on branch tidy (1 file(s))\nlanded tidy onto main (1 change(s), head now csdd50bf0d6f2d)\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        }
+      ],
+      "checks": [
+        {
+          "command": ". /tmp/gesta-task-branch-and-land-hlenckz_/vars.sh 2>/dev/null || true\ngesta show main:notes.txt | sed -n 2p | grep -qx beta",
+          "exit_code": 0,
+          "seconds": 0.141,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": ". /tmp/gesta-task-branch-and-land-hlenckz_/vars.sh 2>/dev/null || true\ngesta fsck",
+          "exit_code": 0,
+          "seconds": 0.135,
+          "stdout_tail": "repository is consistent (2 object(s), 0 orphan(s))\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        }
+      ],
+      "note": ""
+    },
+    {
+      "task": "review-before-landing",
+      "tries": 1,
+      "outcome": "pass",
+      "steps": [
+        {
+          "command": "set -e\ngesta init\nmkdir -p src\nprintf 'export function parseConfig(raw) {\\n  return raw;\\n}\\n' > src/config.js\nprintf 'const c = require(\"./config\");\\nconst v = c.parseConfig(x);\\n' > src/main.js\nC=$(gesta changeset create \"add config\" --author setup --json | cs_id)\ngesta changeset commit $C\ngesta branch create risky\ngesta branch switch risky\nprintf 'export function readConfig(raw) {\\n  return raw;\\n}\\n' > src/config.js\nC=$(gesta changeset create \"rename parseConfig\" --author setup --json | cs_id)\ngesta changeset commit $C",
+          "exit_code": 0,
+          "seconds": 0.975,
+          "stdout_tail": "initialized repository at /tmp/gesta-task-review-before-landing-pc8p4bs_/repo/.gesta\nbranch: main (no changesets yet)\ncommitted cs379aaa4c3c93 on branch main (2 file(s))\ncreated branch risky from main at cs379aaa4c3c93\nswitched to branch risky (2 file(s) materialised, 0 removed, head cs379aaa4c3c93)\ncommitted cse42c95a12639 on branch risky (1 file(s))\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "set -e\ngesta review --json > report.json\nset > /tmp/gesta-task-review-before-landing-pc8p4bs_/vars.sh\n",
+          "exit_code": 0,
+          "seconds": 0.033,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        }
+      ],
+      "checks": [
+        {
+          "command": ". /tmp/gesta-task-review-before-landing-pc8p4bs_/vars.sh 2>/dev/null || true\ntest -f report.json",
+          "exit_code": 0,
+          "seconds": 0.001,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": ". /tmp/gesta-task-review-before-landing-pc8p4bs_/vars.sh 2>/dev/null || true\ngrep -q parseConfig report.json",
+          "exit_code": 0,
+          "seconds": 0.001,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": ". /tmp/gesta-task-review-before-landing-pc8p4bs_/vars.sh 2>/dev/null || true\ngrep -q 'src/main.js' report.json",
+          "exit_code": 0,
+          "seconds": 0.001,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        }
+      ],
+      "note": ""
+    },
+    {
+      "task": "undo-and-redo",
+      "tries": 1,
+      "outcome": "pass",
+      "steps": [
+        {
+          "command": "set -e\ngesta init\nprintf 'one\\n' > first.txt",
+          "exit_code": 0,
+          "seconds": 0.053,
+          "stdout_tail": "initialized repository at /tmp/gesta-task-undo-and-redo-uqqmgj42/repo/.gesta\nbranch: main (no changesets yet)\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "set -e\nprintf 'two\\n' > second.txt\nC=$(gesta changeset create \"add second\" --author solver --json | cs_id)\ngesta changeset commit $C\ngesta undo\ngesta redo\nset > /tmp/gesta-task-undo-and-redo-uqqmgj42/vars.sh\n",
+          "exit_code": 0,
+          "seconds": 0.319,
+          "stdout_tail": "committed cs07aafad34de4 on branch main (2 file(s))\nundid commit cs07aafad34de4 (operation 1, 0 file(s) written)\nredid commit cs07aafad34de4 (operation 1, 2 file(s) written)\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        }
+      ],
+      "checks": [
+        {
+          "command": ". /tmp/gesta-task-undo-and-redo-uqqmgj42/vars.sh 2>/dev/null || true\ntest -f second.txt",
+          "exit_code": 0,
+          "seconds": 0.001,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": ". /tmp/gesta-task-undo-and-redo-uqqmgj42/vars.sh 2>/dev/null || true\ngesta fsck",
+          "exit_code": 0,
+          "seconds": 0.054,
+          "stdout_tail": "repository is consistent (2 object(s), 0 orphan(s))\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        }
+      ],
+      "note": ""
+    },
+    {
+      "task": "stash-a-deletion",
+      "tries": 1,
+      "outcome": "pass",
+      "steps": [
+        {
+          "command": "set -e\ngesta init\nprintf 'keep\\n' > keep.txt\nprintf 'gone\\n' > gone.txt\nC=$(gesta changeset create \"seed\" --author setup --json | cs_id)\ngesta changeset commit $C\nrm gone.txt\nprintf 'new\\n' > added.txt",
+          "exit_code": 0,
+          "seconds": 0.18,
+          "stdout_tail": "initialized repository at /tmp/gesta-task-stash-a-deletion-gnkeze__/repo/.gesta\nbranch: main (no changesets yet)\ncommitted cs920b2ea65705 on branch main (2 file(s))\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "set -e\ngesta stash save > ../stash-log.txt 2>&1\ngesta stash pop\nset > /tmp/gesta-task-stash-a-deletion-gnkeze__/vars.sh\n",
+          "exit_code": 0,
+          "seconds": 0.089,
+          "stdout_tail": "applied stash 1 (2 file(s)): wip\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        }
+      ],
+      "checks": [
+        {
+          "command": ". /tmp/gesta-task-stash-a-deletion-gnkeze__/vars.sh 2>/dev/null || true\ntest -f added.txt",
+          "exit_code": 0,
+          "seconds": 0.001,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": ". /tmp/gesta-task-stash-a-deletion-gnkeze__/vars.sh 2>/dev/null || true\ntest ! -f gone.txt",
+          "exit_code": 0,
+          "seconds": 0.001,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": ". /tmp/gesta-task-stash-a-deletion-gnkeze__/vars.sh 2>/dev/null || true\ngesta show main:gone.txt | grep -qx gone",
+          "exit_code": 0,
+          "seconds": 0.031,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": ". /tmp/gesta-task-stash-a-deletion-gnkeze__/vars.sh 2>/dev/null || true\ntest \"$(gesta stash list 2>&1 | grep -c '^stash')\" -eq 0",
+          "exit_code": 0,
+          "seconds": 0.026,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": ". /tmp/gesta-task-stash-a-deletion-gnkeze__/vars.sh 2>/dev/null || true\ntest -s ../stash-log.txt",
+          "exit_code": 0,
+          "seconds": 0.001,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": ". /tmp/gesta-task-stash-a-deletion-gnkeze__/vars.sh 2>/dev/null || true\ngrep -q 'saved stash' ../stash-log.txt",
+          "exit_code": 0,
+          "seconds": 0.004,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": ". /tmp/gesta-task-stash-a-deletion-gnkeze__/vars.sh 2>/dev/null || true\ngesta fsck",
+          "exit_code": 0,
+          "seconds": 0.067,
+          "stdout_tail": "repository is consistent (3 object(s), 1 orphan(s))\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        }
+      ],
+      "note": ""
+    },
+    {
+      "task": "recover-with-brief",
+      "tries": 1,
+      "outcome": "pass",
+      "steps": [
+        {
+          "command": "set -e\ngesta init\nprintf 'work\\n' > work.txt\ngesta changeset create \"half done\" --author previous --json > /dev/null",
+          "exit_code": 0,
+          "seconds": 0.095,
+          "stdout_tail": "initialized repository at /tmp/gesta-task-recover-with-brief-j1hqe0xo/repo/.gesta\nbranch: main (no changesets yet)\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "set -e\ngesta brief\ngesta changeset commit-all\nset > /tmp/gesta-task-recover-with-brief-j1hqe0xo/vars.sh\n",
+          "exit_code": 0,
+          "seconds": 0.179,
+          "stdout_tail": "branch:   main\nhead:     (empty)\nnext:     commit-pending\nchanged:  1 file(s) differ from the head\npending:  cs37aff20453de\n\na pending changeset describes the disk: `gesta changeset commit <id>`, or discard it\ncommitted 1 changeset(s) (1 file(s))\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        }
+      ],
+      "checks": [
+        {
+          "command": ". /tmp/gesta-task-recover-with-brief-j1hqe0xo/vars.sh 2>/dev/null || true\n! gesta changeset list 2>/dev/null | grep -q 'half done'",
+          "exit_code": 0,
+          "seconds": 0.026,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": ". /tmp/gesta-task-recover-with-brief-j1hqe0xo/vars.sh 2>/dev/null || true\ngesta log --json | grep -q 'half done'",
+          "exit_code": 0,
+          "seconds": 0.027,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": ". /tmp/gesta-task-recover-with-brief-j1hqe0xo/vars.sh 2>/dev/null || true\ngesta fsck",
+          "exit_code": 0,
+          "seconds": 0.03,
+          "stdout_tail": "repository is consistent (1 object(s), 0 orphan(s))\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        }
+      ],
+      "note": ""
+    },
+    {
+      "task": "refuse-a-stale-landing",
+      "tries": 1,
+      "outcome": "pass",
+      "steps": [
+        {
+          "command": "set -e\ngesta init\nprintf 'one\\n' > a.txt\nC=$(gesta changeset create \"seed\" --author setup --json | cs_id)\ngesta changeset commit $C\ngesta branch create side\ngesta branch switch side\nprintf 'side\\n' > b.txt\nC=$(gesta changeset create \"side work\" --author setup --json | cs_id)\ngesta changeset commit $C\ngesta branch switch main\nprintf 'moved\\n' > c.txt\nC=$(gesta changeset create \"main moved\" --author setup --json | cs_id)\ngesta changeset commit $C",
+          "exit_code": 0,
+          "seconds": 0.656,
+          "stdout_tail": "initialized repository at /tmp/gesta-task-refuse-a-stale-landing-p3x28luw/repo/.gesta\nbranch: main (no changesets yet)\ncommitted cs50331da83e5a on branch main (1 file(s))\ncreated branch side from main at cs50331da83e5a\nswitched to branch side (1 file(s) materialised, 0 removed, head cs50331da83e5a)\ncommitted cscd4318781717 on branch side (1 file(s))\nswitched to branch main (1 file(s) materialised, 1 removed, head cs50331da83e5a)\ncommitted cs4508318c6170 on branch main (1 file(s))\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "set -e\n! gesta land side --onto main --expect deadbeef 2>attempt.txt\nset > /tmp/gesta-task-refuse-a-stale-landing-p3x28luw/vars.sh\n",
+          "exit_code": 0,
+          "seconds": 0.041,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        }
+      ],
+      "checks": [
+        {
+          "command": ". /tmp/gesta-task-refuse-a-stale-landing-p3x28luw/vars.sh 2>/dev/null || true\ntest -f attempt.txt",
+          "exit_code": 0,
+          "seconds": 0.001,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": ". /tmp/gesta-task-refuse-a-stale-landing-p3x28luw/vars.sh 2>/dev/null || true\ngrep -qi 'refus\\|moved\\|expect\\|no such' attempt.txt",
+          "exit_code": 0,
+          "seconds": 0.001,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": ". /tmp/gesta-task-refuse-a-stale-landing-p3x28luw/vars.sh 2>/dev/null || true\ngesta show main:c.txt | grep -qx moved",
+          "exit_code": 0,
+          "seconds": 0.032,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": ". /tmp/gesta-task-refuse-a-stale-landing-p3x28luw/vars.sh 2>/dev/null || true\ntest ! -f b.txt",
+          "exit_code": 0,
+          "seconds": 0.001,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        }
+      ],
+      "note": ""
+    },
+    {
+      "task": "binary-survives-a-clone",
+      "tries": 1,
+      "outcome": "pass",
+      "steps": [
+        {
+          "command": "set -e\ngesta init\npython3 -c \"open('blob.bin','wb').write(bytes(range(256)))\"",
+          "exit_code": 0,
+          "seconds": 0.064,
+          "stdout_tail": "initialized repository at /tmp/gesta-task-binary-survives-a-clone-r0p_3p3q/repo/.gesta\nbranch: main (no changesets yet)\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "set -e\nC=$(gesta changeset create \"add blob\" --author solver --json | cs_id)\ngesta changeset commit $C\nset > /tmp/gesta-task-binary-survives-a-clone-r0p_3p3q/vars.sh\n",
+          "exit_code": 0,
+          "seconds": 0.197,
+          "stdout_tail": "committed csec8a2b723d29 on branch main (1 file(s))\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        }
+      ],
+      "checks": [
+        {
+          "command": ". /tmp/gesta-task-binary-survives-a-clone-r0p_3p3q/vars.sh 2>/dev/null || true\nmd5sum blob.bin | cut -d' ' -f1 > want.txt",
+          "exit_code": 0,
+          "seconds": 0.002,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": ". /tmp/gesta-task-binary-survives-a-clone-r0p_3p3q/vars.sh 2>/dev/null || true\ngesta remote add origin $PWD/../mirror",
+          "exit_code": 0,
+          "seconds": 0.14,
+          "stdout_tail": "remote origin -> /tmp/gesta-task-binary-survives-a-clone-r0p_3p3q/repo/../mirror\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": ". /tmp/gesta-task-binary-survives-a-clone-r0p_3p3q/vars.sh 2>/dev/null || true\ngesta remote push origin --branch main",
+          "exit_code": 0,
+          "seconds": 0.18,
+          "stdout_tail": "created remote repository at /tmp/gesta-task-binary-survives-a-clone-r0p_3p3q/repo/../mirror\npushed 1 changeset(s) of main to origin (new, 0 object(s))\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": ". /tmp/gesta-task-binary-survives-a-clone-r0p_3p3q/vars.sh 2>/dev/null || true\ngesta remote clone $PWD/../mirror $PWD/../back",
+          "exit_code": 0,
+          "seconds": 0.151,
+          "stdout_tail": "cloned /tmp/gesta-task-binary-survives-a-clone-r0p_3p3q/repo/../mirror into /tmp/gesta-task-binary-survives-a-clone-r0p_3p3q/repo/../back (1 changeset(s), 1 file(s) on disk)\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": ". /tmp/gesta-task-binary-survives-a-clone-r0p_3p3q/vars.sh 2>/dev/null || true\nmd5sum ../back/blob.bin | cut -d' ' -f1 > got.txt",
+          "exit_code": 0,
+          "seconds": 0.002,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": ". /tmp/gesta-task-binary-survives-a-clone-r0p_3p3q/vars.sh 2>/dev/null || true\ncmp -s want.txt got.txt",
+          "exit_code": 0,
+          "seconds": 0.001,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": ". /tmp/gesta-task-binary-survives-a-clone-r0p_3p3q/vars.sh 2>/dev/null || true\ngesta fsck",
+          "exit_code": 0,
+          "seconds": 0.137,
+          "stdout_tail": "repository is consistent (2 object(s), 1 orphan(s))\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        }
+      ],
+      "note": ""
+    }
+  ]
+}

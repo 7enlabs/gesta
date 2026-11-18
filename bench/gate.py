@@ -2164,6 +2164,35 @@ def main():
             f"exit={rc} {out[-160:]}",
         )
 
+    if want("harness"):
+        # The harness measures whether the tool can be used, which the other steps do not: they
+        # call the binary directly and never ask what a person or an agent would do with it.
+        import shutil as _shh
+
+        binpath = _shh.which("gesta") or os.path.join(os.getcwd(), "target", "release", "gesta")
+        env_prefix = f"GESTA_BIN={binpath} "
+
+        rc, out = sh(f"cd bench/harness && {env_prefix}python3 test_harness.py", timeout=300)
+        record(
+            "the harness passes its own tests",
+            rc == 0 and "every harness test passes" in out,
+            out[-400:],
+        )
+
+        rc, out = sh(f"cd bench/harness && {env_prefix}python3 run.py --selftest", timeout=600)
+        record(
+            "no task passes its checks without the work being done",
+            rc == 0 and "distinguishes work from no work" in out,
+            out[-600:],
+        )
+
+        rc, out = sh(f"cd bench/harness && {env_prefix}python3 run.py", timeout=900)
+        record(
+            "the reference answer passes every task",
+            rc == 0 and "pass: 8" in out,
+            out[-600:],
+        )
+
     if want("suites"):
         suites = [
             "e2e", "http_remote", "http_auth", "mcp_json", "api_changeset",

@@ -515,12 +515,17 @@ Measured on a 558 KB file edited one line fifty times: 1,504 KB before, 692 KB a
 
 ## Release gate
 
-`bench/gate.py` is the single command that decides whether a version may be published. Forty steps, each a real command with a real exit code:
+`bench/gate.py` is the single command that decides whether a version may be published. Each step is a real command with a real exit code:
 
 ```bash
 python3 bench/gate.py            # all steps
 python3 bench/gate.py audit      # one step
 ```
+
+Three outcomes, three exit codes: every check passed, a check failed, or a check did not run. A
+step name that matches nothing is refused with a suggestion rather than selecting an empty set, and
+a check whose tool is missing is reported as a check that did not run instead of as a pass. A gate
+that cannot tell "verified" from "not examined" reports on work nobody did.
 
 | Step | Fails when |
 |---|---|
@@ -536,6 +541,7 @@ python3 bench/gate.py audit      # one step
 | sql | SQL is assembled with `format!` outside the one placeholder helper |
 | suites | any of the nine end to end suites fails |
 | bughunter | an adversarial scenario fails |
+| harness | a task passes without the work being done, or the reference answer fails |
 
 Two of these exist because the first run of the gate found a real defect, which is the point of having it.
 
@@ -591,6 +597,33 @@ An earlier version of `status` and `changeset create` asked for the committed ha
 Disk usage, 21 versions of a 42 KB file edited one line at a time: 256 KB against git's 79 KB, so 3.26x. Before compression it was 8.9x. A tree of 1,000 tiny files costs 6.08x git, because per-row overhead dominates when each object is a few dozen bytes. Both numbers are from `bench/size_compare.py`, reading the binary from the container's own disk.
 
 `blame` does not slow down as history grows. It reads the precomputed table instead of replaying versions.
+
+## Usage harness
+
+`bench/harness` measures whether a person or an agent can do a day of version-control work with
+gesta, rather than whether a command returns a number.
+
+```bash
+python3 bench/harness/run.py             # every task
+python3 bench/harness/run.py --task tags # one task, and nothing if the name is wrong
+python3 bench/harness/run.py --selftest  # does any check pass without the work?
+```
+
+Every task carries a goal, a setup that builds a starting repository, a reference answer, and
+checks. The reference answer is what makes the checks meaningful: a check that has never been
+passed cannot be told apart from a broken one. `--selftest` is the other half, running each setup
+with no work done and requiring that not every check passes, because a check that always passes
+measures agreement with itself.
+
+A task ends as passed, failed, timed out, or broken, and the last two are recorded as their own
+outcomes. A run stopped by a clock says nothing about the work, and scoring it as a wrong answer
+blames the tool for the budget.
+
+Commands run in a scrubbed environment: an allowlist plus an explicit list, with a secret-shaped
+name dropped even when listed. Credentials are not on either list.
+
+Writing this found three checks that performed the goal instead of verifying it, and one stash task
+that could not tell its result from its starting state. See `docs/harness.md`.
 
 ## Limitations
 

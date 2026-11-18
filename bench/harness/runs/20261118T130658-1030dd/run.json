@@ -1,0 +1,403 @@
+{
+  "summary": {
+    "run_id": "20261118T130658-1030dd",
+    "gesta": "ge_h",
+    "k": 1,
+    "mode": "sequential",
+    "seed": 0,
+    "tasks": 8,
+    "outcomes": {
+      "error": 7,
+      "pass": 1
+    },
+    "unfinished": 0,
+    "complete": true
+  },
+  "attempts": [
+    {
+      "task": "first-commit",
+      "tries": 1,
+      "outcome": "error",
+      "steps": [
+        {
+          "command": "gesta init",
+          "exit_code": 0,
+          "seconds": 0.024,
+          "stdout_tail": "initialized repository at /tmp/gesta-task-first-commit-qmhaxdgd/repo/.gesta\nbranch: main (no changesets yet)\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "printf 'alpha\\n' > notes.txt",
+          "exit_code": 0,
+          "seconds": 0.001,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "C=$(gesta changeset create \"add notes\" --author solver --json | cs_id)",
+          "exit_code": 0,
+          "seconds": 0.014,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "gesta changeset commit $C",
+          "exit_code": 2,
+          "seconds": 0.002,
+          "stdout_tail": "",
+          "stderr_tail": "error: the following required arguments were not provided:\n  <ID>\n\nUsage: gesta changeset commit <ID>\n\nFor more information, try '--help'.\n",
+          "stop_reason": ""
+        }
+      ],
+      "checks": [],
+      "note": "the reference answer failed at: gesta changeset commit $C\nerror: the following required arguments were not provided:\n  <ID>\n\nUsage: gesta changeset commit <ID>\n\nFor more information, try '--help'.\n"
+    },
+    {
+      "task": "branch-and-land",
+      "tries": 1,
+      "outcome": "error",
+      "steps": [
+        {
+          "command": "gesta init",
+          "exit_code": 0,
+          "seconds": 0.021,
+          "stdout_tail": "initialized repository at /tmp/gesta-task-branch-and-land-u4fl2z5o/repo/.gesta\nbranch: main (no changesets yet)\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "printf 'one\\ntwo\\n' > notes.txt",
+          "exit_code": 0,
+          "seconds": 0.001,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "C=$(gesta changeset create \"seed\" --author setup --json | cs_id)",
+          "exit_code": 0,
+          "seconds": 0.013,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "gesta changeset commit $C",
+          "exit_code": 2,
+          "seconds": 0.002,
+          "stdout_tail": "",
+          "stderr_tail": "error: the following required arguments were not provided:\n  <ID>\n\nUsage: gesta changeset commit <ID>\n\nFor more information, try '--help'.\n",
+          "stop_reason": ""
+        }
+      ],
+      "checks": [],
+      "note": "setup failed at: gesta changeset commit $C\nerror: the following required arguments were not provided:\n  <ID>\n\nUsage: gesta changeset commit <ID>\n\nFor more information, try '--help'.\n"
+    },
+    {
+      "task": "review-before-landing",
+      "tries": 1,
+      "outcome": "error",
+      "steps": [
+        {
+          "command": "gesta init",
+          "exit_code": 0,
+          "seconds": 0.022,
+          "stdout_tail": "initialized repository at /tmp/gesta-task-review-before-landing-17pfrfrv/repo/.gesta\nbranch: main (no changesets yet)\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "mkdir -p src",
+          "exit_code": 0,
+          "seconds": 0.002,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "printf 'export function parseConfig(raw) {\\n  return raw;\\n}\\n' > src/config.js",
+          "exit_code": 0,
+          "seconds": 0.001,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "printf 'const c = require(\"./config\");\\nconst v = c.parseConfig(x);\\n' > src/main.js",
+          "exit_code": 0,
+          "seconds": 0.001,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "C=$(gesta changeset create \"add config\" --author setup --json | cs_id)",
+          "exit_code": 0,
+          "seconds": 0.014,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "gesta changeset commit $C",
+          "exit_code": 2,
+          "seconds": 0.002,
+          "stdout_tail": "",
+          "stderr_tail": "error: the following required arguments were not provided:\n  <ID>\n\nUsage: gesta changeset commit <ID>\n\nFor more information, try '--help'.\n",
+          "stop_reason": ""
+        }
+      ],
+      "checks": [],
+      "note": "setup failed at: gesta changeset commit $C\nerror: the following required arguments were not provided:\n  <ID>\n\nUsage: gesta changeset commit <ID>\n\nFor more information, try '--help'.\n"
+    },
+    {
+      "task": "undo-and-redo",
+      "tries": 1,
+      "outcome": "error",
+      "steps": [
+        {
+          "command": "gesta init",
+          "exit_code": 0,
+          "seconds": 0.021,
+          "stdout_tail": "initialized repository at /tmp/gesta-task-undo-and-redo-uc3u0izj/repo/.gesta\nbranch: main (no changesets yet)\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "printf 'one\\n' > first.txt",
+          "exit_code": 0,
+          "seconds": 0.001,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "printf 'two\\n' > second.txt",
+          "exit_code": 0,
+          "seconds": 0.001,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "C=$(gesta changeset create \"add second\" --author solver --json | cs_id)",
+          "exit_code": 0,
+          "seconds": 0.013,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "gesta changeset commit $C",
+          "exit_code": 2,
+          "seconds": 0.002,
+          "stdout_tail": "",
+          "stderr_tail": "error: the following required arguments were not provided:\n  <ID>\n\nUsage: gesta changeset commit <ID>\n\nFor more information, try '--help'.\n",
+          "stop_reason": ""
+        }
+      ],
+      "checks": [],
+      "note": "the reference answer failed at: gesta changeset commit $C\nerror: the following required arguments were not provided:\n  <ID>\n\nUsage: gesta changeset commit <ID>\n\nFor more information, try '--help'.\n"
+    },
+    {
+      "task": "stash-a-deletion",
+      "tries": 1,
+      "outcome": "error",
+      "steps": [
+        {
+          "command": "gesta init",
+          "exit_code": 0,
+          "seconds": 0.027,
+          "stdout_tail": "initialized repository at /tmp/gesta-task-stash-a-deletion-w94xhi8f/repo/.gesta\nbranch: main (no changesets yet)\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "printf 'keep\\n' > keep.txt",
+          "exit_code": 0,
+          "seconds": 0.002,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "printf 'gone\\n' > gone.txt",
+          "exit_code": 0,
+          "seconds": 0.003,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "C=$(gesta changeset create \"seed\" --author setup --json | cs_id)",
+          "exit_code": 0,
+          "seconds": 0.015,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "gesta changeset commit $C",
+          "exit_code": 2,
+          "seconds": 0.003,
+          "stdout_tail": "",
+          "stderr_tail": "error: the following required arguments were not provided:\n  <ID>\n\nUsage: gesta changeset commit <ID>\n\nFor more information, try '--help'.\n",
+          "stop_reason": ""
+        }
+      ],
+      "checks": [],
+      "note": "setup failed at: gesta changeset commit $C\nerror: the following required arguments were not provided:\n  <ID>\n\nUsage: gesta changeset commit <ID>\n\nFor more information, try '--help'.\n"
+    },
+    {
+      "task": "recover-with-brief",
+      "tries": 1,
+      "outcome": "pass",
+      "steps": [
+        {
+          "command": "gesta init",
+          "exit_code": 0,
+          "seconds": 0.025,
+          "stdout_tail": "initialized repository at /tmp/gesta-task-recover-with-brief-k5ov5v8v/repo/.gesta\nbranch: main (no changesets yet)\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "printf 'work\\n' > work.txt",
+          "exit_code": 0,
+          "seconds": 0.001,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "gesta changeset create \"half done\" --author previous --json > /dev/null",
+          "exit_code": 0,
+          "seconds": 0.013,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "gesta brief",
+          "exit_code": 0,
+          "seconds": 0.012,
+          "stdout_tail": "branch:   main\nhead:     (empty)\nnext:     commit-pending\nchanged:  1 file(s) differ from the head\npending:  csc05eb9163324\n\na pending changeset describes the disk: `gesta changeset commit <id>`, or discard it\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "gesta changeset commit-all",
+          "exit_code": 0,
+          "seconds": 0.012,
+          "stdout_tail": "committed 1 changeset(s) (1 file(s))\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        }
+      ],
+      "checks": [
+        {
+          "command": "gesta log --json | grep -q 'half done'",
+          "exit_code": 0,
+          "seconds": 0.003,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "gesta fsck",
+          "exit_code": 0,
+          "seconds": 0.002,
+          "stdout_tail": "repository is consistent (1 object(s), 0 orphan(s))\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        }
+      ],
+      "note": ""
+    },
+    {
+      "task": "refuse-a-stale-landing",
+      "tries": 1,
+      "outcome": "error",
+      "steps": [
+        {
+          "command": "gesta init",
+          "exit_code": 0,
+          "seconds": 0.021,
+          "stdout_tail": "initialized repository at /tmp/gesta-task-refuse-a-stale-landing-00o0vle1/repo/.gesta\nbranch: main (no changesets yet)\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "printf 'one\\n' > a.txt",
+          "exit_code": 0,
+          "seconds": 0.001,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "C=$(gesta changeset create \"seed\" --author setup --json | cs_id)",
+          "exit_code": 0,
+          "seconds": 0.012,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "gesta changeset commit $C",
+          "exit_code": 2,
+          "seconds": 0.002,
+          "stdout_tail": "",
+          "stderr_tail": "error: the following required arguments were not provided:\n  <ID>\n\nUsage: gesta changeset commit <ID>\n\nFor more information, try '--help'.\n",
+          "stop_reason": ""
+        }
+      ],
+      "checks": [],
+      "note": "setup failed at: gesta changeset commit $C\nerror: the following required arguments were not provided:\n  <ID>\n\nUsage: gesta changeset commit <ID>\n\nFor more information, try '--help'.\n"
+    },
+    {
+      "task": "binary-survives-a-clone",
+      "tries": 1,
+      "outcome": "error",
+      "steps": [
+        {
+          "command": "gesta init",
+          "exit_code": 0,
+          "seconds": 0.019,
+          "stdout_tail": "initialized repository at /tmp/gesta-task-binary-survives-a-clone-swo74afn/repo/.gesta\nbranch: main (no changesets yet)\n",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "python3 -c \"open('blob.bin','wb').write(bytes(range(256)))\"",
+          "exit_code": 0,
+          "seconds": 0.011,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "C=$(gesta changeset create \"add blob\" --author solver --json | cs_id)",
+          "exit_code": 0,
+          "seconds": 0.013,
+          "stdout_tail": "",
+          "stderr_tail": "",
+          "stop_reason": ""
+        },
+        {
+          "command": "gesta changeset commit $C",
+          "exit_code": 2,
+          "seconds": 0.002,
+          "stdout_tail": "",
+          "stderr_tail": "error: the following required arguments were not provided:\n  <ID>\n\nUsage: gesta changeset commit <ID>\n\nFor more information, try '--help'.\n",
+          "stop_reason": ""
+        }
+      ],
+      "checks": [],
+      "note": "the reference answer failed at: gesta changeset commit $C\nerror: the following required arguments were not provided:\n  <ID>\n\nUsage: gesta changeset commit <ID>\n\nFor more information, try '--help'.\n"
+    }
+  ]
+}
