@@ -97,10 +97,27 @@ pub fn tool_definitions() -> Json {
         ),
         tool(
             "gesta_brief",
-            "Everything a session needs before its first edit, in one call: branch, head, whether a rebase or merge stopped, pending changesets, stale snapshots, stashes and how many files differ from the head. Start here.",
+            "Everything a session needs before its first edit, in one call: branch, head, whether a rebase or merge stopped, pending changesets, stale snapshots, stashes and how many files differ from the head. Start here. Read only: to act, call gesta_fix.",
             Json::obj(vec![
                 ("type", Json::str("object")),
                 ("properties", Json::obj(vec![])),
+            ]),
+        ),
+        tool(
+            "gesta_fix",
+            "Do the safe part of what gesta_brief reports: commit a snapshot that matches the disk exactly, and drop one the disk has moved past. Refuses a stopped rebase, an unresolved conflict, or uncommitted work no snapshot describes, naming the command instead. Set stash to true to set uncommitted work aside rather than refuse it.",
+            Json::obj(vec![
+                ("type", Json::str("object")),
+                (
+                    "properties",
+                    Json::obj(vec![(
+                        "stash",
+                        Json::obj(vec![
+                            ("type", Json::str("boolean")),
+                            ("description", Json::str("Set uncommitted work aside as a stash instead of refusing it.")),
+                        ]),
+                    )]),
+                ),
             ]),
         ),
         tool(
@@ -273,6 +290,7 @@ fn call_tool(root: &Path, params: &Json) -> Result<Json, ToolError> {
 
     let value = match name {
         "gesta_brief" => tool_brief(&conn, root),
+        "gesta_fix" => tool_fix(&conn, root, &args),
         "gesta_grep" => tool_grep(&conn, root, &args),
         "gesta_status" => tool_status(&conn),
         "gesta_log" => tool_log(&conn, &args),
@@ -320,6 +338,19 @@ fn arg_str(args: &Json, key: &str) -> Option<String> {
 fn tool_brief(conn: &Connection, root: &Path) -> Result<Json, String> {
     let b = crate::brief::brief(conn, root).map_err(|e| e.to_string())?;
     Ok(crate::brief::to_json(&b))
+}
+
+fn tool_fix(conn: &Connection, root: &Path, args: &Json) -> Result<Json, String> {
+    let stash = field(args, "stash").and_then(json::as_bool).unwrap_or(false);
+    let fixed = crate::brief::fix_with(
+        conn,
+        root,
+        crate::brief::Options {
+            stash_uncommitted: stash,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(crate::brief::fixed_to_json(&fixed))
 }
 
 fn tool_grep(conn: &Connection, root: &Path, args: &Json) -> Result<Json, String> {

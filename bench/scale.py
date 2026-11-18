@@ -66,10 +66,13 @@ def main():
     global GESTA
     if not os.path.exists(GESTA):
         sys.exit(f"binary not found: {GESTA}")
+    # Copy the binary off the working directory: reading an executable from a bind mount costs
+    # about 16 ms per run on this setup, which is larger than the work being measured. The copy
+    # is refreshed every run, because keeping a stale one measures the previous build and
+    # reports it as the current one.
     local = "/tmp/gesta_scale_bin"
-    if not os.path.exists(local):
-        shutil.copy2(GESTA, local)
-        os.chmod(local, 0o755)
+    shutil.copy2(GESTA, local)
+    os.chmod(local, 0o755)
     GESTA = local
 
     shutil.rmtree(ROOT, ignore_errors=True)

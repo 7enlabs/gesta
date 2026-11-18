@@ -388,6 +388,10 @@ An empty scope means every path. A pattern without a slash matches the file name
 | `gesta_read_file` | file content at a changeset or branch, without a checkout |
 | `gesta_blame` | one entry per line: line number, changeset, author |
 | `gesta_diff` | structured hunks for a changeset, or the working tree |
+| `gesta_merge_conflicts` | what merging a branch would conflict on, without touching anything |
+| `gesta_brief` | branch, head, next state, pending, stale snapshots, stashes |
+| `gesta_fix` | commits a matching snapshot, drops a stale one, or sets work aside |
+| `gesta_grep` | text in the working tree, or in every recorded version |
 | `gesta_create_changeset` | a pending changeset from the working tree |
 | `gesta_commit` | commits a pending changeset, moves the head |
 

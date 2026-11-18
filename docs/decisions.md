@@ -20,7 +20,7 @@ without its mistakes reads as if it were obvious.
 
 | # | Decision | Reason |
 |---|---|---|
-| C1 | `set_branch_head` updates the branch tree incrementally from the changeset's own file list. | Rebuilding the whole tree per commit measured 24 ms at 500 files and 67 ms at 8000. That is O(repository) on the one operation an agent does most. |
+| C1 | `set_branch_head` updates the branch tree incrementally from the changeset's own file list. | Rebuilding the whole tree per commit measured 24 ms at 500 files and 67 ms at 8000. That is O(repository) on the one operation an agent does most. Measured again after the change, with the binary copied off the working directory: a one file commit went from 29.3 ms at 500 files to 53.9 ms at 8000, which is 1.84x for a repository 16 times larger. |
 | C2 | The incremental path falls back to a rebuild when the changeset's parent is not the previous head. | Merge, undo and remote apply all re-parent. Updating incrementally across a re-parent would silently write a wrong tree. |
 | C3 | Deltas are capped at a chain of 16. | An unbounded chain makes a read walk the whole history. The cap bounds a read and keeps the compression that matters. |
 | C4 | `status` reads a maintained table instead of rebuilding the committed tree. | Rebuilding cost about 2 ms on 2000 files, on every `status` and every `diff`. |
@@ -93,6 +93,8 @@ These cost more time than the decisions above, so they stay written down.
 | M4 | Four tests shared one temporary directory because the name used the process id. | A fixture that collides across threads produces failures that look like product defects. |
 | M5 | An investigation blamed a traversal and a diff function for missing files; both were innocent. | Check the fixture before believing the diagnosis. `status --json` on a clean fixture settled it in one call. |
 | M6 | `--branch main` was used with `cargo install --git`, which fails because the remote has no such tracking ref. | Run the installer from the published URL, not from a checkout. Three defects only appeared that way. |
+| M7 | `bench/scale.py` kept the first binary it copied to `/tmp` and reused it on every later run. | A benchmark that reuses a stale copy measures the previous build and reports it as the current one. The copy is refreshed every run now, and the numbers above are from a correct run. |
+| M8 | Timing the binary in place added about 16 ms per run, because it lives on a bind mount. | Read an executable from the container's own disk before timing it. The mount cost was larger than the work being measured, and it looked exactly like slow code. |
 
 ## Not done, and why
 

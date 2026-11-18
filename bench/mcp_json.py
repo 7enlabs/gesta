@@ -120,6 +120,61 @@ def check_schema_version():
     for r in responses:
         if r.get("id") == 1:
             got = (r.get("result") or {}).get("structuredContent") or {}
+    # The whole loop has to be reachable over the protocol: read, then act.
+    responses, _err = mcp_session(d, [
+        {"jsonrpc": "2.0", "id": 10, "method": "tools/call",
+         "params": {"name": "gesta_brief", "arguments": {}}},
+    ])
+    got = {}
+    for r in responses:
+        if r.get("id") == 10:
+            got = (r.get("result") or {}).get("structuredContent") or {}
+    record(
+        "gesta_brief tells the caller what to do next",
+        isinstance(got, dict) and got.get("next") in (
+            "ready", "commit-work", "commit-pending", "finish-rebase"
+        ),
+        str(got)[:160],
+    )
+
+    # A snapshot that matches the disk: gesta_fix commits it without a shell.
+    write(d, "a.txt", "second\n")
+    run("changeset", "create", "snap", "--author", "agent", cwd=d)
+    responses, _err = mcp_session(d, [
+        {"jsonrpc": "2.0", "id": 11, "method": "tools/call",
+         "params": {"name": "gesta_fix", "arguments": {}}},
+    ])
+    fixed = {}
+    for r in responses:
+        if r.get("id") == 11:
+            fixed = (r.get("result") or {}).get("structuredContent") or {}
+    after = json.loads(run("brief", "--json", cwd=d)[1] or "{}")
+    record(
+        "gesta_fix commits a snapshot that matches the disk, over the protocol",
+        isinstance(fixed, dict) and len(fixed.get("committed") or []) == 1
+        and after.get("next") == "ready",
+        f"{fixed} then next={after.get('next')}",
+    )
+
+    # Uncommitted work with no snapshot must be refused, with the edit left alone.
+    write(d, "a.txt", "third\n")
+    responses, _err = mcp_session(d, [
+        {"jsonrpc": "2.0", "id": 12, "method": "tools/call",
+         "params": {"name": "gesta_fix", "arguments": {}}},
+    ])
+    refused = {}
+    for r in responses:
+        if r.get("id") == 12:
+            refused = (r.get("result") or {}).get("structuredContent") or {}
+    on_disk = open(os.path.join(d, "a.txt")).read()
+    record(
+        "gesta_fix refuses uncommitted work and leaves the file alone",
+        isinstance(refused, dict) and refused.get("skipped")
+        and not refused.get("committed")
+        and on_disk == "third\n",
+        f"{refused} disk={on_disk!r}",
+    )
+
     record(
         "an MCP tool result names its schema too",
         isinstance(got, dict) and got.get("schema") == "gesta@1",
