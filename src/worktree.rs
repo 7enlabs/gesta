@@ -348,9 +348,15 @@ impl IgnoreRules {
         // and a test asserts the two agree.
         let bytes = path.as_bytes();
         for d in &self.anchored_dirs {
-            if bytes.len() >= d.len()
-                && &path[..d.len()] == d.as_str()
-                && (bytes.len() == d.len() || bytes[d.len()] == b'/')
+            let dl = d.len();
+            // Slicing a str by a byte count lands inside a character when the path holds one
+            // outside ASCII, and a Vietnamese file name panicked the whole scan. The byte check
+            // is the only thing that can answer "is this prefix ASCII", and the str comparison
+            // then runs on a boundary that is known to be one.
+            if bytes.len() >= dl
+                && path.is_char_boundary(dl)
+                && &path[..dl] == d.as_str()
+                && (bytes.len() == dl || bytes[dl] == b'/')
             {
                 return true;
             }
@@ -821,5 +827,26 @@ mod tests {
         assert!(rules.is_ignored(".gesta/x", false));
         assert!(!rules.is_ignored(".gestax", false));
         assert!(!rules.is_ignored(".gestax/y", false));
+    }
+    #[test]
+    fn a_vietnamese_path_does_not_panic_the_ignore_matcher() {
+        let rules = IgnoreRules::with_defaults(&[]);
+        // "Node" is six bytes of an anchored directory, and the fourth byte of this path is the
+        // middle of a three byte character. Slicing by that count panicked the whole scan.
+        let path = "nồ.md/file.md";
+        assert!(!rules.is_ignored(path, false), "a plain path was ignored");
+        assert!(!rules.is_ignored("tài-liệu/ghi-chú.md", false));
+        assert!(!rules.is_ignored("ồ", false));
+    }
+
+    #[test]
+    fn an_anchored_directory_still_matches_under_a_plain_prefix() {
+        // The anchored shape is `/name/`, which is what turns the match into a prefix test.
+        let rules = IgnoreRules::new(vec!["/target/".to_string()]);
+        assert!(rules.is_ignored("target/debug/x", false));
+        assert!(!rules.is_ignored("targets/x", false), "a longer name matched the prefix");
+        assert!(!rules.is_ignored("src/target/x", false), "a nested one matched an anchored rule");
+        // And a non-ASCII path in front of it must not trip the byte slice.
+        assert!(!rules.is_ignored("tồ/target/x", false));
     }
 }

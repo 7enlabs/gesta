@@ -413,6 +413,47 @@ def main():
             why2 = f"a quote in a path broke the JSON: {exc}: {quoted[1][:80]!r}"
         record("a quote in a message does not break the JSON", ok2, why2)
 
+    if want("unicode"):
+        # A repository of Vietnamese file names is this machine's real workload, and a byte
+        # slice in the ignore matcher panicked the whole scan on it. The check has to run the
+        # real binary on a real tree, not a unit fixture.
+        import tempfile as _tf
+        d = _tf.mkdtemp()
+        os.makedirs(os.path.join(d, "tài-liệu"), exist_ok=True)
+        os.makedirs(os.path.join(d, "nguồn"), exist_ok=True)
+        for rel in ["tài-liệu/ghi-chú.md", "nguồn/bản-sinh.md", "nồ.md", "ồ.md"]:
+            with open(os.path.join(d, rel), "w", encoding="utf-8") as fh:
+                fh.write("nội dung tiếng Việt\n")
+        sh(f"{ZF} init", cwd=d)
+        made = sh(f"{ZF} changeset create snapshot --author t", cwd=d)
+        record(
+            "a tree of non-ASCII names does not crash the scanner",
+            made[0] == 0,
+            (made[1] or "")[:200],
+        )
+        m = re.search(r"(cs[0-9a-f]+)", made[1] or "")
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+        st = sh(f"{ZF} status", cwd=d)
+        record(
+            "and status still answers on it",
+            st[0] == 0,
+            (st[1] or "")[:200],
+        )
+        # The file has to be readable back, which proves the name survived the round trip.
+        body = sh(f'{ZF} show "main:tài-liệu/ghi-chú.md"', cwd=d)
+        record(
+            "a non-ASCII path reads back with its content",
+            body[0] == 0 and "nội dung" in (body[1] or ""),
+            (body[1] or "")[:160],
+        )
+        check = sh(f"{ZF} fsck", cwd=d)
+        record(
+            "and the store stays consistent",
+            check[0] == 0 and "consistent" in (check[1] or ""),
+            (check[1] or "")[:160],
+        )
+
     if want("gc"):
         # A repository that only grows is a repository that gets slower and bigger forever. The
         # check plants an object nothing references and asks gc to remove exactly that one.
