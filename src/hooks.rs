@@ -23,7 +23,13 @@ use std::process::Command;
 use crate::{bad, repo_dir, ZResult};
 
 /// Hooks this program knows how to run.
-pub const HOOKS: &[&str] = &["pre-commit", "post-commit"];
+/// The hook points a repository can install.
+///
+/// `pre-land` exists because landing a branch onto a shared target is the moment a change stops
+/// being private, and it is the last point where a failing suite costs one person instead of
+/// everybody. A commit hook runs per commit, which is too often to run a full suite and too early
+/// to know whether the branch is going anywhere.
+pub const HOOKS: &[&str] = &["pre-commit", "post-commit", "pre-land"];
 
 /// Directory that holds hook programs, inside the repository directory.
 pub fn hooks_dir(root: &Path) -> PathBuf {

@@ -1661,9 +1661,20 @@ pub fn review_stack(
     let head = crate::store::resolve_rev(conn, to)?
         .ok_or_else(|| bad(format!("no such revision: {}", to)))?;
 
-    // Collect the chain oldest first, stopping at `from`.
+    // Collect the chain oldest first, stopping at the point the two branches parted.
+    //
+    // Comparing against `from`'s own head stops only when the branch happens to contain that
+    // exact changeset, so reviewing a feature against a main that has moved one commit includes
+    // every changeset main already has. The merge base is the commit both sides share, which is
+    // the boundary a review actually means.
     let stop = match from {
-        Some(f) => crate::store::resolve_rev(conn, f)?,
+        Some(f) => {
+            let from_head = crate::store::resolve_rev(conn, f)?;
+            match from_head {
+                Some(fh) => crate::store::merge_base(conn, &head, &fh)?,
+                None => None,
+            }
+        }
         None => None,
     };
     let mut chain: Vec<String> = Vec::new();
@@ -1720,6 +1731,10 @@ pub fn land_branch(
     expected_target_head: Option<&str>,
     author: &str,
 ) -> ZResult<MergeOutcome> {
+    // Before anything moves: a landing is when the change stops being private. A refusal here
+    // leaves both branches untouched, which is the only outcome that costs nothing to undo.
+    crate::hooks::run(root, "pre-land", &[source, target])?;
+
     let current = branch_head(conn, target)?;
     if current.as_deref() != expected_target_head {
         // The tree is not damaged and the request is not wrong: it is out of date against

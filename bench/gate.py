@@ -966,6 +966,91 @@ def main():
             ok, why = False, f"not JSON: {exc}"
         record("ignore why --json carries the rule, the source and the schema", ok, why)
 
+    if want("base-and-gate"):
+        # Two things a review needs to be trustworthy. First, comparing against a branch that has
+        # moved must not include the history both sides already share. Second, a landing is the
+        # last moment a failing suite costs one person instead of everybody.
+        import tempfile as _tf
+        d = _tf.mkdtemp()
+        sh(f"{ZF} init", cwd=d)
+        with open(os.path.join(d, "a.txt"), "w") as fh:
+            fh.write("base\n")
+        sh(f'{ZF} changeset create "base" --author t', cwd=d)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=d)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+
+        sh(f"{ZF} branch create feat", cwd=d)
+        sh(f"{ZF} branch switch feat", cwd=d)
+        with open(os.path.join(d, "a.txt"), "w") as fh:
+            fh.write("base\nfeature line\n")
+        sh(f'{ZF} changeset create "the feature" --author t', cwd=d)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=d)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+
+        # main moves on with a file of its own.
+        sh(f"{ZF} branch switch main", cwd=d)
+        with open(os.path.join(d, "main-new.txt"), "w") as fh:
+            fh.write("main only\n")
+        sh(f'{ZF} changeset create "unrelated on main" --author t', cwd=d)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=d)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+
+        sh(f"{ZF} branch switch feat", cwd=d)
+        review = sh(f"{ZF} review --from main", cwd=d)
+        body = review[1] or ""
+        record(
+            "review --from a moved branch shows only this branch's work",
+            "1 step(s) shown" in body and "the feature" in body,
+            body[:300],
+        )
+        record(
+            "and it does not repeat the shared history",
+            "base" not in body.split("1 step(s)")[0].replace("the feature", ""),
+            body[:300],
+        )
+        record(
+            "the unrelated file on main is not reported as a deletion",
+            "main-new.txt" not in body,
+            body[:300],
+        )
+
+        # A failing pre-land hook must refuse the landing and leave the target where it was.
+        os.makedirs(os.path.join(d, ".gesta", "hooks"), exist_ok=True)
+        hook = os.path.join(d, ".gesta", "hooks", "pre-land")
+        with open(hook, "w") as fh:
+            fh.write("#!/bin/sh\necho 'suite failed: 2 tests red' >&2\nexit 1\n")
+        os.chmod(hook, 0o755)
+        sh(f"{ZF} branch switch main", cwd=d)
+        before = sh(f"{ZF} branch info main", cwd=d)[1] or ""
+        landed = sh(f"{ZF} land feat --onto main", cwd=d)
+        after = sh(f"{ZF} branch info main", cwd=d)[1] or ""
+        record(
+            "a failing pre-land hook refuses the landing",
+            landed[0] != 0 and "pre-land" in (landed[1] or ""),
+            (landed[1] or "")[:240],
+        )
+        record(
+            "and the target branch did not move",
+            before == after,
+            f"{before[:80]} vs {after[:80]}",
+        )
+        record(
+            "the hook's own message reaches the reader",
+            "2 tests red" in (landed[1] or ""),
+            (landed[1] or "")[:240],
+        )
+
+        os.remove(hook)
+        ok = sh(f"{ZF} land feat --onto main", cwd=d)
+        record(
+            "with the hook gone the landing goes through",
+            ok[0] == 0 and "landed" in (ok[1] or ""),
+            (ok[1] or "")[:200],
+        )
+
     if want("gc"):
         # A repository that only grows is a repository that gets slower and bigger forever. The
         # check plants an object nothing references and asks gc to remove exactly that one.
