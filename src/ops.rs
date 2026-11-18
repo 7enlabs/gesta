@@ -477,4 +477,42 @@ mod tests {
         assert!(err.to_string().contains("nothing to redo"), "got: {}", err);
         let _ = std::fs::remove_dir_all(&dir);
     }
+    /// Undoing the first changeset of a branch leaves an empty branch, and the disk has to
+    /// follow it to empty. It did not: every tracked file stayed, and `status` reported them as
+    /// new files, which reads as if the undo had done nothing.
+    #[test]
+    fn undo_to_an_empty_branch_removes_the_files_the_tree_no_longer_names() {
+        let conn = mem_db();
+        let dir = std::env::temp_dir().join(format!("gesta-undo-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("d")).unwrap();
+        std::fs::write(dir.join("a.txt"), "v1\n").unwrap();
+        std::fs::write(dir.join("d").join("b.txt"), "v2\n").unwrap();
+
+        crate::repo::tests::commit_files(
+            &conn,
+            "c1",
+            "one",
+            &[("a.txt", "v1\n"), ("d/b.txt", "v2\n")],
+        );
+        crate::store::set_branch_head(&conn, "main", "c1").unwrap();
+        crate::store::set_state(&conn, "current_branch", "main").unwrap();
+        record(&conn, "commit", Some("c1"), None).unwrap();
+
+        undo(&conn, &dir).unwrap();
+
+        assert!(!dir.join("a.txt").exists(), "a.txt survived an undo to an empty branch");
+        assert!(!dir.join("d").join("b.txt").exists(), "d/b.txt survived");
+        assert_eq!(
+            crate::store::branch_head(&conn, "main").unwrap(),
+            None,
+            "the head should be empty"
+        );
+
+        // And redo puts both back, which is what makes undo reversible rather than destructive.
+        redo(&conn, &dir).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("a.txt")).unwrap(), "v1\n");
+        assert_eq!(std::fs::read_to_string(dir.join("d").join("b.txt")).unwrap(), "v2\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

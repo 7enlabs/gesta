@@ -511,6 +511,45 @@ def main():
             f"exit {unknown[0]}",
         )
 
+    if want("undo-empty"):
+        # Undoing the first changeset leaves an empty branch. The disk has to empty too, or
+        # status reports every tracked file as new and the undo looks like it did nothing.
+        import tempfile as _tf
+        d = _tf.mkdtemp()
+        os.makedirs(os.path.join(d, "sub"), exist_ok=True)
+        with open(os.path.join(d, "a.txt"), "w") as fh:
+            fh.write("v1\n")
+        with open(os.path.join(d, "sub", "b.txt"), "w") as fh:
+            fh.write("v2\n")
+        sh(f"{ZF} init", cwd=d)
+        sh(f"{ZF} changeset create one --author t", cwd=d)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=d)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+
+        undone = sh(f"{ZF} undo", cwd=d)
+        record("undo reports no error", undone[0] == 0, (undone[1] or "")[:160])
+        record(
+            "undo to an empty branch removes the tracked files from disk",
+            not os.path.exists(os.path.join(d, "a.txt"))
+            and not os.path.exists(os.path.join(d, "sub", "b.txt")),
+            "a file stayed on disk after the head went empty",
+        )
+        st = sh(f"{ZF} status", cwd=d)
+        record(
+            "status is clean after undoing to an empty branch",
+            "2 files tracked" not in (st[1] or "")
+            and "new files" not in (st[1] or ""),
+            (st[1] or "")[:200],
+        )
+        sh(f"{ZF} redo", cwd=d)
+        record(
+            "redo puts both files back",
+            os.path.exists(os.path.join(d, "a.txt"))
+            and os.path.exists(os.path.join(d, "sub", "b.txt")),
+            "redo did not restore the tree",
+        )
+
     if want("gc"):
         # A repository that only grows is a repository that gets slower and bigger forever. The
         # check plants an object nothing references and asks gc to remove exactly that one.

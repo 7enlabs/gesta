@@ -1172,11 +1172,14 @@ pub fn committed_tree(
 /// Write every file of `branch` to disk. Used after a push and after a clone so
 /// the working tree never lags behind the branch head.
 pub fn materialise(conn: &Connection, root: &Path, branch: &str) -> ZResult<usize> {
-    let head = match branch_head(conn, branch)? {
-        Some(h) => h,
-        None => return Ok(0),
+    // An empty branch is a tree with no paths, not a reason to do nothing. Returning early here
+    // left every file the repository had tracked sitting on disk after an `undo` moved the head
+    // back to the first changeset's parent, and `status` then reported all of them as new files,
+    // which reads as if the undo had not happened.
+    let files: Vec<(String, String)> = match branch_head(conn, branch)? {
+        Some(head) => tree_at(conn, &head)?,
+        None => Vec::new(),
     };
-    let files = tree_at(conn, &head)?;
 
     // A path that the tree no longer names has to leave the disk, or the working tree keeps
     // a file the head says was deleted. Redo showed this: the head moved forward past a
