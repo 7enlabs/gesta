@@ -26,6 +26,42 @@ install that asks for it is an install people abandon.
 **Nothing is left behind on failure.** A failed download is removed before the build starts, so
 a later run does not pick up half a file.
 
+## Building on Windows needs three things, and a missing one names none of them
+
+`cargo install` needs Rust, the MSVC compiler and the Windows SDK. On the machine this was
+written for, the first two were present and the third was not, and the build stopped with:
+
+```
+LINK : fatal error LNK1181: cannot open input file 'kernel32.lib'
+```
+
+That error names a file nobody chose and says nothing about what to install. The installer now
+checks the three separately before it builds, and reports which one is missing:
+
+```
+$env:GESTA_CHECK = '1'
+irm https://raw.githubusercontent.com/zencli/gesta/main/install.ps1 | iex
+
+Checking what this machine has. Nothing will be changed.
+
+  Rust (cargo):  present at C:\Program Files\Rust stable MSVC 1.100\bin\cargo.exe
+  MSVC linker:   present
+  Windows SDK:   NOT FOUND
+```
+
+The SDK check looks for `kernel32.lib` under `Windows Kits\10\Lib\<version>\um\<arch>`, not for
+a `Lib` folder: the machine above has `Windows Kits\10` holding `Catalogs` and `Redist` and no
+`Lib` at all, so a shallow check calls it installed.
+
+The fix, offered by the installer:
+
+```
+winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.Windows11SDK.22621"
+```
+
+`GESTA_CHECK=1` reports and changes nothing, so it is safe to run first on any machine. It exits
+non zero when something is missing, which makes it usable in a script.
+
 ## What it does not do
 
 No tag, no release asset, no signature. A prebuilt binary appears once a release publishes one;

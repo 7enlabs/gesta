@@ -4,6 +4,9 @@
 #
 # Written for PowerShell 5.1, which every Windows 10 and 11 machine has, so that the installer
 # does not need the newer shell to be installed first.
+#   $env:GESTA_CHECK   = '1'       only report what this machine has, change nothing
+#   $env:GESTA_FROM    = 'source'  build from source even if a prebuilt binary exists
+#   $env:GESTA_VERSION = 'main'    a branch, or a tag
 $ErrorActionPreference = 'Stop'
 
 $Repo    = 'zencli/gesta'
@@ -16,6 +19,99 @@ function Write-Step($m) { Write-Host $m }
 function Get-Platform {
     $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
     "$arch-pc-windows-msvc"
+}
+
+# Rust needs three separate things on Windows, and a missing one produces a linker error that
+# names none of them. On the machine this was written for, Rust and the MSVC compiler were both
+# present and the Windows SDK was not: link.exe failed with "cannot open input file
+# 'kernel32.lib'", which reads like a Rust problem and is not.
+function Test-MsvcLinker {
+    $roots = @(
+        "$env:ProgramFiles\Microsoft Visual Studio",
+        "${env:ProgramFiles(x86)}\Microsoft Visual Studio",
+        'C:\BuildTools\VC'
+    )
+    foreach ($r in $roots) {
+        if (-not (Test-Path $r)) { continue }
+        $hit = Get-ChildItem -Path $r -Filter link.exe -Recurse -ErrorAction SilentlyContinue |
+               Where-Object { $_.FullName -like '*Hostx64\x64*' } |
+               Select-Object -First 1
+        if ($hit) { return $true }
+    }
+    return $false
+}
+
+function Test-WindowsSdk {
+    # The linker needs kernel32.lib under <kit>\Lib\<version>\um\<arch>. Checking that a Lib
+    # folder exists is not enough: this machine has Windows Kits\10 holding Catalogs and Redist
+    # and no Lib at all, so a shallow check would call it installed.
+    $arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
+    $roots = @(
+        "${env:ProgramFiles(x86)}\Windows Kits\10\Lib",
+        "$env:ProgramFiles\Windows Kits\10\Lib"
+    )
+    foreach ($r in $roots) {
+        if (-not (Test-Path $r)) { continue }
+        foreach ($v in (Get-ChildItem -Path $r -Directory -ErrorAction SilentlyContinue)) {
+            if (Test-Path (Join-Path $v.FullName "um\$arch\kernel32.lib")) { return $true }
+        }
+    }
+    return $false
+}
+
+function Show-MissingSdk {
+    Write-Host ''
+    Write-Host 'Rust cannot link on this machine: the Windows SDK is missing.' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host '  Rust:          present'
+    Write-Host '  MSVC compiler: present'
+    Write-Host '  Windows SDK:   NOT FOUND (no kernel32.lib under Windows Kits\10\Lib)'
+    Write-Host ''
+    Write-Host 'The linker stops at:'
+    Write-Host "  LINK : fatal error LNK1181: cannot open input file 'kernel32.lib'"
+    Write-Host ''
+    Write-Host 'Fix it one of two ways:'
+    Write-Host ''
+    Write-Host '  1. Add the SDK to the build tools you already have:'
+    Write-Host '       winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.Windows11SDK.22621"'
+    Write-Host ''
+    Write-Host '  2. Open Visual Studio Installer, choose Modify, tick "Windows 11 SDK" under'
+    Write-Host '     Individual components, then run this installer again.'
+    Write-Host ''
+    Write-Host 'Nothing was changed on this machine.'
+}
+
+function Test-Prerequisites {
+    param([switch]$Quiet)
+    $cargo = Get-Command cargo -ErrorAction SilentlyContinue
+    if (-not $cargo) {
+        if (-not $Quiet) {
+            Write-Host ''
+            Write-Host 'Rust is not installed or not on PATH.' -ForegroundColor Yellow
+            Write-Host 'Install it (no administrator needed), then run this again:'
+            Write-Host '  winget install Rustlang.Rustup'
+            Write-Host '  rustup default stable-msvc'
+            Write-Host ''
+        }
+        return $false
+    }
+    $linker = Test-MsvcLinker
+    $sdk = Test-WindowsSdk
+    if (-not $sdk) {
+        if (-not $Quiet) {
+            if (-not $linker) {
+                Write-Host ''
+                Write-Host 'Neither the MSVC compiler nor the Windows SDK is present.' -ForegroundColor Yellow
+                Write-Host 'Install the C++ build tools with the SDK:'
+                Write-Host '  winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.Windows11SDK.22621"'
+                Write-Host ''
+            } else {
+                Show-MissingSdk
+            }
+        }
+        return $false
+    }
+    return $true
 }
 
 function Install-Binary($src) {
@@ -47,24 +143,54 @@ function Try-Prebuilt {
 }
 
 function Build-From-Source {
-    $cargo = Get-Command cargo -ErrorAction SilentlyContinue
-    if (-not $cargo) {
-        throw "Neither a prebuilt binary nor Rust is available. Install Rust from https://rustup.rs and run this again."
-    }
     New-Item -ItemType Directory -Force -Path (Split-Path $BinDir) | Out-Null
     # `--branch main` fails against a remote with no such tracking ref, so the default branch is
     # requested by leaving the flag out and a version by --tag.
     $ref = if ($Version -eq 'main') { @() } else { @('--tag', $Version) }
-    # --locked first, so a build gets the dependency versions the project was tested with.
-    & cargo install --git "https://github.com/$Repo.git" @ref --root (Split-Path $BinDir) --locked
+    # --locked first, so a build gets the dependency versions the project was tested with. The
+    # output goes to a log as well as the screen, because the reason a build failed scrolls past
+    # faster than anyone can read it.
+    $log = Join-Path $env:TEMP "gesta-build-$PID.log"
+    & cargo install --git "https://github.com/$Repo.git" @ref --root (Split-Path $BinDir) --locked 2>&1 |
+        Tee-Object -FilePath $log
     if ($LASTEXITCODE -ne 0) {
-        & cargo install --git "https://github.com/$Repo.git" @ref --root (Split-Path $BinDir)
+        & cargo install --git "https://github.com/$Repo.git" @ref --root (Split-Path $BinDir) 2>&1 |
+            Tee-Object -FilePath $log
     }
-    if ($LASTEXITCODE -ne 0) { throw 'cargo install failed. Run: rustup update' }
+    if ($LASTEXITCODE -ne 0) {
+        # A raw linker error names a .lib file and nothing a person can act on, so translate the
+        # one that actually happens here rather than printing it again.
+        $text = if (Test-Path $log) { Get-Content $log -Raw } else { '' }
+        if ($text -match 'LNK1181' -and $text -match 'kernel32\.lib') {
+            Show-MissingSdk
+            throw 'build failed: the Windows SDK is missing (see above)'
+        }
+        throw "cargo install failed. The build log is at $log"
+    }
+    Remove-Item $log -Force -ErrorAction SilentlyContinue
+}
+
+if ($env:GESTA_CHECK -eq '1') {
+    Write-Step 'Checking what this machine has. Nothing will be changed.'
+    Write-Step ''
+    $cargo = Get-Command cargo -ErrorAction SilentlyContinue
+    $rust = if ($cargo) { "present at $($cargo.Source)" } else { 'NOT FOUND' }
+    Write-Step "  Rust (cargo):  $rust"
+    Write-Step "  MSVC linker:   $(if (Test-MsvcLinker) { 'present' } else { 'NOT FOUND' })"
+    Write-Step "  Windows SDK:   $(if (Test-WindowsSdk) { 'present' } else { 'NOT FOUND' })"
+    Write-Step ''
+    if (Test-Prerequisites -Quiet) {
+        Write-Step 'This machine can build gesta. Run the installer without GESTA_CHECK.'
+        exit 0
+    }
+    exit 1
 }
 
 $ok = Try-Prebuilt
-if (-not $ok) { Build-From-Source }
+if (-not $ok) {
+    if (-not (Test-Prerequisites)) { exit 1 }
+    Build-From-Source
+}
 
 if (-not (Test-Path $Target)) { throw "the binary did not land at $Target" }
 
