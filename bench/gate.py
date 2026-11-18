@@ -550,6 +550,53 @@ def main():
             "redo did not restore the tree",
         )
 
+    if want("delta-blank"):
+        # A delta whose only change is a blank line decoded into an insert of nothing, so the
+        # object it described could not be read back and fsck called it missing.
+        import tempfile as _tf
+        d = _tf.mkdtemp()
+        sh(f"{ZF} init", cwd=d)
+        body = "".join("line %d\n" % i for i in range(400))
+        with open(os.path.join(d, "f.txt"), "w") as fh:
+            fh.write(body)
+        sh(f"{ZF} changeset create one --author t", cwd=d)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=d)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+
+        # Insert a blank line near the top: a small delta against a large file.
+        with open(os.path.join(d, "f.txt"), "w") as fh:
+            fh.write("\n" + body)
+        sh(f"{ZF} changeset create two --author t", cwd=d)
+        m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=d)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+
+        # Compare bytes, not a stripped string: the whole point is that the leading blank line
+        # survives, and `strip()` removes exactly the byte under test.
+        out_path = os.path.join(d, "readback.txt")
+        rc = subprocess.run(
+            f"{ZF} show main:f.txt > {out_path}",
+            shell=True,
+            cwd=d,
+            capture_output=True,
+            text=True,
+        ).returncode
+        with open(out_path, "rb") as fh:
+            read_back = fh.read()
+        record(
+            "a delta holding a blank line reads back byte for byte",
+            rc == 0 and read_back == ("\n" + body).encode(),
+            f"{len(read_back)} bytes, expected {len(('\n' + body).encode())}, "
+            f"starts {read_back[:12]!r}",
+        )
+        check = sh(f"{ZF} fsck", cwd=d)
+        record(
+            "and fsck calls the store consistent",
+            check[0] == 0 and "consistent" in (check[1] or ""),
+            (check[1] or "")[:200],
+        )
+
     if want("gc"):
         # A repository that only grows is a repository that gets slower and bigger forever. The
         # check plants an object nothing references and asks gc to remove exactly that one.

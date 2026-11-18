@@ -169,9 +169,21 @@ pub fn to_bytes(ops: &[Op]) -> Vec<u8> {
 /// Parse the byte form back into ops.
 pub fn from_bytes(raw: &[u8]) -> Option<Vec<Op>> {
     let text = std::str::from_utf8(raw).ok()?;
-    let mut lines = text.split('\n').filter(|l| !l.is_empty());
+    // Every line matters, including an empty one. `to_bytes` writes an insert of a blank line as
+    // `A\t1\n\n`, and a parser that skipped empty lines read that as an insert of nothing, so a
+    // delta whose only change was a blank line decoded into ops that rebuilt different content
+    // and the object became unreadable.
+    let mut lines = text.split('\n');
     let mut ops = Vec::new();
     while let Some(header) = lines.next() {
+        if header.is_empty() {
+            // The trailing newline of the last record leaves one empty tail, which is not a
+            // record. An empty header anywhere else is a malformed payload.
+            if lines.clone().all(|l| l.is_empty()) {
+                break;
+            }
+            return None;
+        }
         if let Some(rest) = header.strip_prefix("C\t") {
             let mut parts = rest.split('\t');
             let start: usize = parts.next()?.parse().ok()?;
@@ -315,5 +327,38 @@ mod tests {
         assert_eq!(ops.len(), 1);
         assert!(matches!(ops[0], Op::Copy { count: 100, .. }));
         assert_eq!(apply(&base, &ops).unwrap(), base);
+    }
+    /// A delta whose only change is a blank line decoded into an insert of nothing, and the
+    /// object it described could never be read again.
+    #[test]
+    fn an_inserted_blank_line_survives_the_byte_round_trip() {
+        let base: String = (0..40).map(|i| format!("line {}\n", i)).collect();
+        let mut new = base.clone();
+        new.insert(0, '\n');
+        let ops = encode(&base, &new).expect("an inserted blank line should encode");
+        let bytes = to_bytes(&ops);
+        let back = from_bytes(&bytes).expect("the bytes this module wrote are not parseable");
+        assert_eq!(back, ops, "the parsed ops differ from what was written");
+        let rebuilt = apply(&base, &back).expect("the delta does not apply");
+        assert_eq!(rebuilt, new, "the blank line was lost");
+    }
+
+    #[test]
+    fn an_insert_of_one_blank_line_round_trips_on_its_own() {
+        let ops = vec![Op::Insert(vec![String::new()])];
+        let back = from_bytes(&to_bytes(&ops)).unwrap();
+        assert_eq!(back, ops);
+    }
+
+    #[test]
+    fn several_blank_lines_stay_separate() {
+        let ops = vec![Op::Insert(vec![
+            "a".to_string(),
+            String::new(),
+            String::new(),
+            "b".to_string(),
+        ])];
+        let back = from_bytes(&to_bytes(&ops)).unwrap();
+        assert_eq!(back, ops);
     }
 }
