@@ -234,7 +234,45 @@ pub fn handle_line(root: &Path, line: &str) -> Option<Json> {
     let result = match method.as_str() {
         "initialize" => Ok(initialize_result()),
         "notifications/initialized" => return None,
-        "tools/list" => Ok(Json::obj(vec![("tools", tool_definitions())])),
+        // Cache hints, because a tool catalog is sent with every request.
+        //
+        // A client that cannot cache the catalog pays for all of it on every model call, including
+        // the tools it never invokes. The list here changes only when the binary changes, so the
+        // TTL is long and the scope is private: two processes of the same build agree, and a
+        // client is free to keep the answer for as long as it holds the connection.
+        // One call that answers what the server can do, for a client that wants to know before it
+        // asks for anything. The spec makes it optional; a client that skips it costs one extra
+        // round trip on its first real call, and a client that uses it can size its own budget.
+        "server/discover" => Ok(Json::obj(vec![
+            ("protocolVersion", Json::str(PROTOCOL_VERSION)),
+            (
+                "serverInfo",
+                Json::obj(vec![
+                    ("name", Json::str("gesta")),
+                    ("version", Json::str(env!("CARGO_PKG_VERSION"))),
+                ]),
+            ),
+            (
+                "capabilities",
+                Json::obj(vec![(
+                    "tools",
+                    Json::obj(vec![("listChanged", Json::Bool(false))]),
+                )]),
+            ),
+            (
+                "instructions",
+                Json::str(
+                    "A version-control server. Read `gesta_brief` first in a new session: it reports \
+                     the branch, the head, what is pending, and what the repository is waiting for, \
+                     in one call. `gesta_status` reports state; `gesta_brief` reports what to do next.",
+                ),
+            ),
+        ])),
+        "tools/list" => Ok(Json::obj(vec![
+            ("tools", tool_definitions()),
+            ("ttlMs", Json::int(3_600_000)),
+            ("cacheScope", Json::str("private")),
+        ])),
         "tools/call" => {
             let params = field(&req, "params").cloned().unwrap_or(Json::Null);
             call_tool(root, &params)
@@ -287,6 +325,13 @@ fn initialize_result() -> Json {
 
 type ToolError = (i64, String);
 
+/// Prefix a tool uses to mark a failure as the caller's argument rather than the server's state.
+///
+/// A prefix rather than a second error type: the distinction has to survive twelve tool functions,
+/// and what matters is the code the client receives, not the type this file uses to carry it. The
+/// prefix is stripped before the message reaches the client, so it never appears in an error.
+const PARAM_ERROR: &str = "params: ";
+
 fn call_tool(root: &Path, params: &Json) -> Result<Json, ToolError> {
     let name = field(params, "name")
         .and_then(json::as_str)
@@ -317,7 +362,16 @@ fn call_tool(root: &Path, params: &Json) -> Result<Json, ToolError> {
         "gesta_commit" => tool_commit(&conn, &args),
         other => return Err((-32602, format!("unknown tool: {}", other))),
     }
-    .map_err(|e| (-32603, e))?;
+    .map_err(|e| {
+        // A missing or malformed argument is the caller's fault and JSON-RPC has a code for it. A
+        // client that receives -32603 cannot tell "my request was wrong" from "the server broke",
+        // and the two lead to opposite decisions: fix the call, or stop and report a fault.
+        if e.starts_with(PARAM_ERROR) {
+            (-32602, e.trim_start_matches(PARAM_ERROR).to_string())
+        } else {
+            (-32603, e)
+        }
+    })?;
 
     // Every tool result carries the schema version, so a client can refuse one it does not
     // know instead of reading fields by the wrong names and running on quietly wrong data.
@@ -497,7 +551,7 @@ fn tool_ls(conn: &Connection, args: &Json) -> Result<Json, String> {
 }
 
 fn tool_read_file(conn: &Connection, args: &Json) -> Result<Json, String> {
-    let path = arg_str(args, "path").ok_or("read_file needs a path")?;
+    let path = arg_str(args, "path").ok_or("params: read_file needs a path")?;
     let rev = match arg_str(args, "rev") {
         Some(r) => r,
         None => current_branch(conn).map_err(|e| e.to_string())?,
@@ -519,7 +573,7 @@ fn tool_read_file(conn: &Connection, args: &Json) -> Result<Json, String> {
 }
 
 fn tool_blame(conn: &Connection, args: &Json) -> Result<Json, String> {
-    let path = arg_str(args, "path").ok_or("blame needs a path")?;
+    let path = arg_str(args, "path").ok_or("params: blame needs a path")?;
     let mut stmt = conn
         .prepare("SELECT line_no, changeset_id, author FROM blame WHERE path = ?1 ORDER BY line_no")
         .map_err(|e| e.to_string())?;
@@ -604,7 +658,7 @@ fn tool_diff(conn: &Connection, root: &Path, args: &Json) -> Result<Json, String
 
 
 fn tool_merge_conflicts(conn: &Connection, root: &Path, args: &Json) -> Result<Json, String> {
-    let source = arg_str(args, "source").ok_or("merge_conflicts needs a source branch")?;
+    let source = arg_str(args, "source").ok_or("params: merge_conflicts needs a source branch")?;
     let target = match arg_str(args, "target") {
         Some(t) => t,
         None => current_branch(conn).map_err(|e| e.to_string())?,
@@ -614,7 +668,7 @@ fn tool_merge_conflicts(conn: &Connection, root: &Path, args: &Json) -> Result<J
 }
 
 fn tool_create_changeset(conn: &Connection, root: &Path, args: &Json) -> Result<Json, String> {
-    let message = arg_str(args, "message").ok_or("create_changeset needs a message")?;
+    let message = arg_str(args, "message").ok_or("params: create_changeset needs a message")?;
     let author = arg_str(args, "author").unwrap_or_else(|| "agent".to_string());
     match store::with_retry(|| repo::create_changeset(conn, root, &message, &author)).map_err(|e| e.to_string())? {
         None => Ok(Json::obj(vec![
@@ -644,7 +698,7 @@ fn tool_create_changeset(conn: &Connection, root: &Path, args: &Json) -> Result<
 }
 
 fn tool_commit(conn: &Connection, args: &Json) -> Result<Json, String> {
-    let id = arg_str(args, "id").ok_or("commit needs an id")?;
+    let id = arg_str(args, "id").ok_or("params: commit needs an id")?;
     let n = store::with_retry(|| repo::commit_one(conn, &id)).map_err(|e| e.to_string())?;
     let branch = current_branch(conn).map_err(|e| e.to_string())?;
     Ok(Json::obj(vec![

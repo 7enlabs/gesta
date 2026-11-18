@@ -212,3 +212,19 @@ something catches it is what turns a score of zero defects into evidence.
 Mutation found four faults in this harness that a passing run could not: a criterion reading a
 truncated tail it could never parse, a criterion judging a script's concatenated output as if it
 belonged to one command, and two mutants whose planted defect never reached the path they claimed.
+
+## M1. A tool catalog is paid for on every request
+
+Tool definitions travel with every model call, so an agent pays for the tools it never invokes. The gesta catalog is 4,426 bytes, about 1,106 estimated tokens, and it was paid again on every call because `tools/list` carried no cache hint. It now carries `ttlMs` and `cacheScope`, which the current spec requires for a client to cache at all.
+
+The lesson is not "fewer tools". A smaller catalog that takes more steps costs more than a larger one that answers in one, and the published rebuild that cut 15 tools to 4 moved the context meter only from 1.1% to 0.8% while halving the number of calls. What matters is the cost per completed task, not the size of the list.
+
+## M2. An argument error is not a server fault
+
+Every tool failure used to return -32603, which tells a client the server broke. A missing `path` is the caller's mistake and JSON-RPC has -32602 for it. A client that cannot tell the two apart either retries a request that will never succeed or reports a fault that does not exist.
+
+## M3. Tool selection is a separate thing to test
+
+Calling a tool directly tests whether it works. It says nothing about whether anything reading twelve descriptions can tell them apart. `gesta_status` and `gesta_brief` both answer "what is going on", and a wrong choice returns a plausible answer, so the mistake never surfaces as an error.
+
+The eval scores selection, arguments and restraint separately. Restraint matters most: a request no tool answers must be declined, because a forced fit turns "I cannot" into an action.

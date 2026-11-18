@@ -2266,6 +2266,78 @@ def main():
             f"{len(lines)} capped list(s) name a way back: " + "; ".join(x[:70] for x in lines[:3]),
         )
 
+    if want("mcp-advanced"):
+        # Three things a client depends on and cannot see from a passing call.
+        import tempfile as _tf
+        import json as _js
+        import subprocess as _sp
+
+        d = _tf.mkdtemp()
+        sh(f"{ZF} init", cwd=d)
+
+        def rpc(method, params=None):
+            req = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}
+            p = _sp.run(
+                [ZF, "mcp"], cwd=d, input=_js.dumps(req) + "\n",
+                capture_output=True, text=True, timeout=60,
+            )
+            for line in (p.stdout or "").splitlines():
+                line = line.strip()
+                if line.startswith("{"):
+                    return _js.loads(line)
+            return {}
+
+        disc = rpc("server/discover")
+        ok = (
+            disc.get("result", {}).get("protocolVersion")
+            and disc["result"]["serverInfo"]["name"] == "gesta"
+            and disc["result"].get("instructions")
+        )
+        record("server/discover answers before any tool is called", bool(ok), str(disc)[:300])
+
+        lst = rpc("tools/list")
+        res = lst.get("result", {})
+        record(
+            "the tool catalog carries cache hints, so a client need not refetch it every call",
+            res.get("ttlMs") is not None and res.get("cacheScope") is not None,
+            f"ttlMs={res.get('ttlMs')} cacheScope={res.get('cacheScope')}",
+        )
+
+        bad_arg = rpc("tools/call", {"name": "gesta_read_file", "arguments": {}})
+        record(
+            "a missing argument is reported as invalid params, not as a server fault",
+            bad_arg.get("error", {}).get("code") == -32602,
+            str(bad_arg.get("error"))[:200],
+        )
+
+        real_err = rpc("tools/call", {"name": "gesta_commit", "arguments": {"id": "csdeadbeef"}})
+        record(
+            "a genuine failure keeps the internal error code",
+            real_err.get("error", {}).get("code") == -32603,
+            str(real_err.get("error"))[:200],
+        )
+
+        unknown = rpc("tools/call", {"name": "gesta_nope", "arguments": {}})
+        record(
+            "an unknown tool is invalid params, not an internal error",
+            unknown.get("error", {}).get("code") == -32602,
+            str(unknown.get("error"))[:200],
+        )
+
+        rc, out = sh("cd bench/harness && python3 test_mcp_eval.py", timeout=300)
+        record(
+            "the tool-selection eval distinguishes a good run from a bad one",
+            rc == 0 and "every mcp eval test passes" in out,
+            out[-400:],
+        )
+
+        rc, out = sh(f"cd bench/harness && GESTA_BIN={ZF} python3 mcp_eval.py --catalog {d}", timeout=200)
+        record(
+            "the catalog is priced in tokens and carries a cache hint",
+            rc == 0 and "estimated tokens" in out and "no cache hint" not in out,
+            out[-400:],
+        )
+
     if want("suites"):
         suites = [
             "e2e", "http_remote", "http_auth", "mcp_json", "api_changeset",
