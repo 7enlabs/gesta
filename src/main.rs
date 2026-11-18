@@ -169,6 +169,21 @@ enum GitCmd {
         #[arg(long)]
         branch: Option<String>,
     },
+    /// Push branches to a git remote through the git binary
+    Push {
+        /// Any git remote: a URL, an ssh path, or a forge
+        remote: String,
+        #[arg(long)]
+        branch: Option<String>,
+    },
+    /// Fetch branches from a git remote and import them
+    Pull {
+        /// Any git remote: a URL, an ssh path, or a forge
+        remote: String,
+        /// Only paths under this prefix
+        #[arg(long)]
+        path_prefix: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -778,6 +793,10 @@ fn run() -> ZResult<()> {
         Cmd::Git { sub } => match sub {
             GitCmd::Import { path, path_prefix } => cli::cmd_git_import(&path, path_prefix.as_deref()),
             GitCmd::Export { path, branch } => cli::cmd_git_export(&path, branch.as_deref()),
+            GitCmd::Push { remote, branch } => cli::cmd_git_push(&remote, branch.as_deref()),
+            GitCmd::Pull { remote, path_prefix } => {
+                cli::cmd_git_pull(&remote, path_prefix.as_deref())
+            }
         },
         Cmd::Brief { json: brief_json, fix, stash } => {
             if fix {

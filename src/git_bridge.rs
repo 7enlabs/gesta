@@ -253,7 +253,11 @@ pub fn export(conn: &Connection, git_root: &Path, branch: Option<&str>) -> ZResu
     std::fs::create_dir_all(root.join(".git").join("refs").join("heads"))?;
     std::fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main\n")?;
     let repo = Repo::open(&root)?;
+    export_into(conn, &repo, branch)
+}
 
+/// The body of `export`, for a repository whose git directory is already decided.
+fn export_into(conn: &Connection, repo: &Repo, branch: Option<&str>) -> ZResult<Exported> {
     let branches: Vec<String> = match branch {
         Some(b) => vec![b.to_string()],
         None => {
@@ -286,7 +290,7 @@ pub fn export(conn: &Connection, git_root: &Path, branch: Option<&str>) -> ZResu
                 rusqlite::params![id],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )?;
-            let tree_hash = write_tree_for(conn, &repo, &id)?;
+            let tree_hash = write_tree_for(conn, repo, &id)?;
             let (name, mail) = split_author(&author);
             let parents: Vec<String> = parent
                 .and_then(|p| mapped.get(&p).cloned())
@@ -302,6 +306,13 @@ pub fn export(conn: &Connection, git_root: &Path, branch: Option<&str>) -> ZResu
                 &message,
             );
             let commit = repo.write_object(Kind::Commit, &body)?;
+            // Remember the name git gave this changeset. Without it a pull back from the same
+            // remote sees an unknown commit and imports a duplicate of work that is already
+            // here, which is what a push-then-pull round trip did before this line existed.
+            conn.execute(
+                "UPDATE changesets SET git_commit = ?2 WHERE id = ?1 AND git_commit IS NULL",
+                rusqlite::params![id, commit],
+            )?;
             mapped.insert(id.clone(), commit.clone());
             out.commits += 1;
             if let Some(last) = mapped.get(&head) {
@@ -410,6 +421,167 @@ fn split_author(author: &str) -> (String, String) {
         ),
         _ => (author.trim().to_string(), String::new()),
     }
+}
+
+/// Push this repository's branches to a git remote, through the git binary.
+///
+/// The objects are written first with [`export`], into a bare repository that holds nothing but
+/// `.git`. git then pushes from there. Doing it in that order means the transfer is an ordinary
+/// git push: an authentication prompt, a token, an SSH key and a forge's hooks all work exactly
+/// as they do for any other repository, which no hand written protocol implementation could
+/// promise.
+///
+/// This is the one place that shells out to git, and it is deliberate. Reading and writing
+/// objects does not need the binary; talking to a forge does.
+pub fn push_to_git_remote(
+    conn: &Connection,
+    branch: Option<&str>,
+    remote: &str,
+) -> ZResult<Exported> {
+    let staging = std::env::temp_dir().join(format!("gesta-git-push-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging)?;
+
+    // `git init --bare <dir>` makes <dir> the git directory itself, so `export` has to be told
+    // where the objects go rather than being pointed at a working tree that does not exist.
+    std::process::Command::new("git")
+        .arg("init")
+        .arg("--bare")
+        .arg("-q")
+        .arg(&staging)
+        .output()
+        .map_err(|e| bad(format!("git is needed to push to a remote: {}", e)))?;
+
+    let written = export_bare(conn, &staging, branch)?;
+
+    let out = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(&staging)
+        .arg("push")
+        .arg(remote)
+        .arg(written.branches.iter().map(|b| format!("refs/heads/{}:refs/heads/{}", b, b)).collect::<Vec<_>>().join(" "))
+        .output()
+        .map_err(|e| bad(format!("cannot run git: {}", e)))?;
+
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let _ = std::fs::remove_dir_all(&staging);
+        // git's own message is the useful one: it names the ref, the reason and the fix.
+        return Err(bad(format!("git push failed: {}", err.trim())));
+    }
+    let _ = std::fs::remove_dir_all(&staging);
+    let _ = adjust_remote_head(remote, &written.branches);
+    Ok(written)
+}
+
+/// Fetch branches from a git remote into a bare staging repository, then import them.
+pub fn pull_from_git_remote(conn: &Connection, remote: &str, prefix: Option<&str>) -> ZResult<Imported> {
+    let staging = std::env::temp_dir().join(format!("gesta-git-pull-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging)?;
+
+    // `git init --bare <dir>` makes <dir> itself the git directory, not <dir>/.git. Pointing
+    // --git-dir at staging/.git then names a path that does not exist, and every command after
+    // it fails with "not a git repository".
+    let init = std::process::Command::new("git")
+        .args(["init", "--bare", "-q"])
+        .arg(&staging)
+        .output()
+        .map_err(|e| bad(format!("git is needed to pull from a remote: {}", e)))?;
+    if !init.status.success() {
+        return Err(bad("git init failed in the staging directory"));
+    }
+
+    let fetch = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(&staging)
+        .args(["fetch", remote, "+refs/heads/*:refs/heads/*"])
+        .output()
+        .map_err(|e| bad(format!("cannot run git: {}", e)))?;
+    if !fetch.status.success() {
+        let err = String::from_utf8_lossy(&fetch.stderr);
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(bad(format!("git fetch failed: {}", err.trim())));
+    }
+
+    // `fetch` writes packfiles and an import reads loose objects, so the packs are taken apart
+    // first. `git unpack-objects` reads one pack per invocation from stdin, and a repository
+    // fetched with several refs can hold more than one, so each pack gets its own run. Piping
+    // them all into one process produced "fatal: early EOF" and unpacked only the first.
+    let pack_dir = staging.join("objects").join("pack");
+    if let Ok(entries) = std::fs::read_dir(&pack_dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().is_none_or(|x| x != "pack") {
+                continue;
+            }
+            let bytes = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            use std::io::Write;
+            if let Ok(mut child) = std::process::Command::new("git")
+                .arg("--git-dir")
+                .arg(&staging)
+                .args(["unpack-objects", "-q"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+            {
+                if let Some(stdin) = child.stdin.as_mut() {
+                    let _ = stdin.write_all(&bytes);
+                }
+                let out = child.wait_with_output();
+                if let Ok(o) = out {
+                    if !o.status.success() {
+                        let err = String::from_utf8_lossy(&o.stderr);
+                        let _ = std::fs::remove_dir_all(&staging);
+                        return Err(bad(format!(
+                            "unpacking {} failed: {}",
+                            path.display(),
+                            err.trim()
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    let got = import(conn, &staging, prefix);
+    let _ = std::fs::remove_dir_all(&staging);
+    got
+}
+
+/// Point a remote's HEAD at `main` when it points at nothing.
+///
+/// A freshly created bare repository has `HEAD` on `master`. Pushing `main` to it leaves a
+/// repository that clones with "remote HEAD refers to nonexistent ref" and no files, which
+/// looks like the push failed when it did not. Only a local path can be fixed this way; a
+/// remote URL belongs to somebody else and is left alone.
+fn adjust_remote_head(remote: &str, branches: &[String]) -> ZResult<()> {
+    if !branches.iter().any(|b| b == "main") {
+        return Ok(());
+    }
+    let path = std::path::Path::new(remote);
+    let bare = path.join("HEAD");
+    if !bare.is_file() {
+        return Ok(());
+    }
+    let current = std::fs::read_to_string(&bare).unwrap_or_default();
+    if current.contains("refs/heads/main") {
+        return Ok(());
+    }
+    std::fs::write(&bare, "ref: refs/heads/main\n")?;
+    Ok(())
+}
+
+/// Write this repository into a git directory that is already a bare repository.
+fn export_bare(conn: &Connection, git_dir: &Path, branch: Option<&str>) -> ZResult<Exported> {
+    let repo = Repo {
+        git_dir: git_dir.to_path_buf(),
+    };
+    export_into(conn, &repo, branch)
 }
 
 #[cfg(test)]
@@ -620,5 +792,41 @@ mod tests {
         assert_eq!(head2, c, "the round trip changed the commit name");
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&out);
+    }
+    #[test]
+    fn a_bare_repository_is_read_as_a_repository() {
+        let dir = temp("bare");
+        std::fs::create_dir_all(dir.join("objects")).unwrap();
+        std::fs::create_dir_all(dir.join("refs").join("heads")).unwrap();
+        // A bare repository has no `.git` inside: it is the git directory.
+        let repo = Repo::open(&dir).unwrap();
+        assert_eq!(repo.git_dir, dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A push records the name git gave each changeset. Without it, pulling from the same remote
+    /// sees an unknown commit and imports a duplicate of the work that was just pushed.
+    #[test]
+    fn an_export_remembers_the_name_git_gave_each_changeset() {
+        let conn = crate::store::tests::mem_db();
+        let dir = temp("export-name");
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        crate::repo::tests::commit_files(&conn, "e1", "one", &[("a.txt", "v1\n")]);
+        crate::store::set_branch_head(&conn, "main", "e1").unwrap();
+        crate::store::set_state(&conn, "current_branch", "main").unwrap();
+
+        let before: Option<String> = conn
+            .query_row("SELECT git_commit FROM changesets WHERE id = 'e1'", [], |r| r.get(0))
+            .unwrap();
+        assert!(before.is_none(), "the fixture already had a git name");
+
+        export(&conn, &dir, None).unwrap();
+
+        let after: Option<String> = conn
+            .query_row("SELECT git_commit FROM changesets WHERE id = 'e1'", [], |r| r.get(0))
+            .unwrap();
+        assert!(after.is_some(), "export did not record the git commit name");
+        assert_eq!(after.unwrap().len(), 40, "a git name is forty hex characters");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

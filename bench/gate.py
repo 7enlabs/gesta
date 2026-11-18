@@ -276,6 +276,70 @@ def main():
             r[1][:240],
         )
 
+    if want("git-remote"):
+        # A push has to reach a real git repository and a pull has to bring back only what is
+        # new. A round trip that duplicates the pushed work is the failure worth checking.
+        import shutil as _shutil
+        import tempfile
+        if not _shutil.which("git"):
+            record("git remote bridge", False, "git is not on PATH")
+        else:
+            forge = tempfile.mkdtemp() + "/forge.git"
+            sh(f"git init -q --bare {forge}")
+            local = tempfile.mkdtemp()
+            sh(f"{ZF} init", cwd=local)
+            with open(os.path.join(local, "a.txt"), "w") as fh:
+                fh.write("v1\n")
+            sh(f"{ZF} changeset create one --author t", cwd=local)
+            m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=local)[1])
+            if m:
+                sh(f"{ZF} changeset commit {m.group(1)}", cwd=local)
+
+            pushed = sh(f"{ZF} git push {forge}", cwd=local)
+            record(
+                "gesta pushes to a git remote",
+                pushed[0] == 0 and "pushed" in pushed[1],
+                pushed[1][:200],
+            )
+
+            # A clone from the forge proves the push wrote a real git repository.
+            clone = tempfile.mkdtemp() + "/clone"
+            sh(f"git clone -q {forge} {clone}")
+            seen = sh("cat a.txt", cwd=clone)
+            record(
+                "a clone of the remote holds what was pushed",
+                seen[0] == 0 and seen[1].strip() == "v1",
+                f"{seen[0]} {seen[1][:80]}",
+            )
+
+            # A teammate commits to the forge, then gesta pulls.
+            with open(os.path.join(clone, "a.txt"), "w") as fh:
+                fh.write("v2\n")
+            sh("git -c user.email=t@e.st -c user.name=T commit -qam teammate", cwd=clone)
+            sh("git push -q origin main", cwd=clone)
+
+            pulled = sh(f"{ZF} git pull {forge}", cwd=local)
+            record(
+                "gesta pulls a commit from a git remote",
+                pulled[0] == 0 and "imported 1 commit" in pulled[1],
+                pulled[1][:200],
+            )
+            body = sh(f"{ZF} show main:a.txt", cwd=local)
+            record(
+                "the pulled content is what the teammate wrote",
+                body[0] == 0 and body[1].strip() == "v2",
+                body[1][:120],
+            )
+
+            # The push recorded the git name of what it sent, so pulling it back must not
+            # import the same commit a second time.
+            count = sh(f"{ZF} log --limit 20 --oneline", cwd=local)[1].count("cs")
+            record(
+                "a push then pull does not duplicate the pushed commit",
+                count == 2,
+                f"{count} changesets, expected 2",
+            )
+
     if want("gc"):
         # A repository that only grows is a repository that gets slower and bigger forever. The
         # check plants an object nothing references and asks gc to remove exactly that one.

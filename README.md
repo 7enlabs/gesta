@@ -80,6 +80,8 @@ gesta blame src/main.rs
 | `stash drop [--id N]` | Delete a stash without applying it |
 | `git import <path>` | Read a git repository into this one, no git binary needed |
 | `git export <path>` | Write a git repository that git reads, same commit ids |
+| `git push <remote>` | Send branches to any git remote through the git binary |
+| `git pull <remote>` | Fetch branches from a git remote and import what is new |
 | `gc` | Remove unreachable objects and vacuum the database |
 | `brief [--json] [--fix] [--stash]` | Where the session stands, and `--fix` does the safe part |
 | `grep <text> [--history] [--regex]` | Find text in the working tree, or in every recorded version |
@@ -306,11 +308,17 @@ A git repository can be read into this one and written back out, without calling
 binary. A round trip keeps the commit ids: they are the hash of the tree, the parents, the
 author line and the message, so equal ids prove all four survived.
 
+Talking to a remote is the one thing that needs the git binary, and it is deliberate: the
+objects are exported first and then `git push` sends them, so a token, an ssh key, a credential
+helper and a forge's hooks all behave the way they already do.
+
 ```sh
 gesta git import ../existing-project        # every branch, every commit
 gesta git import ../existing-project --path-prefix src/
 gesta git export ../git-export             # a repository git reads
 gesta git export ../git-export --branch main
+gesta git push git@github.com:me/project   # send to any git remote
+gesta git pull https://github.com/me/project  # bring back what is new
 ```
 
 ```sh

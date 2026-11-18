@@ -734,6 +734,31 @@ pub fn cmd_history(file: &str) -> ZResult<()> {
     Ok(())
 }
 
+/// Push this repository's branches to a git remote.
+pub fn cmd_git_push(remote: &str, branch: Option<&str>) -> ZResult<()> {
+    let (_root, conn) = open_repo()?;
+    let out = crate::git_bridge::push_to_git_remote(&conn, branch, remote)?;
+    println!("pushed {} commit(s) to {}", out.commits, remote);
+    if !out.branches.is_empty() {
+        println!("branches: {}", out.branches.join(", "));
+    }
+    Ok(())
+}
+
+/// Fetch from a git remote and import what arrived.
+pub fn cmd_git_pull(remote: &str, prefix: Option<&str>) -> ZResult<()> {
+    let (_root, conn) = open_repo()?;
+    let got = crate::git_bridge::pull_from_git_remote(&conn, remote, prefix)?;
+    println!(
+        "imported {} commit(s), {} already present",
+        got.commits, got.skipped
+    );
+    if !got.branches.is_empty() {
+        println!("branches: {}", got.branches.join(", "));
+    }
+    Ok(())
+}
+
 /// Read a git repository into this one.
 pub fn cmd_git_import(path: &str, prefix: Option<&str>) -> ZResult<()> {
     let (_root, conn) = open_repo()?;

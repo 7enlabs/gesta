@@ -141,6 +141,14 @@ pub struct Repo {
 impl Repo {
     /// Find the repository that contains `start`, or `start/.git` itself.
     pub fn open(start: &Path) -> ZResult<Repo> {
+        // A bare repository is its own git directory: it has `objects` and `refs` directly, and
+        // no `.git` inside. Checking for that first is what lets an import read a bare clone or
+        // a staging repository `git init --bare` just made.
+        if start.join("objects").is_dir() && start.join("refs").is_dir() {
+            return Ok(Repo {
+                git_dir: start.to_path_buf(),
+            });
+        }
         let mut cur = start.to_path_buf();
         loop {
             let candidate = cur.join(".git");
