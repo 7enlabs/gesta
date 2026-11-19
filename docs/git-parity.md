@@ -71,6 +71,19 @@ One thing this cost, and it is why the constant is 50: a read is now proportiona
 than to one object. At 50 objects that is a few hundred kilobytes of decompression for a few kilobytes
 of answer. At 1000 it measured almost no extra saving and a much worse read.
 
+Measured on a 600 file tree, reading one file through `show`:
+
+```
+loose    1.6 ms median
+packed   1.8 ms median      (1.12x)
+```
+
+So the read price is 12%, not the several-fold a pack format can cost when the group is a whole
+repository. On a tree that small the pack does not pay for itself at all, which is why a repository
+below the threshold forms no group: 847 KB loose against 995 KB packed, because the index entries
+cost more than the shared vocabulary saved. The mechanism needs a tree with enough repeated text to
+be worth having.
+
 ### 2. `.gitattributes` covers line endings and nothing else
 
 `text`, `-text`/`binary`, `eol=lf` and `eol=crlf` are honoured, read from `.gitattributes` and from
