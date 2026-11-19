@@ -210,15 +210,52 @@ than the write they were protecting.
 Two things measured and rejected as the cause: sorting the 100,002 collected paths costs 8.1 ms, and
 the walk order is already unsorted, so the sort is not free but it is not the problem either.
 
-What would close the gap, in the order the numbers point at:
+One idea was written here first and then measured and removed, which is worth recording because it
+reads as obviously correct:
 
-- Read the stat cache into a hash map keyed by path without building an intermediate dict, and drop
-  the rows the walk never visits in the same pass instead of a second one.
-- Skip the ignore rule for a path whose parent directory was already matched by a directory rule,
-  which is most paths in a tree with a `target` or `node_modules` directory.
-- Compare the directory's own mtime with the recorded one and reuse every entry under it when it has
-  not changed. Git does not do this and it is why `git status` is 78 ms; the stat cache currently
-  saves the read but not the walk.
+> Compare the directory's own mtime with the recorded one and reuse every entry under it when it has
+> not changed.
+
+It is wrong. A directory's mtime changes when an entry is created, removed or renamed inside it. It
+does not change when a file inside it is rewritten. Measured on this filesystem: modifying an existing
+file left the directory mtime untouched, twice, while adding and removing a file both changed it.
+Adopting the idea would have made every edit to an existing file invisible to `status`, which is the
+one change a person makes most often. The measurement took two minutes and would have cost a bug that
+looks like data loss.
+
+### The sort nobody asked for
+
+`scan_files_excluding` sorted its result before returning it. No caller reads the order: the scan's
+output becomes a map keyed by relative path, and the two tests ask whether a path is present. The sort
+was 79 ms of a 244 ms walk at 100,000 files, because comparing paths compares components rather than
+bytes.
+
+Measured A/B on the same tree, two binaries, seven runs each:
+
+| | status at 100,000 files | ratio to `git status` |
+|---|---:|---:|
+| with the sort | 388.0 ms | 5.23x |
+| without it | 299.6 ms | 4.04x |
+
+23% faster, and the removed code was doing nothing. The walk fell from 244 ms to 164 ms, which is
+below the 186.7 ms Python floor measured for the same tree, so the remaining time is no longer the
+stat calls.
+
+That measurement also corrected an earlier one. `sorted()` on a list of Python strings costs 8.1 ms,
+and that number was taken to mean the sort was cheap. It was not: the Rust sort compares `PathBuf`
+values, which walks components, and the two are not comparable. Measuring the thing in the wrong
+language produced a wrong conclusion that survived two rounds of reasoning.
+
+What is left, in the order the numbers point at:
+
+- Remove passes. The scan is a walk, then a cache load, then the files vector, then `prune_cache`;
+  each one touches all 100,000 paths again.
+- Read the stat cache straight into the map the lookup needs, without an intermediate dict, and drop
+  the rows the walk never visited in the same pass.
+- Skip the ignore rule for a path whose parent was already excluded by a directory rule, which is most
+  paths in a tree holding `target` or `node_modules`. The rule check measured 14.8 ms today.
+- Stop cloning the hash string for every cached file. A cache hit allocates a `String` per file, which
+  is 100,000 allocations holding data the map already owns.
 
 None of those is done. The number above is what the tool does today.
 
