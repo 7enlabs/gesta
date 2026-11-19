@@ -2793,6 +2793,33 @@ def main():
             except Exception:
                 server.kill()
 
+    if want("project-files"):
+        # The three files every repository is expected to carry, checked rather than assumed. They
+        # were absent for the whole life of the project while Cargo.toml said `license = "MIT"`, which
+        # is a claim with nothing behind it.
+        for name, must_mention in (
+            ("LICENSE", "MIT License"),
+            ("CONTRIBUTING.md", "bench/gate.py"),
+            ("SECURITY.md", "Reporting a vulnerability"),
+        ):
+            path = os.path.join(ZF_DIR, name)
+            present = os.path.exists(path)
+            text = open(path, encoding="utf-8").read() if present else ""
+            record(
+                f"{name} exists and says what it is for",
+                present and must_mention in text,
+                f"present={present} mentions={must_mention in text}",
+            )
+        # The licence in Cargo.toml has to be the licence on disk, or the two disagree in the one
+        # place a person looks first.
+        cargo = open(os.path.join(ZF_DIR, "Cargo.toml"), encoding="utf-8").read()
+        licence = open(os.path.join(ZF_DIR, "LICENSE"), encoding="utf-8").read()
+        record(
+            "and the licence in Cargo.toml is the one on disk",
+            'license = "MIT"' in cargo and licence.startswith("MIT License"),
+            f"cargo says MIT: {'license = \"MIT\"' in cargo}",
+        )
+
     if want("git-clone"):
         # A server that a real git client can clone is the claim, and only a real git client can
         # check it. A test that reads our own response back proves the response is well formed and

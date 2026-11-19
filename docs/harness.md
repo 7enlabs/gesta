@@ -148,7 +148,7 @@ No task drives a language model. The harness scores a fixed reference answer and
 Measuring a model through the same interface is possible and is not what the runs in `runs/`
 contain.
 
-## What a task costs, not only whether it passed
+## What a task costs, beyond whether it passed
 
 A pass rate says a tool can do the work. It says nothing about what the work cost, and the published
 harness benchmark that held the model fixed found cost moving 17.5x across harnesses while quality

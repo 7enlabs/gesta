@@ -692,6 +692,12 @@ Each of these is pinned by a test, and each one exists because the first impleme
 
 ## Status
 
-Version 0.6.0. Usable for one developer or a set of agents, on one machine, on a private network over TLS, or by agents that never check out the tree. A markdown vault of 10,669 files costs 1.36x git in disk, down from 10.16x after blame storage moved from one row per line to ranges. Still not a full git replacement: a token cannot be revoked before its expiry without editing the auth file, and LFS does not exist.
+Version 0.6.0. Usable for one developer or a set of agents, on one machine, on a private network over TLS, or by agents that never check out the tree. A markdown vault of 10,669 files costs 1.36x git in disk, down from 10.16x after blame storage moved from one row per line to ranges. A plain `git clone` and a plain `git push` work against `gesta serve`. Still not a full git replacement: LFS and submodules do not exist, the git protocol server sends a full pack rather than a delta pack, and a token that is removed still works until the server restarts.
 
 `CHANGELOG.md` says what changed at each version. `docs/upgrade-plan.md` holds the measurements behind each decision and the list of what is still missing.
+
+## License
+
+MIT. See `LICENSE`.
+
+Bug reports and changes: `CONTRIBUTING.md`. Security reports: `SECURITY.md`.
