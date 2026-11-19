@@ -15,7 +15,7 @@ something rather than by reading the code. The order is by what blocks the most.
 
 ## Not closed, in the order they block
 
-### 1. Disk: 1.95x git, and the remainder is cross-file compression
+### 1. Disk: 1.4x git, after grouping objects into shared streams
 
 Measured on 11,301 files and 171 MB of content, both tools at their best:
 
@@ -49,10 +49,27 @@ gap between 76.3 and 33.8 MB once the ratios are applied to the same content.
 Raising the compression level does nothing: level 6 gives 47.3 MB and level 9 gives 47.2 MB, for
 10% more time. The gap is not effort, it is that a zlib stream cannot see the next file.
 
-Closing it means a pack format: objects concatenated into a few large blobs, with an index that maps
-a hash to a byte range, and the whole thing read through that index. That is real work and it costs
-the property that each object is one SQLite row, which is what makes `gc`, `fsck` and a partial read
-simple. It is not done, and the honest number until it is is 1.95x.
+That gap is closed now, and the shape of the fix came from measuring it first. Grouping objects
+before compressing them, 50 at a time and sorted by size, gets 1.36x; joining everything into one
+stream gets only 1.50x. Almost the whole win is available at a granularity a read can afford, so
+there was no need to trade the object model for it.
+
+`gesta gc` groups loose text objects into streams. Each object keeps its row, its hash and its own
+identity; the row names the group and the byte range instead of holding the body. Measured on the
+same 11,225 file tree:
+
+```
+before gc       69.2 MB
+after gc        51.4 MB      (25% smaller)
+```
+
+A read decompresses one group, which is 50 objects rather than the whole store, and the group is
+bounded on purpose. A repository too small to benefit forms no group at all, so a hundred small files
+do not pay for a mechanism they do not need.
+
+One thing this cost, and it is why the constant is 50: a read is now proportional to its group rather
+than to one object. At 50 objects that is a few hundred kilobytes of decompression for a few kilobytes
+of answer. At 1000 it measured almost no extra saving and a much worse read.
 
 ### 2. `.gitattributes` covers line endings and nothing else
 

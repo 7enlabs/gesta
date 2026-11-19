@@ -1219,8 +1219,12 @@ pub fn cmd_verify(id: Option<&str>, key_hex: Option<&str>) -> ZResult<()> {
 
 /// Read a git repository into this one.
 pub fn cmd_git_import(path: &str, prefix: Option<&str>) -> ZResult<()> {
-    let (_root, conn) = open_repo()?;
+    // The source is checked first. Opening the destination first meant a mistyped source path
+    // reported "not a repository: / and no directory above it holds one", which names the directory
+    // the tool was run from rather than the argument the person got wrong.
     let git_root = Path::new(path);
+    crate::gitobj::Repo::open(git_root)?;
+    let (_root, conn) = open_repo()?;
     let got = crate::git_bridge::import(&conn, git_root, prefix)?;
     println!(
         "imported {} commit(s) as changesets, {} path change(s), {} already present",

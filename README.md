@@ -634,6 +634,7 @@ that could not tell its result from its starting state. See `docs/harness.md`.
 - **Blame is line-sequence based.** A line moved and edited in the same commit loses its original author.
 - **Binary files are stored but not diffed.** They are kept raw and restored byte for byte, and `blame` has nothing to attribute for them. There is no LFS: a large binary costs its full size in every version that changes it.
 - **No submodules in the git sense.** `sub` records a child repository as a pointer, which covers the case without git's file.
+- **`gc` groups objects into shared compressed streams.** 50 to a group, sorted by size, because that gets 1.36x of the 1.50x available. Each object keeps its own row and hash.
 - **Secret scanning refuses a commit rather than warning.** Rules, entropy floors and an allowlist; no network validation, because a tool that makes a key authenticate has sent the key somewhere.
 - **`.gitattributes` covers line endings only.** `text`, `binary`, `eol=lf` and `eol=crlf`; no filters, diff drivers or merge drivers.
 - **Conflicts are resolved by editing files**, then committing the result. There is no interactive resolver.

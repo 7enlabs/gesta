@@ -575,7 +575,22 @@ fn clone_s3(url: &str, target: &Path, pin: Option<&str>, depth: Option<usize>) -
 pub fn cmd_gc() -> ZResult<()> {
     let (_root, conn) = open_repo()?;
     let deleted = crate::store::gc(&conn)?;
+    // Grouping runs after the removal, so a group never holds an object that gc just deleted.
+    let (groups, moved) = crate::pack::repack(&conn)?;
+    let (g_all, packed_bytes, raw_bytes) = crate::pack::group_stats(&conn)?;
     println!("gc: removed {} unreachable object(s), database vacuumed", deleted);
+    if groups > 0 {
+        println!(
+            "gc: grouped {} object(s) into {} new group(s); {} object(s) now share {} group(s)",
+            moved, groups, raw_bytes, g_all
+        );
+        if packed_bytes > 0 {
+            println!(
+                "gc: the grouped streams take {} byte(s) in total",
+                packed_bytes
+            );
+        }
+    }
     Ok(())
 }
 

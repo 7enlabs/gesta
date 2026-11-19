@@ -30,6 +30,7 @@ mod privacy;
 mod merge;
 mod ops;
 mod packfile;
+mod pack;
 mod remote;
 mod rebase;
 mod repo;

@@ -20,6 +20,9 @@ version is current and freezes when the number changes, so `0.6.0` is a record a
 - `diff --to <branch>` without `--from` compares against that revision's parent instead of the empty
   tree. `--from ""` still asks for the whole tree.
 - `review --json` prints one parseable document instead of text.
+- `gc` groups loose text objects into shared compressed streams, 50 to a group and sorted by size.
+  Measured on 11,225 files: 69.2 MB before, 51.4 MB after. Each object keeps its own row, hash and
+  identity, so `fsck`, `gc` and a partial read stay simple; only the body moves.
 - `git import` writes `file_versions`, so blame, `grep --history` and the history secret scan work
   on an imported repository. It wrote only `changeset_files` before, which left every per-path
   question over time unanswerable and silent about it.

@@ -149,6 +149,31 @@ impl Repo {
                 git_dir: start.to_path_buf(),
             });
         }
+        // Four things reach this function and only two of them are a directory: a repository, a
+        // path inside one, a bundle file, and a path that does not exist. "no git repository at or
+        // above X" is true for all four and useless for two, because a bundle is a single file that
+        // holds a whole history and the reader has to clone it first. Say which case this is.
+        if start.exists() && !start.is_dir() {
+            let name = start.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            if name.ends_with(".bundle") || name.ends_with(".pack") {
+                return Err(bad(format!(
+                    "{} is a file, not a repository. A git bundle holds a whole history in one file, so it has to be cloned before it can be read:\n  git clone {} <some-directory>\n  gesta git import <some-directory>",
+                    start.display(),
+                    start.display()
+                )));
+            }
+            return Err(bad(format!(
+                "{} is a file, not a directory. This command takes a git repository directory (a checkout, or a bare repository)",
+                start.display()
+            )));
+        }
+        if !start.exists() {
+            return Err(bad(format!(
+                "{} does not exist, so there is no repository to read",
+                start.display()
+            )));
+        }
+
         let mut cur = start.to_path_buf();
         loop {
             let candidate = cur.join(".git");

@@ -2626,6 +2626,97 @@ def main():
             (nb.stderr or nb.stdout)[-400:],
         )
 
+    if want("pack"):
+        # Grouping objects so one zlib stream can see all of them is only worth anything if three
+        # things hold at once: the file shrinks, every object still reads back byte for byte, and a
+        # repository too small to benefit is left alone. Each is asserted, because the first two are
+        # easy to get by breaking the third and vice versa.
+        import tempfile as _tfp
+
+        d = _tfp.mkdtemp(prefix="gate-pack-")
+        sh(f"{ZF} init", cwd=d)
+        # Content with the repetition real source has: a hundred small files that share a vocabulary.
+        for i in range(120):
+            body = "".join(
+                "fn handler_%d_line_%d() -> usize { %d }\n" % (i, j, j) for j in range(40)
+            )
+            with open(os.path.join(d, "f%03d.rs" % i), "w") as fh:
+                fh.write(body)
+        r = sh(f'{ZF} changeset create "bulk" --author t --json', cwd=d)[1]
+        m = re.search(r"(cs[0-9a-f]+)", r)
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+
+        def db_bytes():
+            total = 0
+            for root, _dirs, fs in os.walk(os.path.join(d, ".gesta")):
+                for name in fs:
+                    try:
+                        total += os.path.getsize(os.path.join(root, name))
+                    except OSError:
+                        pass
+            return total
+
+        before = db_bytes()
+        sh(f"{ZF} gc", cwd=d)
+        conn = __import__("sqlite3").connect(os.path.join(d, ".gesta", "gesta.db"))
+        conn.execute("VACUUM")
+        grouped = conn.execute("SELECT COUNT(*) FROM objects WHERE group_id IS NOT NULL").fetchone()[0]
+        groups = conn.execute("SELECT COUNT(*) FROM object_groups").fetchone()[0]
+        conn.close()
+        after = db_bytes()
+
+        record(
+            "gc groups objects so one stream can see all of them",
+            grouped > 0 and groups > 0,
+            f"{grouped} object(s) in {groups} group(s)",
+        )
+        record(
+            "and the store gets smaller",
+            after < before,
+            f"{before} bytes before, {after} after, {100 * (before - after) / max(before, 1):.1f}% smaller",
+        )
+
+        # Every object has to read back exactly. A pack that saves space and loses a byte is a
+        # corrupt store with a smaller file size.
+        ids = sh(f"{ZF} ls", cwd=d)[1].split()
+        h = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} log --oneline", cwd=d)[1])
+        bad = []
+        for name in ids[:40]:
+            got = subprocess.run(
+                f'{ZF} show "{h.group(1) if h else "main"}:{name}"',
+                shell=True, cwd=d, capture_output=True,
+            ).stdout
+            # Not `want`: that name is the step dispatcher for the whole file, and shadowing it
+            # broke every step after this one with "'bytes' object is not callable".
+            on_disk = open(os.path.join(d, name), "rb").read()
+            if got != on_disk:
+                bad.append(f"{name}: {len(got)} vs {len(on_disk)}")
+        record(
+            "and every grouped object reads back byte for byte",
+            not bad,
+            "; ".join(bad[:4]) or f"{min(40, len(ids))} object(s) compared",
+        )
+
+        # A store too small to benefit must not pay for the mechanism.
+        small = _tfp.mkdtemp(prefix="gate-pack-small-")
+        sh(f"{ZF} init", cwd=small)
+        with open(os.path.join(small, "one.txt"), "w") as fh:
+            fh.write("x\n")
+        r2 = sh(f'{ZF} changeset create "tiny" --author t --json', cwd=small)[1]
+        m2 = re.search(r"(cs[0-9a-f]+)", r2)
+        if m2:
+            sh(f"{ZF} changeset commit {m2.group(1)}", cwd=small)
+        sh(f"{ZF} gc", cwd=small)
+        c2 = __import__("sqlite3").connect(os.path.join(small, ".gesta", "gesta.db"))
+        g2 = c2.execute("SELECT COUNT(*) FROM object_groups").fetchone()[0]
+        c2.close()
+        record(
+            "a repository too small to benefit forms no group",
+            g2 == 0,
+            f"{g2} group(s) formed for a one file repository",
+        )
+
     if want("disk"):
         # The ratio this replaces was wrong twice: it compared against an unpacked git, and it named
         # a table as the culprit without measuring it. A check that only asserted a ratio would let

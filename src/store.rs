@@ -90,7 +90,21 @@ pub fn init_schema(conn: &Connection) -> ZResult<()> {
             content    BLOB NOT NULL,
             size       INTEGER NOT NULL,
             compressed INTEGER NOT NULL DEFAULT 1,
-            created_at INTEGER NOT NULL
+            created_at INTEGER NOT NULL,
+            -- Where the body actually lives when it shares a stream with other objects. NULL means
+            -- it is in `content`, which is every object in a repository that never ran `gc --pack`.
+            group_id   INTEGER,
+            offset     INTEGER,
+            length     INTEGER
+        );
+        -- One compressed stream holding several objects, so the compressor can see across them.
+        -- A zlib stream cannot, and the shared vocabulary in source files is most of what it costs.
+        CREATE TABLE IF NOT EXISTS object_groups (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            packed       BLOB NOT NULL,
+            raw_size     INTEGER NOT NULL,
+            object_count INTEGER NOT NULL,
+            created_at   INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS changesets (
             id         TEXT PRIMARY KEY,
@@ -335,11 +349,24 @@ pub fn migrate(conn: &Connection) -> ZResult<bool> {
         }
     }
 
-    if obj_cols.iter().any(|c| c == "compressed") {
-        return Ok(changed);
+    if !obj_cols.iter().any(|c| c == "compressed") {
+        conn.execute_batch("ALTER TABLE objects ADD COLUMN compressed INTEGER NOT NULL DEFAULT 0")?;
+        changed = true;
     }
 
-    conn.execute_batch("ALTER TABLE objects ADD COLUMN compressed INTEGER NOT NULL DEFAULT 0")?;
+    // The group columns are optional: an object that has none keeps its body in `content` and reads
+    // exactly as before, so adding them empty is the whole migration and no data moves.
+    for col in [
+        "ALTER TABLE objects ADD COLUMN group_id INTEGER",
+        "ALTER TABLE objects ADD COLUMN offset INTEGER",
+        "ALTER TABLE objects ADD COLUMN length INTEGER",
+    ] {
+        let name = col.split_whitespace().nth(5).unwrap_or("");
+        if !obj_cols.iter().any(|c| c == name) {
+            let _ = conn.execute(col, []);
+            changed = true;
+        }
+    }
     ensure_column(conn, "changesets", "git_commit", "TEXT")?;
     // A signature over the changeset's identity, and the public key it verifies against.
     ensure_column(conn, "changesets", "signature", "TEXT")?;
@@ -348,6 +375,9 @@ pub fn migrate(conn: &Connection) -> ZResult<bool> {
         conn.execute_batch("ALTER TABLE changesets ADD COLUMN parent2 TEXT")?;
     }
     init_schema(conn)?;
+    // Migration ran, so the caller has to re-read the schema it cached. The value was always true
+    // here; `changed` tracked columns added along the way and nothing read it.
+    let _ = changed;
     Ok(true)
 }
 
@@ -395,7 +425,7 @@ fn compress(content: &str) -> ZResult<Vec<u8>> {
     Ok(enc.finish()?)
 }
 
-fn compress_bytes(data: &[u8]) -> ZResult<Vec<u8>> {
+pub fn compress_bytes(data: &[u8]) -> ZResult<Vec<u8>> {
     let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
     enc.write_all(data)?;
     Ok(enc.finish()?)
@@ -617,6 +647,16 @@ pub fn get_object_bytes(conn: &Connection, hash: &str) -> ZResult<Vec<u8>> {
     if delta.is_some() {
         return Ok(get_object(conn, hash)?.into_bytes());
     }
+    // A grouped object keeps its body in a shared stream. Asking for the group first is one column
+    // read, and it keeps every caller on one path: nothing outside this function needs to know
+    // whether an object is packed.
+    if let Ok(crate::pack::Placement::Packed { group, offset, length }) =
+        crate::pack::placement(conn, hash)
+    {
+        if let Some(body) = crate::pack::read(conn, group, offset, length)? {
+            return Ok(body);
+        }
+    }
     let row: Option<(Vec<u8>, i64)> = conn
         .query_row(
             "SELECT content, compressed FROM objects WHERE hash = ?1",
@@ -634,6 +674,17 @@ pub fn get_object_bytes(conn: &Connection, hash: &str) -> ZResult<Vec<u8>> {
 }
 
 fn read_whole(conn: &Connection, hash: &str) -> ZResult<String> {
+    // A grouped object has no body in its own row, so the group is asked first. Both readers go
+    // through here, and only one of them knew about groups at first: `show` failed with "incomplete
+    // deflate stream" because it read the empty `content` column and tried to decompress nothing.
+    if let Ok(crate::pack::Placement::Packed { group, offset, length }) =
+        crate::pack::placement(conn, hash)
+    {
+        if let Some(body) = crate::pack::read(conn, group, offset, length)? {
+            return String::from_utf8(body)
+                .map_err(|e| bad(format!("object {} is not valid UTF-8: {}", hash, e)));
+        }
+    }
     let row: Option<(Vec<u8>, i64)> = conn
         .query_row(
             "SELECT content, compressed FROM objects WHERE hash = ?1",
