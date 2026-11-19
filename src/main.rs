@@ -5,6 +5,7 @@
 
 mod attributes;
 mod backup;
+mod audit;
 mod auth;
 mod bisect;
 mod brief;
