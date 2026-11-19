@@ -30,12 +30,16 @@ rows**, not smaller ones, and every option costs a capability:
 
 Neither is done. Until one is, the honest number stays 10.2x.
 
-### 2. `.gitattributes` is ignored
+### 2. `.gitattributes` covers line endings and nothing else
 
-A `*.txt text eol=lf` file has no effect. On a mixed team this is not cosmetic: a Windows checkout
-and a Unix checkout of the same file differ in every line ending, so every commit looks like it
-touched the whole file. A minimal `text` and `eol` is a few hundred lines and a large reduction in
-false diffs.
+`text`, `-text`/`binary`, `eol=lf` and `eol=crlf` are honoured, read from `.gitattributes` and from
+`.gesta/attributes`, with the last matching rule winning. A text rule normalises to LF in the object
+and writes the named ending to the working tree, so a Windows checkout and a Unix one agree on what
+changed. `ignore attr <path>` says which rule decided, because a rule file where the last match wins
+is easy to write and hard to read back.
+
+Absent: filters, diff drivers, merge drivers, and `working-tree-encoding`. Each of those runs a
+program on every file, which is a different feature with its own trust question.
 
 ### 3. No SSH transport
 

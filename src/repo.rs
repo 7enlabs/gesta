@@ -80,7 +80,8 @@ pub fn diff_worktree(conn: &Connection, root: &Path, branch: &str) -> ZResult<Wo
 
     // The scan uses the stat cache, so an unchanged file is not re-read from
     // disk and re-hashed on every `status`.
-    let scanned = crate::cache::scan_with_cache(conn, root, &rules)?;
+    let attrs = crate::attributes::Rules::load(root);
+    let scanned = crate::cache::scan_with_cache(conn, root, &rules, &attrs)?;
     for f in &scanned.files {
         // A sparse checkout leaves out-of-scope files on disk. Counting them
         // would report the rest of the repository as new.
@@ -152,7 +153,8 @@ pub fn create_changeset(
     // One tree lookup for the whole snapshot, not one per file.
     let committed = committed_tree(conn, &branch)?;
 
-    let scanned = crate::cache::scan_with_cache(conn, root, &rules)?;
+    let attrs = crate::attributes::Rules::load(root);
+    let scanned = crate::cache::scan_with_cache(conn, root, &rules, &attrs)?;
     if let Some(first) = scanned.unreadable.first() {
         return Err(bad(format!("cannot read {} ({} more)", first, scanned.unreadable.len() - 1)));
     }
@@ -1085,6 +1087,10 @@ pub fn checkout_file(
     };
 
     let content = crate::store::get_object_bytes(conn, &hash)?;
+    // The same decision every other writer makes. A checkout that ignores `eol` writes a file the
+    // next scan immediately reports as modified, which reads as if the checkout failed.
+    let attrs = crate::attributes::Rules::load(root);
+    let content = crate::attributes::plan_for(&attrs, rel).checked_out(&content);
     let target = root.join(rel);
     if let Some(parent) = target.as_path().parent() {
         fs::create_dir_all(parent)?;
@@ -1253,10 +1259,16 @@ pub fn materialise(conn: &Connection, root: &Path, branch: &str) -> ZResult<usiz
         }
     }
 
+    // The rules are read once for the whole write. A checkout that ignores them leaves a Windows
+    // tree with LF endings the editor then rewrites, so the next commit touches every line.
+    let attrs = crate::attributes::Rules::load(root);
     for (path, hash) in &files {
         // Bytes, not text: a binary file is stored raw and is not valid UTF-8, and asking for
         // it as a string refused the whole materialise with a message about encoding.
         let content = crate::store::get_object_bytes(conn, hash)?;
+        // The line ending the working tree wants, which is not always the one the object holds.
+        let plan = crate::attributes::plan_for(&attrs, path);
+        let content = plan.checked_out(&content);
         let target = root.join(path);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
@@ -1279,9 +1291,12 @@ pub fn restore_worktree(conn: &Connection, root: &Path, branch: &str) -> ZResult
     // the head changeset alone loses every file added by an earlier changeset.
     let files = tree_at(conn, &head)?;
 
+    let attrs = crate::attributes::Rules::load(root);
     let mut written = 0usize;
     for (path, hash) in &files {
         let content = crate::store::get_object_bytes(conn, hash)?;
+        let plan = crate::attributes::plan_for(&attrs, path);
+        let content = plan.checked_out(&content);
         let target = root.join(path);
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;

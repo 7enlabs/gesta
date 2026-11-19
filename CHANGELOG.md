@@ -11,6 +11,16 @@ the version numbers in `Cargo.toml` are the only boundary and this file follows 
 Each section is the work that landed at that version, newest first. A section grows while its
 version is current and freezes when the number changes, so `0.6.0` is a record and not a plan.
 
+## Unreleased
+
+- `.gitattributes` support for line endings. `text` normalises to LF in the object, `eol=lf` and
+  `eol=crlf` decide what the working tree gets, and `-text` or `binary` stores bytes unchanged. Read
+  from `.gitattributes` and from `.gesta/attributes`, with the last matching rule winning.
+- `ignore attr <path> [--json]` says which rule decides how a path is stored and checked out.
+- `diff --to <branch>` without `--from` compares against that revision's parent instead of the empty
+  tree. `--from ""` still asks for the whole tree.
+- `review --json` prints one parseable document instead of text.
+
 ## 0.6.0, 2026-11-18
 
 ### Pricing a task, not only passing it

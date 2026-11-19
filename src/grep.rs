@@ -186,7 +186,8 @@ pub fn search_worktree(
 ) -> ZResult<Vec<Hit>> {
     let rules = crate::repo::load_ignore_rules(root, conn)?;
     let scope = crate::sparse::SparseScope::load(conn)?;
-    let scanned = crate::cache::scan_with_cache(conn, root, &rules)?;
+    let attrs = crate::attributes::Rules::load(root);
+    let scanned = crate::cache::scan_with_cache(conn, root, &rules, &attrs)?;
     if let Some(first) = scanned.unreadable.first() {
         return Err(bad(format!(
             "cannot read {} ({} more)",

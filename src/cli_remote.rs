@@ -1707,3 +1707,72 @@ pub fn cmd_deepen(
     );
     Ok(())
 }
+
+/// Say which attribute rule decides what happens to a path, and what the two answers are.
+///
+/// Same reasoning as `ignore why`: a rule file where the last matching rule wins is easy to write
+/// and hard to read back, and a person who wonders why a file keeps appearing as a whole-file diff
+/// should not have to replay the matching by hand.
+pub fn cmd_attributes_why(path: &str, json: bool) -> ZResult<()> {
+    let (root, _conn) = open_repo()?;
+    let rules = crate::attributes::Rules::load(&root);
+    let decision = crate::attributes::explain(&rules, path);
+    let plan = crate::attributes::plan_for(&rules, path);
+
+    if json {
+        crate::cli::emit_object(vec![
+            ("path", crate::json::Json::str(path.to_string())),
+            ("text", crate::json::Json::str(decision["text"].clone())),
+            ("eol", crate::json::Json::str(decision["eol"].clone())),
+            ("rule", crate::json::Json::str(decision["rule"].clone())),
+            ("stored_as_lf", crate::json::Json::Bool(plan.normalise)),
+            ("rules", crate::json::Json::int(rules.rules.len() as i64)),
+            (
+                "source",
+                match &rules.source {
+                    Some(s) => crate::json::Json::str(s.clone()),
+                    None => crate::json::Json::Null,
+                },
+            ),
+        ]);
+        return Ok(());
+    }
+
+    println!("{}", path);
+    if rules.is_empty() {
+        println!("  no attribute rules, so the default applies");
+    } else {
+        println!(
+            "  decided by: {} (last matching rule wins)",
+            decision["rule"]
+        );
+    }
+    println!("  text: {}   eol: {}", decision["text"], decision["eol"]);
+    println!(
+        "  stored as: {}",
+        if plan.normalise {
+            "LF line endings"
+        } else {
+            "byte for byte"
+        }
+    );
+    if let Some(eol) = plan.checkout {
+        println!(
+            "  written to the working tree with: {}",
+            match eol {
+                crate::attributes::Eol::Lf => "LF",
+                crate::attributes::Eol::Crlf => "CRLF",
+            }
+        );
+    } else {
+        println!("  written to the working tree as stored");
+    }
+    if let Some(src) = &rules.source {
+        println!(
+            "  {} rule(s) from {}",
+            rules.rules.len(),
+            src
+        );
+    }
+    Ok(())
+}

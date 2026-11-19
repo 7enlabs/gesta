@@ -3,6 +3,7 @@
 //! Server-side changesets, content-addressed compressed objects, derived blame
 //! and history, three-way merge, remote sync, and an operation log for undo.
 
+mod attributes;
 mod auth;
 mod bisect;
 mod brief;
@@ -790,6 +791,14 @@ enum IgnoreCmd {
     List,
     /// Remove a pattern
     Remove { pattern: String },
+    /// Say which attribute rule decides how a path is stored and checked out
+    Attr {
+        /// Path relative to the repository root
+        path: String,
+        /// Machine readable
+        #[arg(long = "json")]
+        json_attr: bool,
+    },
     /// Say whether a path is ignored, and which rule decides it
     Why {
         path: String,
@@ -1069,6 +1078,9 @@ fn run() -> ZResult<()> {
             IgnoreCmd::Remove { pattern } => cli_remote::cmd_ignore_remove(&pattern),
             IgnoreCmd::Why { path, json_why } => {
                 cli_remote::cmd_ignore_why(&path, json_why || json)
+            }
+            IgnoreCmd::Attr { path, json_attr } => {
+                cli_remote::cmd_attributes_why(&path, json_attr || json)
             }
         },
     }

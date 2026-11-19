@@ -2466,6 +2466,107 @@ def main():
             f"columns: {', '.join(cols)}",
         )
 
+    if want("attributes"):
+        # A mixed team writes the same file with different line endings. Without a rule the two
+        # checkouts disagree on every line, so every commit looks like it touched the whole file.
+        import tempfile as _tf
+
+        d = _tf.mkdtemp()
+        sh(f"{ZF} init", cwd=d)
+        with open(os.path.join(d, ".gitattributes"), "w") as fh:
+            fh.write("*.txt text eol=lf\n")
+        # A CRLF file, which is what a Windows editor writes.
+        with open(os.path.join(d, "win.txt"), "wb") as fh:
+            fh.write(b"one\r\ntwo\r\n")
+        m = re.search(r"(cs[0-9a-f]+)", sh(f'{ZF} changeset create "crlf" --author t --json', cwd=d)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+
+        import json as _js
+        import subprocess as _sub
+
+        # Bytes from stdout alone. A helper that strips whitespace removes the trailing newline the
+        # assertion is about, and a helper that merges stderr makes a content comparison fail for a
+        # reason that has nothing to do with content.
+        body = _sub.run(f"{ZF} show main:win.txt", shell=True, cwd=d, capture_output=True).stdout
+        record(
+            "a text rule stores LF even when the file on disk is CRLF",
+            body == b"one\ntwo\n",
+            f"stored bytes: {body[:40]!r}",
+        )
+
+        # Rewriting the same content with CRLF must not look like a change. This is the false diff
+        # the rule exists to prevent, so it is the assertion that matters.
+        with open(os.path.join(d, "win.txt"), "wb") as fh:
+            fh.write(b"one\r\ntwo\r\n")
+        st = sh(f"{ZF} status", cwd=d)[1]
+        record(
+            "and rewriting the same CRLF content is not a change",
+            "clean" in st,
+            st.strip().splitlines()[-1][:160] if st.strip() else "(no output)",
+        )
+
+        # A real edit has to still be seen. A rule that hides changes is worse than no rule.
+        with open(os.path.join(d, "win.txt"), "wb") as fh:
+            fh.write(b"one\r\nthree\r\n")
+        st2 = sh(f"{ZF} status", cwd=d)[1]
+        record(
+            "and a real edit is still reported",
+            "modified" in st2 or "M win.txt" in st2,
+            st2.strip().splitlines()[-1][:160] if st2.strip() else "(no output)",
+        )
+
+        # eol=crlf has to reach the disk, and the scan after it has to agree with what it wrote.
+        with open(os.path.join(d, ".gitattributes"), "w") as fh:
+            fh.write("*.txt text eol=crlf\n")
+        m2 = re.search(r"(cs[0-9a-f]+)", sh(f'{ZF} changeset create "eol crlf" --author t --json', cwd=d)[1])
+        if m2:
+            sh(f"{ZF} changeset commit {m2.group(1)}", cwd=d)
+        os.remove(os.path.join(d, "win.txt"))
+        sh(f"{ZF} checkout win.txt", cwd=d)
+        disk = open(os.path.join(d, "win.txt"), "rb").read()
+        record(
+            "eol=crlf is written to the working tree while the object keeps LF",
+            disk == b"one\r\nthree\r\n",
+            f"disk bytes: {disk[:40]!r}",
+        )
+        st3 = sh(f"{ZF} status", cwd=d)[1]
+        record(
+            "and the scan agrees with what the checkout wrote",
+            "clean" in st3,
+            st3.strip().splitlines()[-1][:160] if st3.strip() else "(no output)",
+        )
+
+        # A binary attribute stores bytes unchanged, because normalising them corrupts the file.
+        with open(os.path.join(d, ".gitattributes"), "a") as fh:
+            fh.write("*.dat binary\n")
+        raw = b"\x00\x01\r\n\x02"
+        with open(os.path.join(d, "raw.dat"), "wb") as fh:
+            fh.write(raw)
+        m3 = re.search(r"(cs[0-9a-f]+)", sh(f'{ZF} changeset create "binary" --author t --json', cwd=d)[1])
+        if m3:
+            sh(f"{ZF} changeset commit {m3.group(1)}", cwd=d)
+        # Bytes, not text: decoding a binary body to compare it is how a test passes while the
+        # content is already corrupted.
+        rd = _sub.run(
+            f"{ZF} show main:raw.dat", shell=True, cwd=d, capture_output=True
+        )
+        got = rd.stdout
+        record(
+            "a binary rule stores the bytes unchanged",
+            got == raw,
+            f"stored {got!r} but wrote {raw!r}",
+        )
+
+        why = sh_out(f"{ZF} ignore attr win.txt --json", cwd=d)[1]
+        try:
+            doc = _js.loads(why)
+            ok = doc.get("rule") == "*.txt" and doc.get("eol") == "crlf"
+            detail = why[:200]
+        except Exception as exc:
+            ok, detail = False, f"not one document: {exc}"
+        record("attributes why names the deciding rule", ok, detail)
+
     if want("diff-range"):
         # `--to` alone used to mean "from the empty tree", so asking what the last change did
         # listed every file in the repository. The default has to answer the question a caller

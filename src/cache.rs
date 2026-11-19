@@ -51,6 +51,7 @@ pub fn scan_with_cache(
     conn: &Connection,
     root: &Path,
     rules: &IgnoreRules,
+    attrs: &crate::attributes::Rules,
 ) -> ZResult<ScanResult> {
     let known = load_cache(conn)?;
     // Sized up front. Growing a vector of 2000 entries by doubling copies every
@@ -115,8 +116,24 @@ pub fn scan_with_cache(
             }
         }
 
+        // The plan is per path and constant for the life of the scan, so it is computed once here
+        // rather than at every place that reads a body. The hash has to be taken over the bytes the
+        // object will hold, or a checkout with CRLF endings records a hash that no object matches.
+        let plan = crate::attributes::plan_for(attrs, &rel);
+
         match read_file(&path) {
             ReadOutcome::Text(content) => {
+                let content = if plan.normalise {
+                    match String::from_utf8(plan.stored(content.as_bytes())) {
+                        Ok(s) => s,
+                        // Normalising never changes bytes for a body that parsed as UTF-8, so this
+                        // is unreachable rather than a case to handle. Keeping the original is the
+                        // safe answer if it ever is reached.
+                        Err(_) => content,
+                    }
+                } else {
+                    content
+                };
                 let hash = hash_content(&content);
                 rehashed += 1;
                 pending_writes.push((rel.clone(), mtime, size, hash.clone()));
@@ -252,7 +269,7 @@ mod tests {
         std::fs::write(d.join("b.txt"), "two\n").unwrap();
         let conn = mem_db();
         let rules = IgnoreRules::with_defaults(&[]);
-        let r = scan_with_cache(&conn, &d, &rules).unwrap();
+        let r = scan_with_cache(&conn, &d, &rules, &crate::attributes::Rules::default()).unwrap();
         assert_eq!(r.files.len(), 2);
         assert_eq!(r.files[0].hash, hash_content("one\n"));
         let _ = std::fs::remove_dir_all(&d);
@@ -268,7 +285,7 @@ mod tests {
         std::fs::write(d.join("b.bin"), [0u8, 1, 2, 3]).unwrap();
         let conn = mem_db();
         let rules = IgnoreRules::with_defaults(&[]);
-        let r = scan_with_cache(&conn, &d, &rules).unwrap();
+        let r = scan_with_cache(&conn, &d, &rules, &crate::attributes::Rules::default()).unwrap();
 
         assert_eq!(r.files.len(), 2, "the binary should be in the scan");
         let bin = r
@@ -297,7 +314,7 @@ mod tests {
         let rules = IgnoreRules::with_defaults(&[]);
 
         remember(&conn, &d, "a.txt", &hash_content("stable\n")).unwrap();
-        let r = scan_with_cache(&conn, &d, &rules).unwrap();
+        let r = scan_with_cache(&conn, &d, &rules, &crate::attributes::Rules::default()).unwrap();
         assert_eq!(r.cached, 1, "an unchanged stat should be a cache hit");
         assert_eq!(r.rehashed, 0);
 
@@ -314,7 +331,7 @@ mod tests {
         let rules = IgnoreRules::with_defaults(&[]);
         remember(&conn, &d, "a.txt", &hash_content("WRONG\n")).unwrap();
 
-        let r = scan_with_cache(&conn, &d, &rules).unwrap();
+        let r = scan_with_cache(&conn, &d, &rules, &crate::attributes::Rules::default()).unwrap();
         assert_eq!(
             r.files[0].hash,
             hash_content("AAAA\n"),
@@ -337,7 +354,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         std::fs::write(d.join("a.txt"), "after and longer\n").unwrap();
 
-        let r = scan_with_cache(&conn, &d, &rules).unwrap();
+        let r = scan_with_cache(&conn, &d, &rules, &crate::attributes::Rules::default()).unwrap();
         assert_eq!(r.files.len(), 1);
         assert_eq!(r.files[0].content, "after and longer\n");
         assert_eq!(r.files[0].hash, hash_content("after and longer\n"));
@@ -355,7 +372,7 @@ mod tests {
         let rules = IgnoreRules::with_defaults(&[]);
         remember(&conn, &d, "a.txt", &hash_content("WRONG\n")).unwrap();
 
-        let r = scan_with_cache(&conn, &d, &rules).unwrap();
+        let r = scan_with_cache(&conn, &d, &rules, &crate::attributes::Rules::default()).unwrap();
         assert_eq!(r.files[0].hash, hash_content("AAAA\n"), "must hash real content");
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -387,7 +404,7 @@ mod tests {
             .set_modified(old)
             .unwrap();
 
-        let r = scan_with_cache(&conn, &d, &rules).unwrap();
+        let r = scan_with_cache(&conn, &d, &rules, &crate::attributes::Rules::default()).unwrap();
         assert_eq!(r.cached, 1, "the cache row should answer");
         assert_eq!(r.rehashed, 0, "nothing should have been read");
         assert_eq!(r.files[0].hash, recorded, "the file must not have been read");
@@ -406,7 +423,7 @@ mod tests {
         remember(&conn, &d, "a.txt", &hash_content("one\n")).unwrap();
 
         std::fs::write(&p, "a much longer second body\n").unwrap();
-        let r = scan_with_cache(&conn, &d, &rules).unwrap();
+        let r = scan_with_cache(&conn, &d, &rules, &crate::attributes::Rules::default()).unwrap();
         assert_eq!(r.rehashed, 1);
         assert_eq!(r.files[0].hash, hash_content("a much longer second body\n"));
 
