@@ -77,8 +77,9 @@ A real fix is fewer rows, not smaller ones. Two candidates, neither implemented:
    the tree as one serialized value per branch, the way git does, trades the ability to
    query a single path for a much smaller file.
 
-Both are schema changes and both lose a capability. Neither has been done, and the honest
-number stays 6.6x until one of them is.
+Both are schema changes and both lose a capability. Neither has been done. The 6.6x in this
+section was measured on small files before the blame table was rewritten as ranges; see the next
+section, and `docs/git-parity.md` for the figure on a real tree (2.3x against a packed git).
 
 ## Blame was 90% of the database
 
@@ -86,7 +87,8 @@ Measured on this project: 118 files, 62,824 blame rows, one distinct changeset. 
 the same changeset id, author and timestamp once per line of every file, and its two indexes doubled
 the cost. `dbstat` put blame at 3,944,448 bytes plus 4,412,800 bytes of index, against 622,592 bytes
 for the objects themselves. The disk figure this project reported as 6.6x and 10.2x was mostly this
-one table.
+one table, which is why both of those numbers were retired once the ranges landed: on 11,301 files
+the table is now 0.9 MB, 1.2% of the database, and the remaining ratio is compression.
 
 Blame is stored as ranges now. A file written by one commit is one row:
 

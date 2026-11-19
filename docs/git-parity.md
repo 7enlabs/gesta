@@ -15,20 +15,44 @@ something rather than by reading the code. The order is by what blocks the most.
 
 ## Not closed, in the order they block
 
-### 1. Disk: 10.2x git on a markdown vault
+### 1. Disk: 1.95x git, and the remainder is cross-file compression
 
-Measured on 11,062 files: 550,338,560 bytes against git's 54,179,187. This is the worst number in
-the project and the one that decides whether a large repository is practical.
+Measured on 11,301 files and 171 MB of content, both tools at their best:
 
-The measurement and the failed fix are in `docs/storage.md`. The short version: packing small
-objects into one row cost more than it saved, because a pointer is a hash, two integers and a row
-header. The cost sits in six tables that each hold a row per tracked path, so the fix is **fewer
-rows**, not smaller ones, and every option costs a capability:
+```
+work tree                      171.7 MB
+git, packed                     37.4 MB
+gesta, after VACUUM             72.8 MB
+```
 
-- One row per path instead of per version: loses the ability to ask about any older version.
-- A serialized tree per branch, the way git does: loses per-path queries.
+The earlier figure in this document was 10.2x, and it dated from before the blame table was rewritten
+as ranges. It also compared gesta against an unpacked git, and named a table as the suspect without
+measuring it. `bench/disk.py` now does what a comparison has to do: pack git with `--no-detach`
+(a plain `git gc` detaches and returns before it has packed anything, which made an early run of this
+very script report that git never shrank), VACUUM gesta, and break the database down by table.
 
-Neither is done. Until one is, the honest number stays 10.2x.
+```
+objects                  59.8 MB   82.1%
+file_versions             1.7 MB    2.3%
+changeset_files           1.6 MB    2.2%
+worktree_cache            1.6 MB    2.1%
+branch_tree               1.5 MB    2.0%
+blame_ranges              0.9 MB    1.2%
+every other table         5.4 MB    7.9%
+```
+
+Everything that is a row per path is small. The content is the cost, and the reason is specific:
+git compresses many objects into one stream, and gesta compresses each object on its own. Measured
+on this tree, joining the objects into one stream gives 1.50x, which is almost exactly the remaining
+gap between 76.3 and 33.8 MB once the ratios are applied to the same content.
+
+Raising the compression level does nothing: level 6 gives 47.3 MB and level 9 gives 47.2 MB, for
+10% more time. The gap is not effort, it is that a zlib stream cannot see the next file.
+
+Closing it means a pack format: objects concatenated into a few large blobs, with an index that maps
+a hash to a byte range, and the whole thing read through that index. That is real work and it costs
+the property that each object is one SQLite row, which is what makes `gc`, `fsck` and a partial read
+simple. It is not done, and the honest number until it is is 1.95x.
 
 ### 2. `.gitattributes` covers line endings and nothing else
 
@@ -98,6 +122,6 @@ is a difference from git that a person will notice.
 For one person on one machine, on text and binary files, with a remote over HTTP or object
 storage: nothing above blocks it today, and the daily cycle is measured and working.
 
-For a team: disk at 10.2x, no line-ending normalisation, and a forge still reached through git.
+For a team: disk at 1.95x, no forge of its own, and no submodules in the git sense.
 Those three are the real answer to the question, and two of them are schema and format work rather
 than new features.

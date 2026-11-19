@@ -2466,6 +2466,104 @@ def main():
             f"columns: {', '.join(cols)}",
         )
 
+    if want("disk"):
+        # The ratio this replaces was wrong twice: it compared against an unpacked git, and it named
+        # a table as the culprit without measuring it. A check that only asserted a ratio would let
+        # the same two mistakes back in, so this asserts the method as well as the number.
+        import tempfile as _tf
+        import json as _js_d
+        import shutil as _shutil
+
+        d = _tf.mkdtemp(prefix="gate-disk-")
+        tree = os.path.join(d, "tree")
+        os.makedirs(tree)
+        # Content with repetition, so the ratio is about compression rather than about incompressible
+        # random bytes that would make both tools look identical.
+        for i in range(400):
+            sub = os.path.join(tree, f"d{i // 30}")
+            os.makedirs(sub, exist_ok=True)
+            body = "".join("line %d of file %d with the same words\n" % (j, i) for j in range(60))
+            with open(os.path.join(sub, f"f{i}.txt"), "w") as fh:
+                fh.write(body)
+
+        def tree_size(p):
+            total = 0
+            for root, _dirs, fs in os.walk(p):
+                for name in fs:
+                    try:
+                        total += os.path.getsize(os.path.join(root, name))
+                    except OSError:
+                        pass
+            return total
+
+        g = os.path.join(d, "g")
+        z = os.path.join(d, "z")
+        _shutil.copytree(tree, g)
+        _shutil.copytree(tree, z)
+
+        sh("git init -q -b main .", cwd=g)
+        sh("git config user.email t@t", cwd=g)
+        sh("git config user.name t", cwd=g)
+        sh("git add -A && git commit -qm seed", cwd=g)
+        # `git gc` skips a repository it considers too small to be worth packing, so this asks for
+        # the pack directly. A comparison against a git that was never packed reports the loose
+        # object store, which is not git's steady state.
+        sh("git repack -a -d -q", cwd=g)
+        # git's own accounting, so a stray file under .git is not read as pack size.
+        counted = sh("git count-objects -v", cwd=g)[1]
+        packed = any(l.startswith("size-pack:") and l.split(":")[1].strip() not in ("", "0")
+                     for l in counted.splitlines())
+        record(
+            "git is packed before it is measured",
+            packed,
+            counted.replace("\n", " ")[:200],
+        )
+
+        sh(f"{ZF} init", cwd=z)
+        r = sh(f'{ZF} changeset create "seed" --author t --json', cwd=z)[1]
+        try:
+            cs = _js_d.loads(r).get("changeset")
+        except Exception:
+            cs = None
+        if cs:
+            sh(f"{ZF} changeset commit {cs}", cwd=z)
+        import sqlite3 as _sq
+
+        conn = _sq.connect(os.path.join(z, ".gesta", "gesta.db"))
+        conn.execute("VACUUM")
+        conn.close()
+
+        gs = tree_size(os.path.join(g, ".git"))
+        zs = tree_size(os.path.join(z, ".gesta"))
+        ratio = zs / gs if gs else float("inf")
+        # The threshold is 5x and the reason is measurable rather than generous. On a small tree the
+        # per row overhead of six tables dominates, and the ratio falls as the tree grows: 4.8x on
+        # 400 small files, 1.95x on 11,301 real ones. What this asserts is that the gap is in that
+        # range at all, because a regression that doubled the store would clear 5x on any size.
+        record(
+            "gesta stays within 5x of a packed git on the same content",
+            ratio <= 5.0,
+            f"gesta {zs / 1048576:.2f} MB against git {gs / 1048576:.2f} MB, {ratio:.2f}x",
+        )
+
+        # The breakdown is what makes a large ratio actionable. A run that reports 3x without
+        # naming the table sends the next person to guess.
+        rows = None
+        conn = _sq.connect(os.path.join(z, ".gesta", "gesta.db"))
+        try:
+            rows = conn.execute(
+                "SELECT name, SUM(pgsize) FROM dbstat GROUP BY name ORDER BY 2 DESC LIMIT 2"
+            ).fetchall()
+        except _sq.Error:
+            rows = None
+        finally:
+            conn.close()
+        record(
+            "and the largest table is named rather than guessed at",
+            rows is not None and len(rows) > 0,
+            f"largest: {rows[0][0]} at {rows[0][1] / 1048576:.2f} MB" if rows else "dbstat unavailable",
+        )
+
     if want("scale"):
         # The project's central claim is that the cost of a commit follows the size of the change,
         # not of the repository. A benchmark that measured create and commit together reported

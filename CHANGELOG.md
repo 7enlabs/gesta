@@ -23,6 +23,13 @@ version is current and freezes when the number changes, so `0.6.0` is a record a
 - `bench/scale.py` measures the scan and the write apart, because one figure for both hid a flat
   write behind a growing scan. Measured: the write costs 1.28x more in a repository 16x larger.
 - `prune_cache` asks whether any path disappeared before reading the whole table back.
+- Storage measured against a packed git for the first time: 72.8 MB against 37.4 MB on 11,301 files,
+  so 1.95x rather than the 10.2x the parity document had been carrying. That figure predated the blame
+  rewrite; the table is now 1.2% of the database and objects are 82%.
+- `bench/disk.py` measures the two stores with both at their best, using `git gc --no-detach` because
+  a plain `git gc` detaches and returns before it has packed anything.
+- The remaining gap is cross-file compression, measured at 1.50x by joining the objects into one
+  stream. Raising the zlib level changes nothing (47.3 MB at level 6, 47.2 at level 9).
 
 
 ## 0.6.0, 2026-11-18
