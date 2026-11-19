@@ -1325,6 +1325,35 @@ pub type PathDiff = (String, Vec<String>, Vec<String>);
 /// another, and until now the only ways to ask were the working tree against the head
 /// or one changeset against its own parent. A step in the middle of a branch could not
 /// be examined at all.
+/// The parent of a revision, which is the revision a "what changed" question means by "before".
+///
+/// A first changeset has no parent, and an empty string is returned rather than an error: the caller
+/// decides whether the empty tree is the right answer for that case, and for a first commit it is.
+pub fn parent_of(conn: &Connection, rev: &str) -> ZResult<Option<String>> {
+    let id = match crate::store::resolve_rev(conn, rev)? {
+        Some(id) => id,
+        None => return Ok(None),
+    };
+    let parent: Option<String> = conn
+        .query_row(
+            "SELECT parent FROM changesets WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(parent)
+}
+
+/// Compare two revisions.
+///
+/// `from` of `None` means the empty tree, which is what "show me everything in `to`" means and what
+/// a first commit needs. That reading is correct and it is not what a caller usually wants: asking
+/// for `--to main` and receiving every file in the repository, when one file changed since its
+/// parent, is a surprise that costs a reader the work of working out which of those files are new.
+/// The command therefore resolves the parent itself; `diff_revs` keeps the strict reading because a
+/// caller that means the empty tree says so with an explicit `--from`, and a function that guessed
+/// would be unusable for the case that needs it.
 pub fn diff_revs(conn: &Connection, from: Option<&str>, to: Option<&str>) -> ZResult<Vec<PathDiff>> {
     fn tree_of(conn: &Connection, rev: Option<&str>) -> ZResult<Vec<(String, String)>> {
         match rev {

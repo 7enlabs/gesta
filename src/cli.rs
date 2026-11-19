@@ -2670,13 +2670,44 @@ pub fn cmd_secret(sub: crate::SecretCmd) -> ZResult<()> {
 }
 
 /// `gesta diff --from A --to B`: compare two revisions.
+/// What "before" means when a caller names only what "after" is.
+///
+/// `diff --to main` reads as "what is in main that differs", and the answer a caller wants is what
+/// changed since its parent. Treating the missing side as the empty tree answers a different
+/// question, and the caller discovers the difference by counting files. A first changeset has no
+/// parent, so the empty tree is the right answer there and is returned.
+fn resolve_from(
+    conn: &rusqlite::Connection,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> ZResult<Option<String>> {
+    // An explicit empty string means the empty tree, which is how a caller asks for everything in
+    // a revision. Without it the earlier behaviour had no way to be requested at all, and removing
+    // a capability to fix a default is not a fix.
+    if let Some(f) = from {
+        return Ok(if f.is_empty() { None } else { Some(f.to_string()) });
+    }
+    let to = match to {
+        Some(t) => t,
+        // Neither side named: comparing nothing with nothing, which has no parent to resolve.
+        None => return Ok(None),
+    };
+    match crate::repo::parent_of(conn, to)? {
+        Some(parent) => Ok(Some(parent)),
+        // A first changeset has no parent. The empty tree is then the honest answer, and the
+        // function returns None rather than inventing a revision that does not exist.
+        None => Ok(None),
+    }
+}
+
 pub fn cmd_diff_range(from: Option<&str>, to: Option<&str>, name_only: bool) -> ZResult<()> {
     let (_root, conn) = open_repo()?;
-    let diffs = crate::repo::diff_revs(&conn, from, to)?;
+    let from = resolve_from(&conn, from, to)?;
+    let diffs = crate::repo::diff_revs(&conn, from.as_deref(), to)?;
     if diffs.is_empty() {
         println!(
             "no difference between {} and {}",
-            from.unwrap_or("an empty tree"),
+            from.as_deref().unwrap_or("an empty tree"),
             to.unwrap_or("an empty tree")
         );
         return Ok(());
@@ -2700,7 +2731,8 @@ pub fn cmd_diff_range(from: Option<&str>, to: Option<&str>, name_only: bool) -> 
 /// The same as `cmd_diff_range` with `--json`.
 pub fn cmd_diff_range_json(from: Option<&str>, to: Option<&str>) -> ZResult<()> {
     let (_root, conn) = open_repo()?;
-    let diffs = crate::repo::diff_revs(&conn, from, to)?;
+    let from = resolve_from(&conn, from, to)?;
+    let diffs = crate::repo::diff_revs(&conn, from.as_deref(), to)?;
     use crate::json::Json;
     let arr = Json::arr(
         diffs

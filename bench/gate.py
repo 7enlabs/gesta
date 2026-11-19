@@ -2466,6 +2466,48 @@ def main():
             f"columns: {', '.join(cols)}",
         )
 
+    if want("diff-range"):
+        # `--to` alone used to mean "from the empty tree", so asking what the last change did
+        # listed every file in the repository. The default has to answer the question a caller
+        # asked, and the strict reading has to stay reachable.
+        import tempfile as _tf
+
+        d = _tf.mkdtemp()
+        sh(f"{ZF} init", cwd=d)
+        for message, name, body in (
+            ("first", "notes.txt", "a\n"),
+            ("second", "other.txt", "b\n"),
+        ):
+            with open(os.path.join(d, name), "w") as fh:
+                fh.write(body)
+            sh(f'{ZF} changeset create "{message}" --author t', cwd=d)
+            m = re.search(r"(cs[0-9a-f]+)", sh(f"{ZF} changeset list --json", cwd=d)[1])
+            if m:
+                sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+
+        last = sh(f"{ZF} diff --name-only --to main", cwd=d)
+        body = (last[1] or "").strip()
+        record(
+            "diff --to a branch answers what its last change did",
+            body == "other.txt",
+            f"reported: {body!r}",
+        )
+
+        whole = sh(f"{ZF} diff --name-only --to main --from \"\"", cwd=d)
+        found = sorted((whole[1] or "").split())
+        record(
+            "and an explicit empty from still asks for the whole tree",
+            found == ["notes.txt", "other.txt"],
+            f"reported: {found}",
+        )
+
+        first = sh(f"{ZF} diff --name-only --to main --from nonsense", cwd=d)
+        record(
+            "a name that does not resolve is refused rather than treated as empty",
+            first[0] != 0 and "no such revision" in (first[1] or ""),
+            (first[1] or "")[:200],
+        )
+
     if want("review-json"):
         # `review --json` used to print text: the flag was accepted and ignored, which is the same
         # fault as a check that never runs, seen from the caller's side.

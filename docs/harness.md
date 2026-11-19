@@ -182,25 +182,31 @@ Six jobs, each written twice, priced by the same ledger:
 
 ```
 job                 gesta        git   ask
-state                 146        186   what is the state of this tree
-history                39         43   what changed recently
-diff                   20         10   what did the last change do
-list-files             20         20   what files exist at the head
+state                 146        277   what is the state of this tree
+history               115         43   what changed recently
+diff                   10         26   what did the last change do
+list-files             20         36   what files exist at the head
 read-one-file          17         17   show one file as committed
-search                 44         38   where does this word appear
+search                 44         74   where does this word appear
 
-cost ratio      0.92x    quality gap     +0.0 points
+cost ratio      0.75x    quality gap     +0.0 points
 ```
 
-gesta answers all six at 8% below git's cost per answer. Two of the earlier figures were the
-measurement's fault rather than the tool's, and both mistakes are the kind this comparison exists to
-catch:
+gesta answers all six at 25% below git's cost per answer. Three findings shaped this number, and
+each was the measurement's fault rather than the tool's at first.
 
-- `history` was compared as gesta's full record against git's one-line form. Pointing gesta at its
-  own one-line form made it cheaper than git, 39 bytes against 43.
-- `diff` was compared as gesta's full JSON review against git's diffstat, then as a name list that
-  gesta could not answer because the first commit has no parent to name. Both tools now fall back to
-  their first-commit form together, so neither is charged for a shape the other did not have to use.
+`history` compared gesta's full record against git's one-line form. Pointing gesta at its own
+one-line form made it cheaper than git.
 
-What remains is honest: `diff` costs gesta twice git's bytes for the same answer, `search` costs 6
-more, and `state` costs 40 fewer because gesta's status is one screen where git's is three.
+`diff` compared gesta's full JSON review against git's diffstat. A summary on both sides fixed that,
+and then the two histories still had different shapes: gesta held one changeset for a tree git
+described in three commits, so its last change was the whole repository. Both tools now walk one
+shared list of steps and commit at each one.
+
+`--to` alone used to mean "from the empty tree", so `diff --to main` listed every file when one had
+changed since its parent. It resolves the parent now, and an explicit `--from ""` still asks for the
+whole tree.
+
+What remains is honest and specific. gesta loses on `history`, where its one-line form still carries
+a timestamp and git's does not. It wins on `state` and `search` because its answers are shorter, and
+on `diff` because it resolves what the question meant.

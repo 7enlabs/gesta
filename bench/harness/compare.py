@@ -103,10 +103,9 @@ JOBS = [
         # The closest thing each tool has to a summary: names on both sides, so the comparison is
         # about the cost of an answer rather than the amount of detail a format prints.
         #
-        # gesta names revisions by changeset, and the first commit has no parent to name. The job
-        # therefore comes in two forms and the runner picks the one the repository supports.
-        "gesta": ["{G} diff --name-only --from {PARENT} --to main"],
-        "gesta_first": ["{G} diff --name-only --to main"],
+        # Both tools take the same question without being handed a parent: gesta resolves the
+        # parent of `--to` itself, and git's first-commit form falls back for the same reason.
+        "gesta": ["{G} diff --name-only --to main"],
         "git": ["git diff --name-only HEAD~1 HEAD"],
         "git_first": ["git show --name-only --pretty=format: HEAD"],
     },
@@ -133,20 +132,30 @@ JOBS = [
 ]
 
 
-def setup(root: str) -> None:
-    """A tree with three commits, so every job has something to answer."""
+# The three states both tools walk, in order. Each entry is the message its commit carries and the
+# files that commit writes. Sharing the list is what makes "what did the last change do" the same
+# question in both tools.
+STEPS = [
+    ("first", {"notes.txt": "alpha\nbeta\n"}),
+    ("second", {"notes.txt": "alpha\nbeta\ngamma\n"}),
+    ("third", {"other.txt": "alpha again\n"}),
+]
+
+
+def apply_step(root: str, writes: dict[str, str]) -> None:
+    """Write one state to disk."""
+    for name, body in writes.items():
+        with open(os.path.join(root, name), "w") as fh:
+            fh.write(body)
+
+
+def setup_git(root: str) -> None:
+    """Initialise git, so both tools answer about the same files."""
     os.makedirs(root, exist_ok=True)
-    subprocess.run("git init -q . && git config user.email t@t && git config user.name t",
-                   shell=True, cwd=root, capture_output=True)
-    with open(os.path.join(root, "notes.txt"), "w") as fh:
-        fh.write("alpha\nbeta\n")
-    subprocess.run("git add -A && git commit -qm first", shell=True, cwd=root, capture_output=True)
-    with open(os.path.join(root, "notes.txt"), "w") as fh:
-        fh.write("alpha\nbeta\ngamma\n")
-    subprocess.run("git add -A && git commit -qm second", shell=True, cwd=root, capture_output=True)
-    with open(os.path.join(root, "other.txt"), "w") as fh:
-        fh.write("alpha again\n")
-    subprocess.run("git add -A && git commit -qm third", shell=True, cwd=root, capture_output=True)
+    subprocess.run(
+        "git init -q . && git config user.email t@t && git config user.name t",
+        shell=True, cwd=root, capture_output=True,
+    )
 
 
 def main(argv: list[str]) -> int:
@@ -162,34 +171,55 @@ def main(argv: list[str]) -> int:
 
     root = tempfile.mkdtemp(prefix="harness-compare-")
     try:
-        setup(root)
-        # The gesta repository is built inside the same tree, so both tools answer about the same
-        # files. This is the setup cost of measuring, and it is not charged to either side.
+        # gesta is initialised before the tree exists, so its first changeset sees only the first
+        # state. Initialising after the files are written makes that changeset hold every later file
+        # too, and every history question then compares two histories with different shapes.
         g = run(f"{gesta} init", root)
         if g.code != 0:
             print(f"gesta init failed: {g.err[:200]}")
             return 2
+        setup_git(root)
 
         # The gesta repository has to hold the same tree git does, or the comparison is between a
         # populated tool and an empty one. A setup failure here is fatal and says so, because an
         # empty repository makes every gesta job fail for a reason that has nothing to do with
         # gesta.
-        c = run(f'{gesta} changeset create "import" --author cmp --json', root)
         import json as _js
 
-        cs = ""
-        try:
-            cs = _js.loads(c.out).get("changeset", "")
-        except Exception:
-            print(f"could not read the changeset id gesta returned: {c.out[:160]}")
-            return 2
-        if not cs:
-            print(f"gesta created no changeset, so its tree is empty: {c.out[:160]} {c.err[:160]}")
-            return 2
-        commit = run(f"{gesta} changeset commit {cs}", root)
-        if commit.code != 0:
-            print(f"gesta could not commit the tree: {commit.err[:200]}")
-            return 2
+        def changeset(message: str) -> str:
+            """Record the current tree as one changeset, and return its id."""
+            r = run(f'{gesta} changeset create "{message}" --author cmp --json', root)
+            try:
+                cs = _js.loads(r.out).get("changeset", "")
+            except Exception:
+                print(f"could not read the changeset id gesta returned: {r.out[:160]}")
+                return ""
+            if not cs:
+                print(f"gesta created no changeset: {r.out[:160]} {r.err[:160]}")
+                return ""
+            k = run(f"{gesta} changeset commit {cs}", root)
+            if k.code != 0:
+                print(f"gesta could not commit the tree: {k.err[:200]}")
+                return ""
+            return cs
+
+        # One changeset per commit, walking the same three states git walked, so "what did the last
+        # change do" asks the same question in both tools. A single changeset holding the whole tree
+        # makes gesta's last change the entire repository, and the comparison then measures the
+        # shape of the history rather than the cost of an answer.
+        #
+        # Only the files a step actually changes are written. Rewriting a file with its existing
+        # content leaves the tree unchanged, so the changeset records nothing and the step vanishes
+        # from the history it was meant to build.
+        for message, writes in STEPS:
+            apply_step(root, writes)
+            # git commits the same state, so the two histories stay in step. The setup cost of
+            # measuring is charged to neither side.
+            subprocess.run(
+                f"git add -A && git commit -qm {message}", shell=True, cwd=root, capture_output=True
+            )
+            if not changeset(message):
+                return 2
 
         # The parent of the head, so a "last change" job has two revisions to compare. gesta names
         # revisions by changeset id rather than by HEAD~1, and inventing a Git spelling for it would
