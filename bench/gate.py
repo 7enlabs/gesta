@@ -2793,6 +2793,132 @@ def main():
             except Exception:
                 server.kill()
 
+    if want("backup"):
+        # A backup that loses what a bundle does not carry is the failure this step exists for: a
+        # bundle holds one branch and the objects it reaches, and a person asking for a backup means
+        # the tags, the other branches and the blame as well.
+        import tempfile as _tfb
+        import time as _tmpb
+
+        d = _tfb.mkdtemp(prefix="gate-backup-")
+        sh(f"{ZF} init", cwd=d)
+        with open(os.path.join(d, "a.txt"), "w") as fh:
+            fh.write("one\n")
+        m = re.search(r"(cs[0-9a-f]+)", sh(f'{ZF} changeset create "first" --author t --json', cwd=d)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+        with open(os.path.join(d, "a.txt"), "a") as fh:
+            fh.write("two\n")
+        m = re.search(r"(cs[0-9a-f]+)", sh(f'{ZF} changeset create "second" --author t --json', cwd=d)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+        sh(f"{ZF} tag v1", cwd=d)
+        sh(f"{ZF} branch create side", cwd=d)
+        sh(f"{ZF} branch switch main", cwd=d)
+
+        snap = os.path.join(d, "snap.db")
+        r = sh(f"{ZF} backup {snap}", cwd=d)
+        record("a backup is written", os.path.exists(snap) and r[0] == 0, r[1].strip()[:200])
+        record(
+            "and it carries the branches and tags a bundle does not",
+            "2 branch(es)" in r[1] and "1 tag(s)" in r[1],
+            r[1].strip()[:200],
+        )
+
+        v = sh(f"{ZF} verify-backup {snap}", cwd=d)
+        record(
+            "and the file verifies on its own",
+            "is readable" in v[1] and "1 tag(s)" in v[1],
+            v[1].strip()[:200],
+        )
+
+        # Destroy the store the way a disaster does, then restore.
+        sh(f"{ZF} init", cwd=d)
+        for name in ("gesta.db", "gesta.db-wal", "gesta.db-shm"):
+            p2 = os.path.join(d, ".gesta", name)
+            if os.path.exists(p2):
+                os.remove(p2)
+        sh(f"{ZF} init", cwd=d)
+
+        # A restore replaces the store, so it has to ask first.
+        asked = sh(f"{ZF} restore-repo {snap}", cwd=d)
+        record(
+            "a restore says what it would replace unless told to proceed",
+            "Pass --yes" in asked[1],
+            asked[1].strip()[:200],
+        )
+
+        r2 = sh(f"{ZF} restore-repo {snap} --yes", cwd=d)
+        record("a restore installs the backup", r2[0] == 0, r2[1].strip()[:200])
+
+        log = sh(f"{ZF} log --oneline", cwd=d)[1]
+        record(
+            "and the history came back",
+            log.count("cs") >= 2 and "second" in log,
+            log.strip()[:200],
+        )
+        branch_list = sh(f"{ZF} branch list", cwd=d)[1]
+        record(
+            "and the second branch came back",
+            "side" in branch_list,
+            branch_list.strip()[:200],
+        )
+        tags = sh(f"{ZF} tag list", cwd=d)[1]
+        record("and the tag came back", "v1" in tags or "cs" in tags, tags.strip()[:200])
+        content = sh(f"{ZF} show main:a.txt", cwd=d)[1]
+        record(
+            "and the file content is the one that was backed up",
+            content.strip() == "one\ntwo",
+            repr(content[:80]),
+        )
+        fsck = sh(f"{ZF} fsck", cwd=d)[1]
+        record("and the restored store is consistent", "consistent" in fsck, fsck.strip()[:200])
+
+        # A backup taken while a writer is running. The copy is consistent as of when it starts, so
+        # the file holds a coherent point in time and may hold fewer rows than the live store at the
+        # end. An earlier guard compared against the live count and refused every such backup, which
+        # is the one moment a backup has to work.
+        live = os.path.join(d, "live.db")
+        writer = subprocess.Popen(
+            ["bash", "-lc",
+             f"for i in $(seq 1 25); do printf 'line $i\\n' >> live.txt; "
+             f"{ZF} changeset create w$i --author w >/dev/null 2>&1; sleep 0.02; done"],
+            cwd=d,
+        )
+        _tmpb.sleep(0.15)
+        live_report = sh(f"{ZF} backup {live}", cwd=d)
+        writer.wait(timeout=120)
+        record(
+            "a backup succeeds while the repository is being written",
+            live_report[0] == 0 and os.path.exists(live),
+            live_report[1].strip()[:200],
+        )
+        live_check = sh(f"{ZF} verify-backup {live}", cwd=d)
+        record(
+            "and the live backup verifies",
+            "is readable" in live_check[1],
+            live_check[1].strip()[:200],
+        )
+
+        # A file that is not a backup is refused before anything is touched.
+        junk = os.path.join(d, "junk.txt")
+        with open(junk, "w") as fh:
+            fh.write("not a database\n")
+        bad = sh(f"{ZF} verify-backup {junk}", cwd=d)
+        record(
+            "a file that is not a backup is named as such",
+            "could not be read" in bad[1],
+            bad[1].strip()[:200],
+        )
+
+        # And the repository is still there after a refused restore.
+        after = sh(f"{ZF} log --oneline", cwd=d)[1]
+        record(
+            "and a refused restore leaves the repository as it was",
+            after.count("cs") >= 2,
+            after.strip()[:200],
+        )
+
     if want("serve-policy"):
         # The refusal has to come before the socket exists. Binding first and refusing afterwards
         # printed "listening on http://0.0.0.0:8899" and left the port open for the length of that

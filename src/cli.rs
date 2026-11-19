@@ -78,7 +78,30 @@ pub fn cmd_init(bare: bool) -> ZResult<()> {
     let root = std::env::current_dir()?;
     let zf = repo_dir(&root);
     if zf.is_dir() {
-        println!("already a repository: {}", zf.display());
+        // The directory can exist with no database inside it: a restore that failed part way, a
+        // half copied project, a `.gesta` left behind after its file was deleted. Reporting "already
+        // a repository" then leaves every command failing with "no such table: changesets" and no
+        // way to recover except deleting the directory by hand.
+        let conn = open_db(&root)?;
+        let has_schema: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='changesets'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if has_schema > 0 {
+            println!("already a repository: {}", zf.display());
+            return Ok(());
+        }
+        init_schema(&conn)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO branches(name, head, created_at, from_branch) VALUES('main', NULL, ?1, NULL)",
+            rusqlite::params![now()],
+        )?;
+        set_state(&conn, "current_branch", "main")?;
+        set_state(&conn, "created_at", &now().to_string())?;
+        println!("repaired an empty repository: {}", zf.display());
         return Ok(());
     }
     fs::create_dir_all(&zf)?;
@@ -1497,6 +1520,93 @@ pub fn cmd_checkout(file: &str, changeset: Option<&str>) -> ZResult<()> {
     let rel = normalise(file);
     let bytes = repo::checkout_file(&conn, &root, &rel, changeset)?;
     println!("checked out {} ({} bytes)", rel, bytes);
+    Ok(())
+}
+
+/// Write the whole store to one file.
+///
+/// Different from `restore`, which puts working-tree files back from a branch. This copies the
+/// repository itself, including the parts no bundle carries: tags, blame ranges, every branch.
+pub fn cmd_backup(dest: &str, json: bool) -> ZResult<()> {
+    let (_root, conn) = open_repo()?;
+    let path = std::path::PathBuf::from(dest);
+    let report = crate::backup::backup(&conn, &path)?;
+    if json {
+        let doc = crate::json::Json::obj(vec![
+            ("schema", crate::json::Json::str("gesta@1")),
+            ("path", crate::json::Json::str(report.path.display().to_string())),
+            ("bytes", crate::json::Json::int(report.bytes as i64)),
+            ("changesets", crate::json::Json::int(report.changesets)),
+            ("objects", crate::json::Json::int(report.objects)),
+            ("branches", crate::json::Json::int(report.branches)),
+            ("tags", crate::json::Json::int(report.tags)),
+        ]);
+        println!("{}", doc.render());
+        return Ok(());
+    }
+    println!(
+        "backed up {} change(s), {} object(s), {} branch(es), {} tag(s) to {} ({} bytes)",
+        report.changesets,
+        report.objects,
+        report.branches,
+        report.tags,
+        report.path.display(),
+        report.bytes
+    );
+    Ok(())
+}
+
+/// Check a backup file. Reads only the file, so it is safe to run against a repository in use.
+pub fn cmd_verify_backup(file: &str) -> ZResult<()> {
+    let path = std::path::PathBuf::from(file);
+    let c = crate::backup::verify(&path)?;
+    println!(
+        "{} is readable: {} change(s), {} object(s), {} branch(es), {} tag(s), {} version(s), {} blame range(s)",
+        path.display(),
+        c.changesets,
+        c.objects,
+        c.branches,
+        c.tags,
+        c.file_versions,
+        c.blame_ranges
+    );
+    Ok(())
+}
+
+/// Replace this repository with a backup.
+///
+/// The destination is the repository this command is run inside, and the old store is kept as
+/// `<db>.before-restore` until the new one has opened, so a failure puts it back.
+pub fn cmd_restore_repo(file: &str, yes: bool) -> ZResult<()> {
+    let (root, conn) = open_repo()?;
+    let path = std::path::PathBuf::from(file);
+    let c = crate::backup::verify(&path)?;
+    let here = crate::backup::contents(&conn)?;
+
+    if !yes {
+        // A restore replaces the store. Asking is the difference between recovering from a backup
+        // and destroying a repository because the wrong file was named.
+        return Err(Box::new(crate::error::Error::new(
+            crate::error::Code::Usage,
+            format!(
+                "this replaces {} change(s) here with {} from {}. Pass --yes to do it",
+                here.changesets,
+                c.changesets,
+                path.display()
+            ),
+        )));
+    }
+
+    drop(conn);
+    let restored = crate::backup::restore(&root, &path)?;
+    println!(
+        "restored {} change(s), {} object(s), {} branch(es), {} tag(s) from {}",
+        restored.changesets,
+        restored.objects,
+        restored.branches,
+        restored.tags,
+        path.display()
+    );
     Ok(())
 }
 

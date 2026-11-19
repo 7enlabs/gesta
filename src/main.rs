@@ -4,6 +4,7 @@
 //! and history, three-way merge, remote sync, and an operation log for undo.
 
 mod attributes;
+mod backup;
 mod auth;
 mod bisect;
 mod brief;
@@ -347,6 +348,26 @@ enum Cmd {
     Restore {
         /// File or `.` to restore the whole working tree
         file: String,
+    },
+    /// Write the whole repository to one file: every branch, tag and blame range
+    Backup {
+        /// Destination file. Replaced if it exists
+        dest: String,
+        #[arg(long)]
+        json_backup: bool,
+    },
+    /// Check a backup file without touching the repository
+    VerifyBackup {
+        /// The backup file
+        file: String,
+    },
+    /// Replace this repository with the one in a backup file
+    RestoreRepo {
+        /// The backup file
+        file: String,
+        /// Skip the question. Without it, restoring asks first because it replaces the store
+        #[arg(long)]
+        yes: bool,
     },
     /// Replay this branch's changesets onto another point
     Rebase {
@@ -1022,6 +1043,9 @@ fn run() -> ZResult<()> {
         }
         Cmd::Checkout { file, changeset } => cli::cmd_checkout(&file, changeset.as_deref()),
         Cmd::Restore { file } => cli::cmd_restore(&file),
+        Cmd::Backup { dest, json_backup } => cli::cmd_backup(&dest, json_backup),
+        Cmd::VerifyBackup { file } => cli::cmd_verify_backup(&file),
+        Cmd::RestoreRepo { file, yes } => cli::cmd_restore_repo(&file, yes),
         Cmd::Undo => cli::cmd_undo(),
         Cmd::Redo => cli::cmd_redo(),
         Cmd::Revert { id, reason, author } => {
