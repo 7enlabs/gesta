@@ -180,33 +180,31 @@ cost win with a quality loss is not a win.
 
 Six jobs, each written twice, priced by the same ledger:
 
+Three repository shapes, six jobs each. The shapes differ in what they stress: a few files with one
+edit each, forty small files in deep paths, and a tree with deletions.
+
 ```
-job                 gesta        git   ask
-state                 146        277   what is the state of this tree
-history               115         43   what changed recently
-diff                   10         26   what did the last change do
-list-files             20         36   what files exist at the head
-read-one-file          17         17   show one file as committed
-search                 44         74   where does this word appear
+shape           gesta/pass   git/pass   ratio  quality
+small                   15         20   0.75x  +0.0
+wide                    69         69   1.00x  +0.0
+deleting                12         18   0.67x  +0.0
 
-cost ratio      0.75x    quality gap     +0.0 points
+pooled            32 estimated tokens against 36          0.89x
 ```
 
-gesta answers all six at 25% below git's cost per answer. Three findings shaped this number, and
-each was the measurement's fault rather than the tool's at first.
+The three ratios are not the same number, and that is the finding. A comparison measured on one
+repository shape is a statement about that repository: the same tool is 25% cheaper on a small tree,
+33% cheaper when deletions are involved, and exactly equal when the paths are deep and the files are
+many. Reporting 0.75x alone would be true and misleading in the same sentence.
 
-`history` compared gesta's full record against git's one-line form. Pointing gesta at its own
-one-line form made it cheaper than git.
+This is the split advice any evaluation text gives: the unit of measurement has to match the unit
+over which the claim is made. A row-level split claims generalization it cannot support, and a
+single-shape benchmark claims a cost it cannot support.
 
-`diff` compared gesta's full JSON review against git's diffstat. A summary on both sides fixed that,
-and then the two histories still had different shapes: gesta held one changeset for a tree git
-described in three commits, so its last change was the whole repository. Both tools now walk one
-shared list of steps and commit at each one.
+Two jobs were also asking questions that one shape could not answer. `read-one-file` named
+`notes.txt`, which exists in one shape and in no other, and `git grep alpha` found nothing outside
+it. Both tools failed, the job was scored as unanswered for both, and the ratio was computed over a
+job neither side had done. A job both tools fail is two errors rather than a comparison, and the
+shape now supplies the file name and the search word.
 
-`--to` alone used to mean "from the empty tree", so `diff --to main` listed every file when one had
-changed since its parent. It resolves the parent now, and an explicit `--from ""` still asks for the
-whole tree.
 
-What remains is honest and specific. gesta loses on `history`, where its one-line form still carries
-a timestamp and git's does not. It wins on `state` and `search` because its answers are shorter, and
-on `diff` because it resolves what the question meant.

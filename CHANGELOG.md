@@ -20,6 +20,9 @@ version is current and freezes when the number changes, so `0.6.0` is a record a
 - `diff --to <branch>` without `--from` compares against that revision's parent instead of the empty
   tree. `--from ""` still asks for the whole tree.
 - `review --json` prints one parseable document instead of text.
+- `bench/harness/compare.py` measures three repository shapes instead of one, and reports each shape
+  before the pooled figure. Measured: 0.75x on a small tree, 1.00x on deep paths, 0.67x where
+  deletions are involved. One shape was one sample, and the three do not agree.
 - `gc` groups loose text objects into shared compressed streams, 50 to a group and sorted by size.
   Measured on 11,225 files: 69.2 MB before, 51.4 MB after. Each object keeps its own row, hash and
   identity, so `fsck`, `gc` and a partial read stay simple; only the body moves.

@@ -3113,6 +3113,23 @@ def main():
             "quality gap     +0.0" in out,
             out[-300:],
         )
+        # One repository shape is one sample. The report has to show the shapes separately, because a
+        # pooled ratio that hides one shape pointing the other way is the finding.
+        import re as _re_shapes
+
+        shape_rows = _re_shapes.findall(r"^(small|wide|deleting)\s+\d+\s+\d+", out, _re_shapes.M)
+        record(
+            "the comparison reports every repository shape, not one pooled figure",
+            len(shape_rows) >= 3,
+            f"shapes reported: {shape_rows}",
+        )
+        # And every job on every shape has to be answered by both, or the ratio is computed over a
+        # set one side never finished.
+        record(
+            "and both tools answer every job on every shape",
+            "answered every job on every shape" in out,
+            out[-260:] if "answered every job" not in out else "all answered",
+        )
 
     if want("suites"):
         suites = [

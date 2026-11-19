@@ -120,14 +120,19 @@ JOBS = [
         "ask": "show one file as committed",
         # gesta names the branch, not a Git synonym for it. `HEAD` is not its vocabulary, and a job
         # written in one tool's words measures the vocabulary rather than the cost.
-        "gesta": ["{G} show main:notes.txt"],
-        "git": ["git show HEAD:notes.txt"],
+        # The path comes from the shape rather than being written here. A fixed name made this job
+        # fail on any shape that does not have that file, and a job both tools fail is not a
+        # comparison, it is two errors.
+        "gesta": ["{G} show {REV}:{FILE}"],
+        "git": ["git show HEAD:{FILE}"],
     },
     {
         "name": "search",
         "ask": "where does this word appear",
-        "gesta": ["{G} grep alpha"],
-        "git": ["git grep alpha"],
+        # A word every shape contains. Pinning this to one shape's content made the job fail on the
+        # others and the ratio was then computed over a job one side never answered.
+        "gesta": ["{G} grep {WORD}"],
+        "git": ["git grep {WORD}"],
     },
 ]
 
@@ -135,18 +140,60 @@ JOBS = [
 # The three states both tools walk, in order. Each entry is the message its commit carries and the
 # files that commit writes. Sharing the list is what makes "what did the last change do" the same
 # question in both tools.
-STEPS = [
-    ("first", {"notes.txt": "alpha\nbeta\n"}),
-    ("second", {"notes.txt": "alpha\nbeta\ngamma\n"}),
-    ("third", {"other.txt": "alpha again\n"}),
-]
+# Shapes the same six jobs are asked on. One repository shape is one sample, and a cost ratio
+# measured on one sample is a statement about that repository rather than about the tool: the same
+# mistake the split advice in any evaluation text warns about, where a row-level split claims
+# generalization it cannot support. The shapes differ in what they stress.
+SHAPES = {
+    # The original: a small tree, a few edits, one new file.
+    "small": [
+        ("first", {"notes.txt": "alpha\nbeta\n"}),
+        ("second", {"notes.txt": "first\nalpha\nbeta\ngamma\n"}),
+        ("third", {"other.txt": "alpha again\n"}),
+    ],
+    # Deep paths and many files, where a tree walk and a path listing cost more.
+    "wide": [
+        ("first", {f"d{i}//f{i}.txt": f"line {i}\n" for i in range(40)}),
+        ("second", {"d39//f39.txt": "line 39 changed\n"}),
+        ("third", {"d0//f0.txt": "line 0 changed\n"}),
+    ],
+    # Deletions, which a summary has to report and a name list has to omit.
+    "deleting": [
+        ("first", {"a.txt": "first\n", "b.txt": "two\n", "c.txt": "three\n"}),
+        ("second", {"b.txt": "two changed\n"}),
+        ("third", {}),
+    ],
+}
+
+# The files a shape's deletions remove, keyed by the step that removes them.
+DELETIONS = {"deleting": {2: ["c.txt"]}}
+
+# The file a per-shape job reads, and the word it searches for. A job written with one shape's
+# names fails on the others, and a job both tools fail is two errors rather than a comparison.
+SHAPE_FACTS = {
+    "small": {"file": "notes.txt", "word": "alpha"},
+    "wide": {"file": "d0/f0.txt", "word": "line"},
+    "deleting": {"file": "a.txt", "word": "first"},
+}
+
+STEPS = SHAPES["small"]
 
 
 def apply_step(root: str, writes: dict[str, str]) -> None:
     """Write one state to disk."""
     for name, body in writes.items():
-        with open(os.path.join(root, name), "w") as fh:
+        target = os.path.join(root, name.replace("//", "/"))
+        os.makedirs(os.path.dirname(target) or root, exist_ok=True)
+        with open(target, "w") as fh:
             fh.write(body)
+
+
+def apply_deletions(root: str, names: list[str]) -> None:
+    """Remove the files a step deletes, so both tools see the same tree."""
+    for name in names:
+        p = os.path.join(root, name)
+        if os.path.exists(p):
+            os.remove(p)
 
 
 def setup_git(root: str) -> None:
@@ -158,18 +205,11 @@ def setup_git(root: str) -> None:
     )
 
 
-def main(argv: list[str]) -> int:
-    gesta = os.environ.get("GESTA_BIN") or "gesta"
-    if "--gesta" in argv:
-        gesta = argv[argv.index("--gesta") + 1]
-    if not shutil.which("git"):
-        print("git is not on PATH, so there is nothing to compare against")
-        return 2
-    if not os.path.exists(gesta) and not shutil.which(gesta):
-        print(f"no gesta binary at {gesta}. Pass --gesta PATH or set GESTA_BIN")
-        return 2
-
-    root = tempfile.mkdtemp(prefix="harness-compare-")
+def measure_shape(gesta: str, shape: str):
+    """Run every job on one repository shape. Returns (ledgers, rows) or None when setup fails."""
+    steps = SHAPES[shape]
+    deletes = DELETIONS.get(shape, {})
+    root = tempfile.mkdtemp(prefix=f"compare-{shape}-")
     try:
         # gesta is initialised before the tree exists, so its first changeset sees only the first
         # state. Initialising after the files are written makes that changeset hold every later file
@@ -177,17 +217,12 @@ def main(argv: list[str]) -> int:
         g = run(f"{gesta} init", root)
         if g.code != 0:
             print(f"gesta init failed: {g.err[:200]}")
-            return 2
+            return None
         setup_git(root)
 
-        # The gesta repository has to hold the same tree git does, or the comparison is between a
-        # populated tool and an empty one. A setup failure here is fatal and says so, because an
-        # empty repository makes every gesta job fail for a reason that has nothing to do with
-        # gesta.
         import json as _js
 
         def changeset(message: str) -> str:
-            """Record the current tree as one changeset, and return its id."""
             r = run(f'{gesta} changeset create "{message}" --author cmp --json', root)
             try:
                 cs = _js.loads(r.out).get("changeset", "")
@@ -203,27 +238,20 @@ def main(argv: list[str]) -> int:
                 return ""
             return cs
 
-        # One changeset per commit, walking the same three states git walked, so "what did the last
-        # change do" asks the same question in both tools. A single changeset holding the whole tree
-        # makes gesta's last change the entire repository, and the comparison then measures the
-        # shape of the history rather than the cost of an answer.
-        #
-        # Only the files a step actually changes are written. Rewriting a file with its existing
-        # content leaves the tree unchanged, so the changeset records nothing and the step vanishes
-        # from the history it was meant to build.
-        for message, writes in STEPS:
+        # One changeset per commit, walking the same states git walks. Only the files a step changes
+        # are written: rewriting a file with its existing content leaves the tree unchanged, so the
+        # changeset records nothing and the step vanishes from the history it was meant to build.
+        for i, (message, writes) in enumerate(steps):
             apply_step(root, writes)
-            # git commits the same state, so the two histories stay in step. The setup cost of
-            # measuring is charged to neither side.
+            for name in deletes.get(i, []):
+                apply_deletions(root, [name])
             subprocess.run(
-                f"git add -A && git commit -qm {message}", shell=True, cwd=root, capture_output=True
+                f"git add -A && git commit -qm {message} --allow-empty",
+                shell=True, cwd=root, capture_output=True,
             )
             if not changeset(message):
-                return 2
+                return None
 
-        # The parent of the head, so a "last change" job has two revisions to compare. gesta names
-        # revisions by changeset id rather than by HEAD~1, and inventing a Git spelling for it would
-        # measure the vocabulary.
         parent = ""
         log = run(f"{gesta} log --json", root)
         try:
@@ -237,70 +265,121 @@ def main(argv: list[str]) -> int:
 
         check = run(f"{gesta} ls", root)
         if check.code != 0:
-            print(f"gesta has no tree after setup: {check.err[:200]}")
-            return 2
+            print(f"gesta has no tree after setup on {shape}: {check.err[:200]}")
+            return None
 
+        facts = SHAPE_FACTS[shape]
         ledgers = {"gesta": eff.Ledger(), "git": eff.Ledger()}
         rows = []
         for job in JOBS:
             for tool in ("gesta", "git"):
-                # A job whose first form needs a parent falls back to its first-commit form when the
-                # repository has only one changeset. Both tools take the same fallback, so neither
-                # is charged for a shape the other did not have to use.
                 key = tool if parent else tool + "_first"
                 commands = job.get(key) or job[tool]
-                # The binary is named by the caller, so a job is a command line rather than an
-                # assumption about PATH. A tool measured through a missing name exits 127 and every
-                # job fails for a reason that has nothing to do with the tool.
                 runs = [
-                    run(cmd.replace("{G}", gesta).replace("{PARENT}", parent), root)
+                    run(
+                        cmd.replace("{G}", gesta)
+                        .replace("{PARENT}", parent)
+                        .replace("{REV}", "main")
+                        .replace("{FILE}", facts["file"])
+                        .replace("{WORD}", facts["word"]),
+                        root,
+                    )
                     for cmd in commands
                 ]
-                # A job counts as answered when every command in it succeeded and said something.
                 ok = all(r.code == 0 for r in runs) and any(r.bytes_read for r in runs)
                 ledgers[tool].add(price(job["name"], runs, ok))
             rows.append((job["name"], job["ask"]))
-
-        a = ledgers["gesta"].summary()
-        b = ledgers["git"].summary()
-        cmp = eff.compare(a, b, "gesta", "git")
-
-        print(f"{len(JOBS)} job(s), both tools answering the same questions\n")
-        print(f"{'job':14} {'gesta':>10} {'git':>10}   ask")
-        gs = {r["task"]: r for r in ledgers["gesta"].by_task()}
-        gis = {r["task"]: r for r in ledgers["git"].by_task()}
-        for name, ask in rows:
-            print(
-                f"{name:14} {gs[name]['bytes']:>10} {gis[name]['bytes']:>10}   {ask}"
-            )
-
-        print()
-        print("gesta")
-        for line in eff.fmt(a).splitlines():
-            print(line)
-        print("\ngit")
-        for line in eff.fmt(b).splitlines():
-            print(line)
-
-        print()
-        if "cost_ratio" in cmp:
-            print(
-                f"cost ratio      {cmp['cost_ratio']}x  (gesta cost per pass over git's; "
-                f"below 1.0 means gesta answers with fewer bytes)"
-            )
-        if "turns_ratio" in cmp:
-            print(f"turn ratio      {cmp['turns_ratio']}x")
-        print(f"quality gap     {cmp['quality_gap_points']:+.1f} points")
-
-        # The figure this whole exercise exists to produce: what a caller pays to get one answer.
-        if a["passed"] == b["passed"] == len(JOBS):
-            print(
-                "\nboth tools answered every job, so the difference is entirely cost: "
-                f"{a['cost_per_pass_tokens']} estimated tokens against {b['cost_per_pass_tokens']}"
-            )
-        return 0
+        return ledgers, rows
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+def main(argv: list[str]) -> int:
+    gesta = os.environ.get("GESTA_BIN") or "gesta"
+    if "--gesta" in argv:
+        gesta = argv[argv.index("--gesta") + 1]
+    if not shutil.which("git"):
+        print("git is not on PATH, so there is nothing to compare against")
+        return 2
+    if not os.path.exists(gesta) and not shutil.which(gesta):
+        print(f"no gesta binary at {gesta}. Pass --gesta PATH or set GESTA_BIN")
+        return 2
+
+    # Every shape, then the pooled result. One shape is one sample, and a ratio measured on one
+    # sample is a statement about that repository rather than about the tool, which is the same
+    # mistake as claiming generalization from a split that did not respect the unit of deployment.
+    pooled = {"gesta": eff.Ledger(), "git": eff.Ledger()}
+    per_shape = {}
+    counted = 0
+    for shape in SHAPES:
+        got = measure_shape(gesta, shape)
+        if got is None:
+            print(f"shape {shape}: setup failed, so it is not counted")
+            continue
+        ledgers, rows = got
+        counted += 1
+        a1 = ledgers["gesta"].summary()
+        b1 = ledgers["git"].summary()
+        c1 = eff.compare(a1, b1, "gesta", "git")
+        per_shape[shape] = (a1, b1, c1)
+        # The ledger's own prices are carried over, not a row rebuilt from `by_task`. That row
+        # reports combined bytes and no attempt count, so rebuilding a Price from it silently
+        # changed what the pooled number means: a job run on three shapes counted once.
+        for price_row in ledgers["gesta"].prices:
+            pooled["gesta"].add(price_row)
+        for price_row in ledgers["git"].prices:
+            pooled["git"].add(price_row)
+
+    if not per_shape:
+        print("no repository shape produced a result, so there is nothing to compare")
+        return 2
+
+    # One row per shape. A pooled figure that hides one shape pointing the other way is the finding,
+    # and it only shows up when the shapes are reported before the total.
+    print(f"{len(JOBS)} job(s) per shape, {counted} shape(s)\n")
+    print(f"{'shape':14} {'gesta/pass':>11} {'git/pass':>10} {'ratio':>7}  quality")
+    for shape, (sa, sb, sc) in per_shape.items():
+        print(
+            f"{shape:14} {sa['cost_per_pass_tokens']:>11} {sb['cost_per_pass_tokens']:>10} "
+            f"{sc['cost_ratio']:>6.2f}x  {sc['quality_gap_points']:+.1f}"
+        )
+    print()
+
+    a = pooled["gesta"].summary()
+    b = pooled["git"].summary()
+    cmp = eff.compare(a, b, "gesta", "git")
+
+    print(f"{'job':14} {'gesta':>10} {'git':>10}   ask")
+    gs = {r["task"]: r for r in pooled["gesta"].by_task()}
+    gis = {r["task"]: r for r in pooled["git"].by_task()}
+    for job in JOBS:
+        name = job["name"]
+        print(f"{name:14} {gs[name]['bytes']:>10} {gis[name]['bytes']:>10}   {job['ask']}")
+
+    print()
+    print("gesta")
+    for line in eff.fmt(a).splitlines():
+        print(line)
+    print("\ngit")
+    for line in eff.fmt(b).splitlines():
+        print(line)
+
+    print()
+    if "cost_ratio" in cmp:
+        print(
+            f"cost ratio      {cmp['cost_ratio']}x  (gesta cost per pass over git's; "
+            f"below 1.0 means gesta answers with fewer bytes)"
+        )
+    if "turns_ratio" in cmp:
+        print(f"turn ratio      {cmp['turns_ratio']}x")
+    print(f"quality gap     {cmp['quality_gap_points']:+.1f} points")
+
+    if a["passed"] == b["passed"] == len(JOBS) * counted:
+        print(
+            "\nboth tools answered every job on every shape, so the difference is entirely cost: "
+            f"{a['cost_per_pass_tokens']} estimated tokens against {b['cost_per_pass_tokens']}"
+        )
+    return 0
 
 
 if __name__ == "__main__":
