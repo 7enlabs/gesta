@@ -2626,6 +2626,63 @@ def main():
             (nb.stderr or nb.stdout)[-400:],
         )
 
+    if want("git-parity"):
+        # A round trip that changes every commit name is not a round trip. git hashes the author line
+        # including its timezone, so an export that writes +0000 where the import read +0700 produces
+        # a different name for identical content. Measured before the fix: 0 of 97 ids survived.
+        import tempfile as _tfg
+
+        d = _tfg.mkdtemp(prefix="gate-parity-")
+        src = os.path.join(d, "src")
+        os.makedirs(src)
+        sh("git init -q -b main .", cwd=src)
+        sh("git config user.email t@t && git config user.name t", cwd=src)
+        # A non-UTC offset is the whole point: with +0000 every id matches whether the code is right
+        # or wrong, which is how this survived for so long.
+        env = "GIT_AUTHOR_DATE='1700000000 +0700' GIT_COMMITTER_DATE='1700000000 +0700'"
+        for i in range(4):
+            with open(os.path.join(src, "f.txt"), "a") as fh:
+                fh.write(f"line {i}\n")
+            subprocess.run(
+                f"{env} git add -A && {env} git commit -qm c{i}",
+                shell=True, cwd=src, capture_output=True,
+            )
+
+        imp = os.path.join(d, "imp")
+        out = os.path.join(d, "out")
+        os.makedirs(imp)
+        os.makedirs(out)
+        sh(f"{ZF} init", cwd=imp)
+        sh(f"{ZF} git import {src}", cwd=imp)
+        sh(f"{ZF} init", cwd=out)
+        sh(f"{ZF} git export {out}", cwd=imp)
+
+        got = subprocess.run(
+            "comm -12 <(git rev-list --all|sort) <(git -C " + out + " rev-list --all|sort) | wc -l",
+            shell=True, executable="/bin/bash", cwd=src, capture_output=True, text=True,
+        )
+        total = subprocess.run(
+            "git rev-list --all | wc -l", shell=True, cwd=src, capture_output=True, text=True
+        )
+        try:
+            same = int(got.stdout.strip())
+            want_n = int(total.stdout.strip())
+        except Exception:
+            same, want_n = -1, -1
+        record(
+            "every commit keeps its git name through an import and export",
+            same == want_n and want_n >= 4,
+            f"{same} of {want_n} ids survived",
+        )
+
+        # And git itself has to accept the result, or the ids matching means nothing.
+        fs = sh(f"git fsck --no-progress", cwd=out)
+        record(
+            "and git accepts the exported repository",
+            fs[0] == 0,
+            (fs[1] or "")[:200] or "no complaints",
+        )
+
     if want("pack"):
         # Grouping objects so one zlib stream can see all of them is only worth anything if three
         # things hold at once: the file shrinks, every object still reads back byte for byte, and a

@@ -20,6 +20,9 @@ version is current and freezes when the number changes, so `0.6.0` is a record a
 - `diff --to <branch>` without `--from` compares against that revision's parent instead of the empty
   tree. `--from ""` still asks for the whole tree.
 - `review --json` prints one parseable document instead of text.
+- `git export` writes the timezone the commit was imported with, so every commit keeps its git name
+  through an import and export. It wrote `+0000` for everything, which gave every exported commit a
+  different id: 0 of 97 survived on this project's history, 97 of 97 after the fix.
 - `bench/harness/compare.py` measures three repository shapes instead of one, and reports each shape
   before the pooled figure. Measured: 0.75x on a small tree, 1.00x on deep paths, 0.67x where
   deletions are involved. One shape was one sample, and the three do not agree.

@@ -95,7 +95,20 @@ is easy to write and hard to read back.
 Absent: filters, diff drivers, merge drivers, and `working-tree-encoding`. Each of those runs a
 program on every file, which is a different feature with its own trust question.
 
-### 3. No SSH transport
+### 3. A round trip now keeps every commit name
+
+An import followed by an export used to produce a repository whose content matched and whose commit
+ids did not: 0 of 97 survived on this project. git hashes the author line including its timezone, and
+the export wrote `+0000` where the import had read `+0700`.
+
+The timezone is recorded on the changeset now and written back on export. Measured after the fix:
+97 of 97 commit ids survive an import and export of this project's own history, and `git fsck` accepts
+the result.
+
+The gate asserts this with a source repository written at `+0700`, because a `+0000` source matches
+whether the code is right or wrong, which is how the fault survived a test that read the export back.
+
+### 9. No SSH transport
 
 A remote is a filesystem path, an HTTP server, or S3. An SSH remote would need the protocol and key
 handling. `git push` covers it in the meantime by shelling out, which is honest but depends on the

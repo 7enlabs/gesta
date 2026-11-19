@@ -118,6 +118,10 @@ pub fn init_schema(conn: &Connection) -> ZResult<()> {
             -- Signature over this changeset's identity, and the public key it verifies with.
             signature  TEXT,
             signer     TEXT,
+            -- The author timezone a git commit was written in. git hashes the author line including
+            -- the offset, so an export that writes a different one produces a different commit name
+            -- for identical content. NULL means the changeset was made here, not imported.
+            tz         TEXT,
             -- Provenance: which session produced this change and why. When an agent
             -- writes most of the code, the reason behind a change is part of the
             -- change; a message alone loses it.
@@ -368,6 +372,11 @@ pub fn migrate(conn: &Connection) -> ZResult<bool> {
         }
     }
     ensure_column(conn, "changesets", "git_commit", "TEXT")?;
+    // The timezone a git commit was written in. Without it an export cannot reproduce the commit id,
+    // because git hashes the offset as part of the author line: a commit written at +0700 and the
+    // same commit written at +0000 have different names. NULL means the offset is unknown, which is
+    // every changeset created here rather than imported, and those are written as +0000.
+    ensure_column(conn, "changesets", "tz", "TEXT")?;
     // A signature over the changeset's identity, and the public key it verifies against.
     ensure_column(conn, "changesets", "signature", "TEXT")?;
     ensure_column(conn, "changesets", "signer", "TEXT")?;

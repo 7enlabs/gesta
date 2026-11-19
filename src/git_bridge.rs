@@ -106,8 +106,8 @@ pub fn import(conn: &Connection, git_root: &Path, prefix: Option<&str>) -> ZResu
         };
 
         conn.execute(
-            "INSERT INTO changesets(id,message,author,created_at,status,parent,parent2,branch,git_commit)
-             VALUES(?1,?2,?3,?4,'committed',?5,?6,?7,?8)",
+            "INSERT INTO changesets(id,message,author,created_at,status,parent,parent2,branch,git_commit,tz)
+             VALUES(?1,?2,?3,?4,'committed',?5,?6,?7,?8,?9)",
             rusqlite::params![
                 id,
                 commit.message.trim_end(),
@@ -116,7 +116,11 @@ pub fn import(conn: &Connection, git_root: &Path, prefix: Option<&str>) -> ZResu
                 parent_id,
                 second_parent,
                 "main",
-                hash
+                hash,
+                // git hashes the author line including its offset, so a round trip that writes
+                // +0000 where the original said +0700 produces a different commit name for
+                // identical content. Measured on this project: 0 of 97 ids survived the trip.
+                &commit.timezone
             ],
         )?;
 
@@ -310,13 +314,23 @@ fn export_into(conn: &Connection, repo: &Repo, branch: Option<&str>) -> ZResult<
                 .and_then(|p| mapped.get(&p).cloned())
                 .into_iter()
                 .collect();
+            // The offset the commit was imported with, or +0000 for a changeset made here. A
+            // hard-coded +0000 gave every exported commit a different name than the one it came
+            // from, which made a round trip useless for anything that compares ids.
+            let tz: String = conn
+                .query_row(
+                    "SELECT COALESCE(tz, '+0000') FROM changesets WHERE id = ?1",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|_| "+0000".to_string());
             let body = gitobj::build_commit(
                 &tree_hash,
                 &parents,
                 &name,
                 &mail,
                 ts,
-                "+0000",
+                &tz,
                 &message,
             );
             let commit = repo.write_object(Kind::Commit, &body)?;
@@ -727,6 +741,78 @@ mod tests {
             .expect("b.txt is missing from the imported tree");
         assert_eq!(store::get_object(&conn, &b.1).unwrap(), "second\n");
         let _ = std::fs::remove_dir_all(&src);
+    }
+
+    #[test]
+    fn a_non_utc_offset_survives_the_round_trip() {
+        // git hashes the author line including its offset, so a source written at +0700 and an
+        // export written at +0000 are different commits for identical content. Every id matched in
+        // the test above until a source with a real offset was used, because +0000 matches whether
+        // the code is right or wrong.
+        let dir = temp("tz-offset");
+        let git_dir = dir.join("repo");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main", "."],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "T"],
+        ] {
+            let st = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&git_dir)
+                .status()
+                .unwrap();
+            assert!(st.success(), "git {:?} failed in the test setup", args);
+        }
+        std::fs::write(git_dir.join("a.txt"), "one\n").unwrap();
+        let add = std::process::Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&git_dir)
+            .status()
+            .unwrap();
+        assert!(add.success(), "could not stage the source file");
+        // The offset is set on the commit, where git reads it. Setting it on `git add` did nothing
+        // and the test then failed for a reason that had nothing to do with what it checks.
+        let out = std::process::Command::new("git")
+            .args(["commit", "-qm", "first"])
+            .env("GIT_AUTHOR_DATE", "1700000000 +0700")
+            .env("GIT_COMMITTER_DATE", "1700000000 +0700")
+            .current_dir(&git_dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "could not make the source commit: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        std::fs::create_dir_all(dir.join(".gesta")).unwrap();
+        let conn = store::open_db(&dir).unwrap();
+        store::init_schema(&conn).unwrap();
+        import(&conn, &git_dir, None).unwrap();
+
+        // The recorded offset has to be the one git wrote, not a default.
+        let tz: String = conn
+            .query_row("SELECT tz FROM changesets LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tz, "+0700", "the import dropped the author's offset");
+
+        let out = temp("tz-out");
+        export(&conn, &out, None).unwrap();
+        let repo_out = Repo::open(&out).unwrap();
+        let exported = head_of(&repo_out, "main");
+        let original = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&git_dir)
+            .output()
+            .unwrap();
+        assert_eq!(
+            exported,
+            String::from_utf8_lossy(&original.stdout).trim(),
+            "the export gave the commit a different name"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&out);
     }
 
     #[test]

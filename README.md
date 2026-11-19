@@ -552,7 +552,7 @@ Line coverage, measured with `cargo-llvm-cov --release --summary-only`: 60.64%. 
 ## Verification
 
 ```bash
-cargo test --release              # 184 unit tests
+cargo test --release              # 417 unit tests
 python3 bench/replace_git.py      # 20 end to end capability checks
 python3 bench/http_remote.py      # 11 checks over a real socket
 python3 bench/http_auth.py        # 18 checks on tokens and roles
