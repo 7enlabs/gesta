@@ -469,6 +469,16 @@ fn handle_tls_connection(mut stream: crate::tls::TlsStream, root: &Path, auth: &
 }
 
 pub fn serve(root: PathBuf, bind: String, port: u16, auth: Auth) -> ZResult<()> {
+    // The policy is decided before the socket exists. Binding first printed "listening on
+    // http://0.0.0.0:8899" and then refused, so the one line a person reads said the server was up
+    // when it was about to exit, and the port was open for the length of that message.
+    if !auth.required && !is_loopback(&bind) {
+        return Err(bad(format!(
+            "refusing to serve {} without tokens: add entries to .gesta/auth, or bind 127.0.0.1",
+            bind
+        )));
+    }
+
     let listener = TcpListener::bind((bind.as_str(), port))
         .map_err(|e| bad(format!("cannot bind {}:{}: {}", bind, port, e)))?;
     let local = listener.local_addr()?;
@@ -476,13 +486,8 @@ pub fn serve(root: PathBuf, bind: String, port: u16, auth: Auth) -> ZResult<()> 
     println!("repository: {}", root.display());
     if auth.required {
         println!("access: {} token(s) configured", auth.token_count());
-    } else if is_loopback(&bind) {
-        println!("access: open, loopback only");
     } else {
-        return Err(bad(format!(
-            "refusing to serve {} without tokens: add entries to .gesta/auth, or bind 127.0.0.1",
-            bind
-        )));
+        println!("access: open, loopback only");
     }
     println!("press Ctrl-C to stop");
 

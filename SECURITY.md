@@ -24,9 +24,9 @@ so is better than writing a service-level agreement nobody can meet.
 ## What is not in scope
 
 - A repository you serve on a reachable address with no token file and no TLS. `gesta serve` refuses
-  to serve `0.0.0.0` without tokens: `add entries to .gesta/auth, or bind 127.0.0.1`. Removing a token
-  later and leaving the server up is the case that gets people, because the refusal only happens at
-  startup and the running process keeps what it read.
+  before it opens the socket: `refusing to serve 0.0.0.0 without tokens: add entries to .gesta/auth,
+  or bind 127.0.0.1`. Removing a token later and leaving the server up is the case that gets people,
+  because the check runs at startup and the running process keeps what it read.
 - Denial of service by a client that holds a write token. A write token can already change the
   repository; making it slow is not a new capability.
 - Findings that require an attacker to already have file-system access to the repository store. At

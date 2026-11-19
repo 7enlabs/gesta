@@ -2793,6 +2793,48 @@ def main():
             except Exception:
                 server.kill()
 
+    if want("serve-policy"):
+        # The refusal has to come before the socket exists. Binding first and refusing afterwards
+        # printed "listening on http://0.0.0.0:8899" and left the port open for the length of that
+        # message, so the one line a person reads said the server was up when it was about to exit.
+        import tempfile as _tfs
+        import socket as _socks
+
+        d = _tfs.mkdtemp(prefix="gate-serve-")
+        sh(f"{ZF} init", cwd=d)
+        with open(os.path.join(d, "f.txt"), "w") as fh:
+            fh.write("x\n")
+
+        s = _socks.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+
+        r = subprocess.run(
+            f"{ZF} serve --bind 0.0.0.0 --port {port}",
+            shell=True, cwd=d, capture_output=True, text=True, timeout=30,
+        )
+        combined = r.stdout + r.stderr
+        record(
+            "a server with no tokens refuses a reachable address",
+            "refusing to serve 0.0.0.0 without tokens" in combined,
+            combined.strip()[:300],
+        )
+        # The line that made the old behaviour dangerous.
+        record(
+            "and it does not claim to be listening first",
+            "listening on" not in combined,
+            combined.strip()[:300],
+        )
+        # And the port really is closed, which is what "refused" has to mean.
+        closed = True
+        try:
+            with _socks.create_connection(("127.0.0.1", port), timeout=0.5):
+                closed = False
+        except OSError:
+            closed = True
+        record("and the port was never opened", closed, f"port {port}")
+
     if want("project-files"):
         # The three files every repository is expected to carry, checked rather than assumed. They
         # were absent for the whole life of the project while Cargo.toml said `license = "MIT"`, which

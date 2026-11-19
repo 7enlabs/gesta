@@ -72,6 +72,11 @@ nothing, which is the intended behaviour. If a fixture is genuinely not a creden
 Do not add an entry that covers a real key. An allowlist that hides a credential is worse than no
 scanner, because the project then believes it is being checked.
 
+## Licence of a contribution
+
+The project is MIT, held by 7EN Labs. By sending a change you agree it is licensed under the same
+terms, and that you have the right to license it.
+
 ## Reporting a problem
 
 Open an issue with the command you ran, what you expected and what happened. For anything that looks
