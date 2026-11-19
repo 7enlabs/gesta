@@ -47,7 +47,31 @@ A remote is a filesystem path, an HTTP server, or S3. An SSH remote would need t
 handling. `git push` covers it in the meantime by shelling out, which is honest but depends on the
 git binary being present.
 
-### 4. Long histories are lightly measured
+### 4. The write is flat; the scan is not
+
+Measured on one file edit at three repository sizes, `create` and `commit` apart:
+
+```
+  files   gesta create   gesta commit   git add+commit  write ratio
+    500      13.2ms       11.4ms           6.2ms        1.86x
+   2000      19.7ms       12.8ms          13.8ms        0.92x
+   8000      48.2ms       14.7ms          21.6ms        0.68x
+```
+
+The write costs 1.28x more in a repository 16x larger, which is the property the project claims: the
+cost follows the change. At 8000 files the write is cheaper than `git add && git commit` (14.7
+against 21.6 ms).
+
+The read costs 3.65x more over the same range, and that number is real rather than a bug to hide.
+Answering "what changed" means stat-ing every tracked file, some 14 ms of the 48 at 8000 files, and
+comparing the rest against a cache. Git pays the same shape of cost in `git status` (7.9 ms at 8000
+files on the same machine, because its index stores the stat of every path).
+
+A single figure for the two phases said "2.12x worse" about a floor that did not move. Both numbers
+are reported now, and the gate asserts the write is flat and the scan was seen growing, so neither
+can be made to look good at the other's expense.
+
+### 9. Long histories are lightly measured
 
 Behaviour is known to 5,000 files and 200 changesets. The vault run reached 11,000 files and one
 changeset. Nothing has been tested at 50,000 commits, and the per-query `ancestors_bfs` is the

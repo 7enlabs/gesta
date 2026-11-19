@@ -2466,6 +2466,82 @@ def main():
             f"columns: {', '.join(cols)}",
         )
 
+    if want("scale"):
+        # The project's central claim is that the cost of a commit follows the size of the change,
+        # not of the repository. A benchmark that measured create and commit together reported
+        # 2.12x for a phase that did not move, so the split is the point of the check.
+        #
+        # Two sizes rather than three, because this has to run inside a gate: the shape appears
+        # between 300 and 3000 files, and a third size triples the cost of proving it.
+        import tempfile as _tf
+        import time as _tm
+
+        base = _tf.mkdtemp(prefix="gate-scale-")
+        sizes = (300, 3000)
+        got = {}
+        for n in sizes:
+            d = os.path.join(base, f"r{n}")
+            os.makedirs(d)
+            for i in range(n):
+                sub = os.path.join(d, f"d{i // 200}")
+                os.makedirs(sub, exist_ok=True)
+                with open(os.path.join(sub, f"f{i}.py"), "w") as fh:
+                    fh.write(f"def f{i}():\n    return {i}\n")
+            sh(f"{ZF} init", cwd=d)
+            m = re.search(r"(cs[0-9a-f]+)", sh(f'{ZF} changeset create "seed" --author t --json', cwd=d)[1])
+            if m:
+                sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+            # A freshly written tree is re-read by design, so the cache has to settle before the
+            # timed runs or the measurement is about the first scan.
+            _tm.sleep(2.5)
+
+            writes = []
+            scans = []
+            for i in range(7):
+                with open(os.path.join(d, "d0", "f0.py"), "a") as fh:
+                    fh.write(f"# t{i}\n")
+                # Timed apart. create reads the tree and commit writes the change, and only the
+                # second one is the claim; a single figure hid a flat write behind a growing scan.
+                t0 = _tm.perf_counter()
+                r = sh(f'{ZF} changeset create "m{i}" --author t --json', cwd=d)[1]
+                scans.append((_tm.perf_counter() - t0) * 1000)
+                m = re.search(r"(cs[0-9a-f]+)", r)
+                if not m:
+                    break
+                t0 = _tm.perf_counter()
+                sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+                writes.append((_tm.perf_counter() - t0) * 1000)
+            if len(writes) < 4:
+                got[n] = None
+                continue
+            got[n] = (sorted(scans)[len(scans) // 2], sorted(writes)[len(writes) // 2])
+
+        small, large = got.get(sizes[0]), got.get(sizes[1])
+        if small is None or large is None:
+            record(
+                "the cost of a commit does not follow the size of the repository",
+                False,
+                f"a size did not produce measurements: {got}",
+            )
+        else:
+            scan_small, write_small = small
+            scan_large, write_large = large
+            grown = write_large / write_small if write_small else float("inf")
+            record(
+                "the cost of a commit does not follow the size of the repository",
+                grown <= 2.0,
+                f"write {sizes[0]} files {write_small:.1f} ms, {sizes[1]} files "
+                f"{write_large:.1f} ms, {grown:.2f}x",
+            )
+            # The scan is the other half of the picture, and it is allowed to grow. A repository
+            # with no files would make the first assertion true and mean nothing, so the scan has
+            # to be seen doing its work at both sizes.
+            record(
+                "and the scan that finds the change is measured apart from the write",
+                scan_large > scan_small,
+                f"scan {sizes[0]} files {scan_small:.1f} ms, {sizes[1]} files {scan_large:.1f} ms",
+            )
+
     if want("attributes"):
         # A mixed team writes the same file with different line endings. Without a rule the two
         # checkouts disagree on every line, so every commit looks like it touched the whole file.

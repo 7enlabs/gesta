@@ -20,10 +20,14 @@ version is current and freezes when the number changes, so `0.6.0` is a record a
 - `diff --to <branch>` without `--from` compares against that revision's parent instead of the empty
   tree. `--from ""` still asks for the whole tree.
 - `review --json` prints one parseable document instead of text.
+- `bench/scale.py` measures the scan and the write apart, because one figure for both hid a flat
+  write behind a growing scan. Measured: the write costs 1.28x more in a repository 16x larger.
+- `prune_cache` asks whether any path disappeared before reading the whole table back.
+
 
 ## 0.6.0, 2026-11-18
 
-### Pricing a task, not only passing it
+### Pricing a task and not just its pass rate
 
 - Every attempt now carries a cost: bytes read, turns, and cost per pass. A pass rate says the work
   can be done and says nothing about what it cost, and the published harness benchmark that held
