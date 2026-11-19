@@ -20,6 +20,9 @@ version is current and freezes when the number changes, so `0.6.0` is a record a
 - `diff --to <branch>` without `--from` compares against that revision's parent instead of the empty
   tree. `--from ""` still asks for the whole tree.
 - `review --json` prints one parseable document instead of text.
+- `git import` writes `file_versions`, so blame, `grep --history` and the history secret scan work
+  on an imported repository. It wrote only `changeset_files` before, which left every per-path
+  question over time unanswerable and silent about it.
 - Secret scanning at commit time. A changeset whose content looks like a credential is refused and
   nothing is written; `secret scan [--history]` answers the same question for the tree and for every
   stored version. Rules are a pattern plus a per-rule entropy floor, findings carry a fingerprint that

@@ -137,6 +137,20 @@ pub fn import(conn: &Connection, git_root: &Path, prefix: Option<&str>) -> ZResu
                 "INSERT INTO changeset_files(changeset_id,path,old_hash,new_hash) VALUES(?1,?2,?3,?4)",
                 rusqlite::params![id, path, parent_tree.get(path), our_hash],
             )?;
+            // `file_versions` is what answers "what did this path hold, and when". An import that
+            // wrote only `changeset_files` left the content reachable from the tree but invisible to
+            // every question about a path over time: blame, `grep --history`, and the secret scan of
+            // the history all read this table and all found nothing on an imported repository.
+            let next_ver: i64 = conn.query_row(
+                "SELECT COALESCE(MAX(version), 0) + 1 FROM file_versions WHERE path = ?1",
+                rusqlite::params![path],
+                |r| r.get(0),
+            )?;
+            conn.execute(
+                "INSERT INTO file_versions(path, version, hash, changeset_id, created_at)
+                 VALUES(?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![path, next_ver, our_hash, id, crate::now()],
+            )?;
             out.files += 1;
         }
         for path in parent_tree.keys() {

@@ -70,3 +70,29 @@ commit, and a build step that walks a zip file has its own trust question.
 A scanner can be wrong in both directions, so it reports what it found and names the two-line fix
 rather than deciding for the person reading it. A credential that is already committed has to be
 reverted and then rotated, in that order: reverting alone leaves a live key in a public record.
+
+## Scanning an imported history
+
+`gesta git import` writes `file_versions`, so the history scan sees what the import brought in. It
+did not, until this was measured: the import wrote `changeset_files` and left `file_versions` empty,
+which made every question about a path over time unanswerable on an imported repository. `blame`,
+`grep --history` and `secret scan --history` all read that table and all found nothing, quietly.
+
+Measured on this project's own 93 commit history after the fix:
+
+```
+$ gesta secret scan --history
+7 possible secret(s) in 541 object(s):
+  bench/gate.py:2474  aws-access-key-id  AKIA****************
+  bench/gate.py:2521  github-pat  ghp_************************************
+  src/leak.rs:473  aws-access-key-id  AKIA****************
+  ...
+```
+
+All seven are fixtures in this project's own tests, committed before the allowlist existed. That is
+what the allowlist is for, and it is also the reason the list is checked against the tree rather
+than assumed.
+
+`blame` on an imported history is still empty: the import records versions, not line attribution.
+Reconstructing it means replaying ninety-three diffs, which is a decision about import cost rather
+than an oversight, and it is not done.

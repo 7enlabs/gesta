@@ -2573,6 +2573,53 @@ def main():
             "cargo build --release --no-default-features --target-dir target/nofeat",
             shell=True, cwd=ZF_DIR, capture_output=True, text=True, timeout=900,
         )
+        # An import that writes changesets but not file_versions leaves every question about a path
+        # over time unanswerable: blame, grep --history, and the history scan all read that table.
+        # The check runs on a real repository with more than one commit in it, because a one-commit
+        # import is the case that hid this.
+        imp = _tf.mkdtemp(prefix="gate-import-")
+        src = os.path.join(imp, "src")
+        os.makedirs(src)
+        sh("git init -q -b main .", cwd=src)
+        sh("git config user.email t@t", cwd=src)
+        sh("git config user.name t", cwd=src)
+        for i, text in enumerate(("one\n", "two\n", "three\n")):
+            with open(os.path.join(src, "a.txt"), "w") as fh:
+                fh.write(text)
+            sh(f"git add -A && git commit -qm c{i}", cwd=src)
+        dst = os.path.join(imp, "dst")
+        os.makedirs(dst)
+        sh(f"{ZF} init", cwd=dst)
+        sh(f"{ZF} git import {src}", cwd=dst)
+
+        counts = subprocess.run(
+            'sqlite3 .gesta/gesta.db "SELECT (SELECT COUNT(*) FROM changesets), '
+            '(SELECT COUNT(*) FROM file_versions), '
+            '(SELECT COUNT(*) FROM file_versions fv JOIN objects o ON o.hash=fv.hash)"',
+            shell=True, cwd=dst, capture_output=True, text=True,
+        )
+        vals = (counts.stdout or "").strip().split("|")
+        try:
+            n_cs, n_fv, n_join = (int(v) for v in vals)
+        except Exception:
+            n_cs = n_fv = n_join = -1
+        record(
+            "an imported history records a version for every path",
+            n_cs == 3 and n_fv > 0 and n_join == n_fv,
+            f"changesets {n_cs}, file_versions {n_fv}, of which readable {n_join}",
+        )
+
+        # And the history scan has to see the content the import brought in, or the scan is a
+        # promise about an empty store.
+        hscan = sh(f"{ZF} secret scan --history --json", cwd=dst)[1]
+        try:
+            doc = _js_s.loads(hscan)
+            ok = doc.get("scanned", 0) > 0
+            detail = f"scanned {doc.get('scanned')} object(s), findings {doc.get('findings')}"
+        except Exception as exc:
+            ok, detail = False, f"not one document: {exc}"
+        record("and the history scan reads the imported objects", ok, detail)
+
         record(
             "the build without optional features compiles",
             nb.returncode == 0,
