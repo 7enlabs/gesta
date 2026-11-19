@@ -415,8 +415,57 @@ mod tests {
         assert!(err.contains("plain http"), "unexpected message: {}", err);
     }
 
+    // One lock for every test that writes the process environment. Cargo runs the tests in a
+    // binary on several threads, and two tests that both call `set_var` see each other's writes.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const ENV_KEYS: [&str; 4] = [
+        "GESTA_S3_ENDPOINT",
+        "GESTA_S3_ACCESS_KEY",
+        "GESTA_S3_SECRET_KEY",
+        "GESTA_S3_REGION",
+    ];
+
+    /// Puts the four variables back the way they were when it is dropped.
+    ///
+    /// A guard rather than a call at the end of the test: a test that fails part way through still
+    /// has to leave the environment as it found it, or the next test inherits the mess.
+    struct EnvGuard {
+        saved: [Option<String>; 4],
+    }
+
+    impl EnvGuard {
+        fn new() -> EnvGuard {
+            EnvGuard {
+                saved: [
+                    std::env::var(ENV_KEYS[0]).ok(),
+                    std::env::var(ENV_KEYS[1]).ok(),
+                    std::env::var(ENV_KEYS[2]).ok(),
+                    std::env::var(ENV_KEYS[3]).ok(),
+                ],
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in ENV_KEYS.iter().zip(self.saved.iter()) {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_loopback_endpoint_is_allowed_for_a_local_test_server() {
+        // These tests share one process environment and run in parallel, so a value another test
+        // set a moment ago is what `from_url` reads here. It failed on the Windows runner for that
+        // reason and nowhere else: the scheduling differed, not the code. The lock serialises the
+        // tests that write environment variables, and the variables are restored afterwards.
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new();
         std::env::set_var("GESTA_S3_ENDPOINT", "http://127.0.0.1:9303");
         std::env::set_var("GESTA_S3_ACCESS_KEY", "k");
         std::env::set_var("GESTA_S3_SECRET_KEY", "s");

@@ -56,6 +56,37 @@ def sh_out(cmd, cwd=ZF_DIR, timeout=900):
     return r.returncode, r.stdout.strip()
 
 
+def zf_repo_view():
+    """A repository over this project's files, for the checks that need one.
+
+    A checkout is not a repository: `.gesta/` is ignored with the rest of the local state, so a
+    fresh clone has no store and every command that reads one reports "not a repository". A CI worker
+    is exactly a fresh clone, which is why these checks passed for months on one machine and failed
+    on the first runner that was not that machine.
+    """
+    global _ZF_REPO_VIEW
+    if _ZF_REPO_VIEW is not None:
+        return _ZF_REPO_VIEW
+    import tempfile as _tf
+    import shutil as _sh2
+    root = _tf.mkdtemp(prefix="gate-repo-view-")
+    for name in os.listdir(ZF_DIR):
+        if name in (".gesta", ".git", "target", ".zenforge"):
+            continue
+        s = os.path.join(ZF_DIR, name)
+        d = os.path.join(root, name)
+        if os.path.isdir(s):
+            _sh2.copytree(s, d, symlinks=True)
+        else:
+            _sh2.copy2(s, d)
+    sh(f"{ZF} init", cwd=root)
+    _ZF_REPO_VIEW = root
+    return root
+
+
+_ZF_REPO_VIEW = None
+
+
 def main():
     only = sys.argv[1] if len(sys.argv) > 1 else None
 
@@ -142,7 +173,12 @@ def main():
         # The tool's own scanner rather than a second list of patterns here. Two lists drift, and
         # the one in the tool is the one that runs at commit time, so a difference between them
         # would mean the gate passes a tree the tool would refuse.
-        r = sh(f"{ZF} secret scan", cwd=ZF_DIR)
+        # `secret scan` reads a repository, and a checkout of this project is not one: `.gesta/` is
+        # ignored with the rest of the local state. A CI worker therefore had no repository here and
+        # the step reported "not a repository", which is a failure with nothing to do with
+        # credentials. A throwaway repository over the same files answers the same question.
+        scan_root = zf_repo_view()
+        r = sh(f"{ZF} secret scan", cwd=scan_root)
         own = r[1]
         record(
             "no hardcoded credential in src",
@@ -1825,15 +1861,20 @@ def main():
             path = os.path.join(tmp, f"w{i}.txt")
             with open(path, "w") as fh:
                 fh.write(f"writer {i}\n")
-            # Each writer commits the changeset it just made, by name. Taking the first id from
-            # `changeset list` picks whichever changeset another process created a moment ago, so
-            # twenty writers committed each other's work and some of their own was never committed.
-            # The check then reported lost changesets, which was true and was the harness's doing.
+            # Each writer commits the changeset it made, found by its own message. Two traps here,
+            # both of which produced a "lost changesets" report that was true and was the harness's
+            # doing: taking the first id from `changeset list` picks whichever changeset another
+            # process created a moment ago, and `changeset create --json` returns a null id when the
+            # tree has no change to record. Matching on the message this writer chose avoids both.
             procs.append(
                 subprocess.Popen(
                     ["bash", "-lc",
-                     f"c=$({ZF} changeset create w{i} --author p{i} --json 2>/dev/null "
-                     f"| grep -oE 'cs[0-9a-f]+' | head -1); "
+                     f"{ZF} changeset create w{i} --author p{i} >/dev/null 2>&1; "
+                     f"c=$({ZF} changeset list --json 2>/dev/null "
+                     f"| python3 -c \"import json,sys; "
+                     f"d=json.load(sys.stdin); "
+                     f"ids=[x['id'] for x in d.get('changesets',[]) if x.get('message')=='w{i}']; "
+                     f"print(ids[0] if ids else '')\"); "
                      f"[ -n \"$c\" ] && {ZF} changeset commit $c >/dev/null 2>&1; true"],
                     cwd=tmp,
                 )
@@ -2562,7 +2603,7 @@ def main():
 
         # And this repository has to pass its own check, or the first commit after this lands is a
         # commit the project cannot make.
-        own = sh(f"{ZF} secret scan", cwd=ZF_DIR)[1]
+        own = sh(f"{ZF} secret scan", cwd=zf_repo_view())[1]
         record(
             "this repository passes its own scan",
             "no secrets found" in own,

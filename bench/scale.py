@@ -26,7 +26,10 @@ import subprocess
 import sys
 import time
 
-GESTA = os.environ.get("GESTA_BIN", "/work/gesta/target/release/gesta")
+# Found relative to this file. A benchmark that only runs in one container is not a
+# measurement another machine can repeat.
+_PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+GESTA = os.environ.get("GESTA_BIN", os.path.join(_PROJECT, "target", "release", "gesta"))
 ROOT = "/tmp/gesta_scale"
 rows = []
 

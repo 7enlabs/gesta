@@ -17,7 +17,10 @@ import sys
 import time
 import time
 
-ZF = os.environ.get("ZF_BIN", "/work/gesta/target/release/gesta")
+# Found relative to this file. A benchmark that only runs in one container is not a
+# measurement another machine can repeat.
+_PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ZF = os.environ.get("ZF_BIN", os.path.join(_PROJECT, "target", "release", "gesta"))
 # The benchmark must not run on a bind mount. /work is a 9p drvfs share of a
 # Windows drive, where every read crosses the container boundary, and a 3.7 MB
 # binary then takes 7 ms to page in instead of 0.9 ms. Measuring there blames the

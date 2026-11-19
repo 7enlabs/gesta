@@ -202,11 +202,23 @@ impl Scanner {
     /// `stopword <word>`. A format that needs no parser library and that a person can read in an
     /// editor, because the file a project maintains by hand should not need a tool to inspect.
     pub fn load_allowlist(&mut self, root: &Path) {
-        let path = root.join(".gesta").join("secret-allowlist");
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(_) => return,
-        };
+        // Two files, in this order: `.gesta/secret-allowlist` is local to one checkout, and
+        // `.secret-allowlist` is committed with the project. Without the second one a fresh clone
+        // has no allowlist at all, so its own fixtures read as credentials and the scanner refuses
+        // the project it ships with.
+        for path in [
+            root.join(".gesta").join("secret-allowlist"),
+            root.join(".secret-allowlist"),
+        ] {
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            self.merge_allowlist_text(&text);
+        }
+    }
+
+    fn merge_allowlist_text(&mut self, text: &str) {
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {

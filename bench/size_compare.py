@@ -1,7 +1,8 @@
 
 import subprocess, os, shutil, re
 
-ZF = "/work/gesta/target/release/gesta"
+_PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ZF = os.environ.get("ZF_BIN", os.path.join(_PROJECT, "target", "release", "gesta"))
 N = 500
 base = [f"line {i}: some content padding padding padding" for i in range(N)]
 

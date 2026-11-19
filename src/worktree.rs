@@ -874,14 +874,23 @@ mod tests {
     }
     #[test]
     fn a_backslash_in_a_file_name_is_not_a_separator() {
-        // Two different files on a Unix disk. A blanket replace made them one path.
-        let root = std::path::Path::new("/repo");
-        let one = root.join("back\\slash.txt");
+        // A backslash is a separator on Windows and a character in a name everywhere else, so the
+        // same two paths are one file on one platform and two on the other. The assertion that holds
+        // on both: the answer is a path whose separators are forward slashes, and on a Unix disk the
+        // name keeps its backslash because there it is not a separator.
+        let root = std::path::Path::new(if cfg!(windows) { "C:/repo" } else { "/repo" });
         let two = root.join("back").join("slash.txt");
-        let a = rel_path(root, &one);
         let b = rel_path(root, &two);
+        assert_eq!(b, "back/slash.txt", "a separator stayed a backslash");
+
+        if cfg!(windows) {
+            // On Windows a name cannot hold a backslash at all, so there is no second file to
+            // compare with. Saying so is better than an assertion that only holds on one platform.
+            return;
+        }
+        let one = root.join("back\\slash.txt");
+        let a = rel_path(root, &one);
         assert_eq!(a, "back\\slash.txt", "a backslash in a name was rewritten");
-        assert_eq!(b, "back/slash.txt");
         assert_ne!(a, b, "two different files became one path");
     }
 

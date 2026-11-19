@@ -16,7 +16,11 @@ import time
 import urllib.error
 import urllib.request
 
-ZF = os.environ.get("ZF_BIN", "/work/gesta/target/release/gesta")
+# The binary and the project are found relative to this file, not from a fixed mount path. A suite
+# that only runs in one container cannot be part of the check a change is measured against.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PROJECT = os.path.dirname(_HERE)
+ZF = os.environ.get("ZF_BIN", os.path.join(_PROJECT, "target", "release", "gesta"))
 ROOT = "/tmp/zf_api"
 PORT = 8791
 BASE = f"http://127.0.0.1:{PORT}"
