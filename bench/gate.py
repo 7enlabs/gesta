@@ -2626,6 +2626,101 @@ def main():
             (nb.stderr or nb.stdout)[-400:],
         )
 
+    if want("git-clone"):
+        # A server that a real git client can clone is the claim, and only a real git client can
+        # check it. A test that reads our own response back proves the response is well formed and
+        # nothing about whether git agrees.
+        import tempfile as _tfc
+        import socket as _sock
+        import time as _tmc
+
+        d = _tfc.mkdtemp(prefix="gate-clone-")
+        sh(f"{ZF} init", cwd=d)
+        with open(os.path.join(d, "a.txt"), "w") as fh:
+            fh.write("one\ntwo\n")
+        os.makedirs(os.path.join(d, "sub"), exist_ok=True)
+        with open(os.path.join(d, "sub", "b.txt"), "w") as fh:
+            fh.write("deep\n")
+        m = re.search(r"(cs[0-9a-f]+)", sh(f'{ZF} changeset create "first" --author t --json', cwd=d)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+        with open(os.path.join(d, "a.txt"), "w") as fh:
+            fh.write("one\ntwo\nthree\n")
+        m = re.search(r"(cs[0-9a-f]+)", sh(f'{ZF} changeset create "second" --author t --json', cwd=d)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+
+        # A free port, taken from the OS rather than guessed.
+        s = _sock.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+
+        server = subprocess.Popen(
+            f"{ZF} serve --port {port}", shell=True, cwd=d,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            # Wait for the listener rather than sleeping a fixed time, which fails on a slow machine
+            # and passes for the wrong reason on a fast one.
+            for _ in range(50):
+                try:
+                    with _sock.create_connection(("127.0.0.1", port), timeout=0.2):
+                        break
+                except OSError:
+                    _tmc.sleep(0.1)
+
+            out = _tfc.mkdtemp(prefix="gate-clone-out-")
+            clone = os.path.join(out, "repo")
+            r = subprocess.run(
+                f"git clone http://127.0.0.1:{port}/git/repo {clone}",
+                shell=True, capture_output=True, text=True, timeout=120,
+            )
+            record(
+                "a plain git client can clone from the server",
+                r.returncode == 0,
+                (r.stderr or r.stdout)[-400:],
+            )
+            # The content, not just the exit code: an empty clone exits 0 with a warning.
+            got = ""
+            if os.path.exists(os.path.join(clone, "a.txt")):
+                got = open(os.path.join(clone, "a.txt")).read()
+            record(
+                "and the working tree holds the content",
+                got == "one\ntwo\nthree\n",
+                f"a.txt: {got!r}",
+            )
+            nested = ""
+            if os.path.exists(os.path.join(clone, "sub", "b.txt")):
+                nested = open(os.path.join(clone, "sub", "b.txt")).read()
+            record(
+                "and a nested path survived",
+                nested == "deep\n",
+                f"sub/b.txt: {nested!r}",
+            )
+            log = subprocess.run(
+                "git log --oneline", shell=True, cwd=clone, capture_output=True, text=True
+            ).stdout
+            record(
+                "and the history came with it",
+                log.count("\n") >= 2 and "first" in log and "second" in log,
+                log.strip()[:200],
+            )
+            status = subprocess.run(
+                "git status --short", shell=True, cwd=clone, capture_output=True, text=True
+            ).stdout
+            record(
+                "and git considers the checkout clean",
+                status.strip() == "",
+                status.strip()[:200] or "no changes",
+            )
+        finally:
+            server.terminate()
+            try:
+                server.wait(timeout=10)
+            except Exception:
+                server.kill()
+
     if want("git-parity"):
         # A round trip that changes every commit name is not a round trip. git hashes the author line
         # including its timezone, so an export that writes +0000 where the import read +0700 produces

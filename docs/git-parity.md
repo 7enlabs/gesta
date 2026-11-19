@@ -108,13 +108,36 @@ the result.
 The gate asserts this with a source repository written at `+0700`, because a `+0000` source matches
 whether the code is right or wrong, which is how the fault survived a test that read the export back.
 
-### 9. No SSH transport
+### 4. The server speaks enough of the git protocol to clone
+
+`gesta serve` answers the two requests a clone makes: `info/refs?service=git-upload-pack` and
+`POST git-upload-pack`. `git clone http://host/git/repo` produces a working tree with the content,
+the history and a clean status.
+
+That is the check, and the only one worth making: a test that reads our own response back proves the
+response is well formed and nothing about whether git agrees with it.
+
+Four details produced the same symptom, an empty working tree:
+
+- The pkt-line length counts its own four byte header.
+- The first ref line carries the capabilities after a NUL, and only the first one.
+- Under `side-band-64k` the stream ends with a band-1 packet carrying nothing, then a flush.
+- `HEAD` has to be advertised as a ref of its own alongside `symref=HEAD:refs/heads/main`. Without
+  the `HEAD` line git files everything under `refs/remotes/origin` and leaves the tree empty with a
+  warning about a missing ref.
+
+What is absent: push, the v2 protocol, `multi_ack_detailed`, and any delta in the pack. The pack is a
+full copy, about 3x a delta pack on this project, and a negotiation that sent only what the client
+asked for would need its `have` list. Absent on purpose, and named here so the next person does not
+read the absence as a bug.
+
+### 5. No SSH transport
 
 A remote is a filesystem path, an HTTP server, or S3. An SSH remote would need the protocol and key
 handling. `git push` covers it in the meantime by shelling out, which is honest but depends on the
 git binary being present.
 
-### 4. The write is flat; the scan is not
+### 6. The write is flat; the scan is not
 
 Measured on one file edit at three repository sizes, `create` and `commit` apart:
 
@@ -138,19 +161,19 @@ A single figure for the two phases said "2.12x worse" about a floor that did not
 are reported now, and the gate asserts the write is flat and the scan was seen growing, so neither
 can be made to look good at the other's expense.
 
-### 9. Long histories are lightly measured
+### 7. Long histories are lightly measured
 
 Behaviour is known to 5,000 files and 200 changesets. The vault run reached 11,000 files and one
 changeset. Nothing has been tested at 50,000 commits, and the per-query `ancestors_bfs` is the
 first thing that would hurt.
 
-### 5. No interactive conflict resolver
+### 8. No interactive conflict resolver
 
 Conflicts are data: both sides, line numbers, context, all three whole files. An agent writes the
 answer. A human is handed conflict markers. That is a deliberate design choice, not a gap, but it
 is a difference from git that a person will notice.
 
-### 6. What git has that nothing here replaces
+### 9. What git has that nothing here replaces
 
 - **Hooks ecosystem.** There are pre and post commit hooks, not the full set, and no `.git/hooks`
   compatibility.

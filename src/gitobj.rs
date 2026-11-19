@@ -76,6 +76,18 @@ pub struct Commit {
 // SHA-1. Git names objects by it, so a bridge cannot avoid it. Written here rather than pulled in
 // because this is the only use: the tree, the commit and the blob are hashed over a few hundred
 // bytes, and the alternative is another dependency for one call.
+/// The same digest as `sha1`, as bytes. A pack's trailing checksum is raw bytes, and converting a
+/// hex string back to them to append it would be two conversions for one value.
+pub fn sha1_raw(data: &[u8]) -> [u8; 20] {
+    let h = sha1(data);
+    let mut out = [0u8; 20];
+    for i in 0..20 {
+        let byte = u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).unwrap_or(0);
+        out[i] = byte;
+    }
+    out
+}
+
 fn sha1(data: &[u8]) -> String {
     let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
     let bit_len = (data.len() as u64) * 8;
@@ -502,6 +514,77 @@ pub fn author_parts(line: &str) -> (String, String) {
             line[a + 1..b].trim().to_string(),
         ),
         _ => (line.trim().to_string(), String::new()),
+    }
+}
+
+
+
+impl Repo {
+    /// The commit a branch points at, read the way git stores it.
+    ///
+    /// Restored as a method because a server needs it: the earlier version was removed as dead code
+    /// when only a test called it, and the protocol needs exactly this lookup to answer a clone.
+    pub fn read_head(&self, branch: &str) -> ZResult<Option<String>> {
+        let loose = self.git_dir.join("refs").join("heads").join(branch);
+        if let Ok(text) = std::fs::read_to_string(&loose) {
+            let t = text.trim();
+            if !t.is_empty() {
+                return Ok(Some(t.to_string()));
+            }
+        }
+        let packed = std::fs::read_to_string(self.git_dir.join("packed-refs")).unwrap_or_default();
+        for line in packed.lines() {
+            if line.starts_with('#') || line.trim().is_empty() {
+                continue;
+            }
+            if let Some((hash, name)) = line.split_once(' ') {
+                if name.trim() == format!("refs/heads/{}", branch) {
+                    return Ok(Some(hash.trim().to_string()));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Every object in this repository, as (hex sha, type code, body).
+    ///
+    /// Walks loose objects only. A repository this code wrote never has a pack, and reading a pack
+    /// here would duplicate what `packfile.rs` already does for git repositories it did not write.
+    pub fn all_objects(&self) -> ZResult<Vec<(String, u8, Vec<u8>)>> {
+        let mut out = Vec::new();
+        let objects = self.git_dir.join("objects");
+        let dirs = match std::fs::read_dir(&objects) {
+            Ok(d) => d,
+            Err(_) => return Ok(out),
+        };
+        for entry in dirs.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            // `info` and `pack` sit next to the two-character object folders.
+            if name.len() != 2 {
+                continue;
+            }
+            let inner = match std::fs::read_dir(entry.path()) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            for f in inner.flatten() {
+                let rest = f.file_name().to_string_lossy().to_string();
+                let sha = format!("{}{}", name, rest);
+                if let Ok(obj) = self.read_object(&sha) {
+                    out.push((sha, kind_code(&obj.kind), obj.body));
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+fn kind_code(k: &Kind) -> u8 {
+    match k {
+        Kind::Commit => 1,
+        Kind::Tree => 2,
+        Kind::Blob => 3,
+        Kind::Tag => 4,
     }
 }
 

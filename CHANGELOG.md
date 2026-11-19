@@ -20,6 +20,8 @@ version is current and freezes when the number changes, so `0.6.0` is a record a
 - `diff --to <branch>` without `--from` compares against that revision's parent instead of the empty
   tree. `--from ""` still asks for the whole tree.
 - `review --json` prints one parseable document instead of text.
+- `gesta serve` speaks the git upload-pack protocol, so `git clone http://host/git/repo` works with a
+  plain git client and no gesta binary. Full pack, no delta and no push.
 - `git export` writes the timezone the commit was imported with, so every commit keeps its git name
   through an import and export. It wrote `+0000` for everything, which gave every exported commit a
   different id: 0 of 97 survived on this project's history, 97 of 97 after the fix.

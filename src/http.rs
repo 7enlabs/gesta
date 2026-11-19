@@ -76,6 +76,17 @@ impl Response {
         }
     }
 
+    /// A binary answer with the content type its consumer requires. A git client refuses a
+    /// response whose type is not the one it asked for, and reports it as a protocol error.
+    pub fn ok_with_type(b: Vec<u8>, content_type: &'static str) -> Response {
+        Response {
+            status: 200,
+            reason: "OK",
+            content_type,
+            body: b,
+        }
+    }
+
     pub fn ok_binary(b: Vec<u8>) -> Response {
         Response {
             status: 200,
@@ -571,6 +582,10 @@ pub fn route(root: &Path, req: &Request, auth: &Auth) -> Response {
         (_, p) if p.starts_with("/v1/bundle") && req.method == "POST" => Some(Role::Write),
         (_, "/v1/changeset") if req.method == "POST" => Some(Role::Write),
         (_, "/v1/changeset") if req.method == "GET" || req.method == "HEAD" => Some(Role::Read),
+        // A git client sends a path it was given, not one of ours, and it authenticates with Basic
+        // while our tokens use Bearer. Both are read, because a clone that cannot authenticate is a
+        // clone nobody finishes.
+        (_, p) if p.contains("/info/refs") || p.ends_with("/git-upload-pack") => Some(Role::Read),
         (_, p) if p.starts_with("/v1/") => Some(Role::Read),
         _ => None,
     };
@@ -642,6 +657,37 @@ pub fn route(root: &Path, req: &Request, auth: &Auth) -> Response {
                     Response::ok_binary(bytes)
                 }
                 Ok(None) => Response::error(404, "Not Found", format!("no branch {}", branch)),
+                Err(e) => Response::error(500, "Internal Server Error", e.to_string()),
+            }
+        }
+        // ---- git smart HTTP ----
+        //
+        // `git clone http://host/git/repo` asks for `info/refs?service=git-upload-pack` first, and
+        // then POSTs to `git-upload-pack`. Two requests, and a repository that answers the first and
+        // not the second makes the client fail after it has already printed progress.
+        ("GET", p) if p.contains("/info/refs") => {
+            let service = req.param("service").unwrap_or("");
+            if service != "git-upload-pack" {
+                return Response::error(
+                    403,
+                    "Forbidden",
+                    format!("service {} is not served here (only git-upload-pack)", service),
+                );
+            }
+            match crate::gitserver::advertise(root) {
+                Ok(body) => {
+                    log_access(root, &who, "git-info-refs", p, &format!("{} bytes", body.len()));
+                    Response::ok_with_type(body, "application/x-git-upload-pack-advertisement")
+                }
+                Err(e) => Response::error(500, "Internal Server Error", e.to_string()),
+            }
+        }
+        ("POST", p) if p.ends_with("/git-upload-pack") => {
+            match crate::gitserver::upload_pack(root, &req.body) {
+                Ok(body) => {
+                    log_access(root, &who, "git-upload-pack", p, &format!("{} bytes", body.len()));
+                    Response::ok_with_type(body, "application/x-git-upload-pack-result")
+                }
                 Err(e) => Response::error(500, "Internal Server Error", e.to_string()),
             }
         }
@@ -1194,5 +1240,108 @@ mod tests {
         assert!(text.contains("Content-Length: 5"));
         assert!(text.contains("Connection: close"));
         assert!(text.ends_with("hello"));
+    }
+}
+
+/// Open a repository at `root` for a server request.
+///
+/// The server is handed the directory it was started in, and the branch it serves is `main` unless
+/// the repository says otherwise. Returning all three keeps the caller from guessing which of them
+/// it needs.
+/// What a server request needs from a repository, read in one pass.
+///
+/// A tuple of four would have been shorter and unreadable at the call site, and clippy is right that
+/// `(Connection, String, Vec<(String, String)>, Vec<Entry>)` is not a type anybody can follow.
+pub struct ServedRepository {
+    /// Branch name to the git commit id it points at.
+    pub refs: Vec<(String, String)>,
+    /// Every object those refs reach.
+    pub objects: Vec<crate::gitserver::Entry>,
+}
+
+pub fn open_repo_for_serve(root: &Path) -> ZResult<ServedRepository> {
+    let conn = crate::store::open_db(root)?;
+    let names: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT name FROM branches WHERE head IS NOT NULL ORDER BY name")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if names.is_empty() {
+        return Ok(ServedRepository {
+            refs: Vec::new(),
+            objects: Vec::new(),
+        });
+    }
+
+    // One export, read twice: the refs a client asks for, and the objects it receives. Two exports
+    // to the same temporary path in the same second collided, and the second one read a directory
+    // the first had already removed, which is why the pack had a count and no bodies.
+    let dir = std::env::temp_dir().join(format!(
+        "gesta-serve-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir)?;
+    let mut refs = Vec::new();
+    let mut objects = Vec::new();
+    if crate::git_bridge::export(&conn, &dir, None).is_ok() {
+        if let Ok(repo) = crate::gitobj::Repo::open(&dir) {
+            for name in names {
+                if let Ok(Some(sha)) = repo.read_head(&name) {
+                    refs.push((name, sha));
+                }
+            }
+            if let Ok(all) = repo.all_objects() {
+                for (_sha, kind, body) in all {
+                    objects.push(crate::gitserver::Entry { kind, body });
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(ServedRepository { refs, objects })
+}
+
+
+#[cfg(test)]
+mod serve_tests {
+    #[test]
+    fn an_export_can_be_read_back_as_objects() {
+        // The server sends a pack built from an export, so the export has to come back with objects.
+        // A pack with a count and no bodies is what this reads like when it does not, and git
+        // reports it as a clone that succeeded and checked out nothing.
+        let dir = std::env::temp_dir().join(format!("gesta-serve-t-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".gesta")).unwrap();
+        let conn = crate::store::open_db(&dir).unwrap();
+        crate::store::init_schema(&conn).unwrap();
+        std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+        std::fs::create_dir_all(dir.join("d")).unwrap();
+        std::fs::write(dir.join("d").join("b.txt"), "deep\n").unwrap();
+        // A branch has to exist before a changeset can be committed onto it, which is what `init`
+        // does when a person runs it. Building the store by hand skipped that and the export then
+        // had nowhere to write a ref.
+        conn.execute(
+            "INSERT INTO branches(name, head, created_at, from_branch) VALUES('main', NULL, 0, NULL)",
+            [],
+        )
+        .unwrap();
+        crate::repo::create_changeset(&conn, &dir, "first", "t").unwrap();
+        let pending: String = conn
+            .query_row("SELECT id FROM changesets LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        crate::repo::commit_one(&conn, &pending).unwrap();
+
+        let exported = dir.join("out");
+        crate::git_bridge::export(&conn, &exported, None).unwrap();
+        let repo = crate::gitobj::Repo::open(&exported);
+        assert!(repo.is_ok(), "the export is not a git repository: {:?}", repo.err());
+        let repo = repo.unwrap();
+        let objects = repo.all_objects().unwrap();
+        assert!(!objects.is_empty(), "the export holds no objects");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

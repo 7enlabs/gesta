@@ -16,6 +16,7 @@ mod content;
 mod delta;
 mod git_bridge;
 mod gitobj;
+mod gitserver;
 mod grep;
 mod history;
 mod impact;
