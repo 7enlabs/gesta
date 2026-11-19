@@ -35,6 +35,28 @@ impl S3Config {
     /// `GESTA_S3_REGION`, `GESTA_S3_ACCESS_KEY` and `GESTA_S3_SECRET_KEY`. Putting
     /// a secret in a URL means it ends up in shell history and in the repository
     /// config, which is a copy nobody rotates.
+    /// Whether a plain http endpoint is allowed, given the endpoint text.
+    ///
+    /// Split out of `from_url` so it can be tested without writing the process environment. A test
+    /// that sets `GESTA_S3_ENDPOINT` shares that variable with every other test in the binary, and
+    /// the two that did exactly that failed on a runner whose thread schedule differed and nowhere
+    /// else.
+    pub fn plain_http_is_allowed(endpoint: &str) -> bool {
+        match endpoint.strip_prefix("http://") {
+            None => true,
+            Some(rest) => {
+                // A bracketed IPv6 literal holds colons, so splitting on the first colon would cut
+                // `[::1]:9000` down to `[`. Take the bracket first, then the port.
+                let host = if let Some(after) = rest.strip_prefix('[') {
+                    after.split(']').next().unwrap_or("")
+                } else {
+                    rest.split(['/', ':']).next().unwrap_or("")
+                };
+                host == "127.0.0.1" || host == "localhost" || host == "::1"
+            }
+        }
+    }
+
     pub fn from_url(url: &str) -> ZResult<(S3Config, String)> {
         let rest = url
             .strip_prefix("s3://")
@@ -57,15 +79,11 @@ impl S3Config {
         // is not a password, but it identifies the key and it covers the payload, so anyone on
         // the path reads the repository and can replay within the signing window. Loopback is
         // allowed because a local test server cannot be read by anyone else.
-        if let Some(rest) = endpoint.strip_prefix("http://") {
-            let host = rest.split(['/', ':']).next().unwrap_or("");
-            let loopback = host == "127.0.0.1" || host == "localhost" || host == "::1";
-            if !loopback {
-                return Err(bad(format!(
-                    "refusing a plain http endpoint ({}): the signature and the content would travel in the clear. Use https, or 127.0.0.1 for a local test server",
-                    endpoint
-                )));
-            }
+        if !S3Config::plain_http_is_allowed(&endpoint) {
+            return Err(bad(format!(
+                "refusing a plain http endpoint ({}): the signature and the content would travel in the clear. Use https, or 127.0.0.1 for a local test server",
+                endpoint
+            )));
         }
         // Credentials come from the environment first, then from the encrypted
         // store. The order matters: an environment variable is what a test or a
@@ -403,85 +421,26 @@ mod tests {
     }
     #[test]
     fn a_plain_http_endpoint_is_refused_because_the_signature_would_be_readable() {
-        std::env::set_var("GESTA_S3_ENDPOINT", "http://s3.example.com");
-        std::env::set_var("GESTA_S3_ACCESS_KEY", "k");
-        std::env::set_var("GESTA_S3_SECRET_KEY", "s");
-        // `S3Config` deliberately has no Debug, because it holds the secret key and a
-        // derive would print it in any panic message.
-        let err = match S3Config::from_url("s3://bucket/prefix") {
-            Ok(_) => panic!("a plain endpoint was accepted"),
-            Err(e) => e.to_string(),
-        };
-        assert!(err.contains("plain http"), "unexpected message: {}", err);
-    }
-
-    // One lock for every test that writes the process environment. Cargo runs the tests in a
-    // binary on several threads, and two tests that both call `set_var` see each other's writes.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    const ENV_KEYS: [&str; 4] = [
-        "GESTA_S3_ENDPOINT",
-        "GESTA_S3_ACCESS_KEY",
-        "GESTA_S3_SECRET_KEY",
-        "GESTA_S3_REGION",
-    ];
-
-    /// Puts the four variables back the way they were when it is dropped.
-    ///
-    /// A guard rather than a call at the end of the test: a test that fails part way through still
-    /// has to leave the environment as it found it, or the next test inherits the mess.
-    struct EnvGuard {
-        saved: [Option<String>; 4],
-    }
-
-    impl EnvGuard {
-        fn new() -> EnvGuard {
-            EnvGuard {
-                saved: [
-                    std::env::var(ENV_KEYS[0]).ok(),
-                    std::env::var(ENV_KEYS[1]).ok(),
-                    std::env::var(ENV_KEYS[2]).ok(),
-                    std::env::var(ENV_KEYS[3]).ok(),
-                ],
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, value) in ENV_KEYS.iter().zip(self.saved.iter()) {
-                match value {
-                    Some(v) => std::env::set_var(key, v),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
+        // No environment is written: the decision is a pure function, so this cannot race the tests
+        // that read the environment. The earlier version wrote GESTA_S3_ENDPOINT and failed on a
+        // runner whose thread schedule differed, which looked like a Windows bug and was not one.
+        assert!(!S3Config::plain_http_is_allowed("http://s3.example.com"));
+        assert!(!S3Config::plain_http_is_allowed("http://10.0.0.1:9000"));
     }
 
     #[test]
     fn a_loopback_endpoint_is_allowed_for_a_local_test_server() {
-        // These tests share one process environment and run in parallel, so a value another test
-        // set a moment ago is what `from_url` reads here. It failed on the Windows runner for that
-        // reason and nowhere else: the scheduling differed, not the code. The lock serialises the
-        // tests that write environment variables, and the variables are restored afterwards.
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _env = EnvGuard::new();
-        std::env::set_var("GESTA_S3_ENDPOINT", "http://127.0.0.1:9303");
-        std::env::set_var("GESTA_S3_ACCESS_KEY", "k");
-        std::env::set_var("GESTA_S3_SECRET_KEY", "s");
-        std::env::set_var("GESTA_S3_REGION", "us-east-1");
-        let (cfg, prefix) = S3Config::from_url("s3://bucket/prefix").unwrap();
-        assert_eq!(prefix, "prefix");
-        assert_eq!(cfg.bucket, "bucket");
+        assert!(S3Config::plain_http_is_allowed("http://127.0.0.1:9303"));
+        assert!(S3Config::plain_http_is_allowed("http://localhost:9000/x"));
+        assert!(S3Config::plain_http_is_allowed("http://[::1]:9000"));
+        assert!(S3Config::plain_http_is_allowed("https://s3.example.com"));
     }
 
     #[test]
     fn an_https_endpoint_is_accepted() {
-        std::env::set_var("GESTA_S3_ENDPOINT", "https://s3.ap-southeast-2.idrivee2.com");
-        std::env::set_var("GESTA_S3_ACCESS_KEY", "k");
-        std::env::set_var("GESTA_S3_SECRET_KEY", "s");
-        std::env::set_var("GESTA_S3_REGION", "ap-southeast-2");
-        let (cfg, _) = S3Config::from_url("s3://bucket/pre").unwrap();
-        assert_eq!(cfg.region, "ap-southeast-2");
+        // The scheme check only, because the rest of `from_url` reads credentials from the process
+        // environment or the secret store, and both are process-wide.
+        assert!(S3Config::plain_http_is_allowed("https://s3.ap-southeast-2.example.com"));
+        assert!(S3Config::plain_http_is_allowed("https://s3.amazonaws.com"));
     }
 }
