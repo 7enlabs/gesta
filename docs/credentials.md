@@ -79,3 +79,31 @@ Being honest about the boundary is more useful than claiming more than it does.
 
 Rotating the key does not touch the repository. Nothing in the history depends on
 which key pushed it.
+
+## Scoping a token to a branch
+
+A write token may be limited to named branches, so a job that publishes to `main` cannot rewrite
+`release`:
+
+```bash
+gesta remote token add write publisher --branches main
+gesta remote token add write docs-bot --branches "docs-*" --scope "docs/**"
+```
+
+The auth file entry gains two optional fields at the end:
+
+```text
+<token or sha256:digest> : <role> : <name> : <path globs> : <expiry> : <branch globs>
+```
+
+Each field may be empty, and an entry written before the branch field existed grants every branch,
+which is why an existing `.gesta/auth` keeps working unchanged.
+
+Two rules that are not obvious:
+
+- **A read token is never limited by branch.** Refusing a read because a branch is not listed would
+  make the field silently hide history, and reading is already covered by the path scope.
+- **A refused push leaves no branch behind.** The pack is unpacked, the permitted refs move, the
+  refused ref reports `ng`, and any branch the refused ref would have created is removed. Creating it
+  and then reporting a refusal would put history in the repository that the caller was not allowed to
+  write.

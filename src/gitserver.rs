@@ -307,8 +307,33 @@ pub fn split_push(body: &[u8]) -> ZResult<(Vec<PushCommand>, Vec<u8>)> {
 /// path a `git import` uses. Writing a second reader for a pack that arrives over the wire would be
 /// a second implementation to keep in step with the first, and the first difference between them
 /// shows up as a push that reports success and a branch that did not move.
-pub fn receive_pack(root: &std::path::Path, body: &[u8]) -> ZResult<Vec<u8>> {
+/// Answer `git-receive-pack`.
+///
+/// `allowed`, when given, is which branches this caller may write. Returning false for a ref rejects
+/// that ref and leaves the others alone, which is what a push naming three refs expects when one of
+/// them is not its business. The pack is still unpacked: refusing the whole transfer would let one
+/// forbidden branch hide the objects the permitted ones need.
+pub fn receive_pack_allowing(
+    root: &std::path::Path,
+    body: &[u8],
+    allowed: Option<&dyn Fn(&str) -> bool>,
+) -> ZResult<Vec<u8>> {
     let (commands, pack) = split_push(body)?;
+
+    // Refused refs, remembered so the import's own branch creation can be undone. The import walks
+    // the scratch repository's refs and creates a branch for each, so a forbidden branch was created
+    // and left behind pointing at a commit the caller may not write to.
+    let refused: Vec<String> = commands
+        .iter()
+        .filter(|c| match allowed {
+            Some(permitted) => {
+                let branch = c.name.strip_prefix("refs/heads/").unwrap_or(&c.name);
+                !permitted(branch)
+            }
+            None => false,
+        })
+        .map(|c| c.name.strip_prefix("refs/heads/").unwrap_or(&c.name).to_string())
+        .collect();
     if commands.is_empty() {
         return Ok(flush());
     }
@@ -401,6 +426,23 @@ pub fn receive_pack(root: &std::path::Path, body: &[u8]) -> ZResult<Vec<u8>> {
         // The client's `old` value is checked against the branch as it was before this push. Reading
         // it after the import would compare the client's expectation with the result of applying the
         // push, which always differs and rejects every push that is correct.
+        // The branches the push names and the ones that already existed are different questions. A
+        // refused push must not delete history, and the map of names in the request answers the
+        // wrong one: it lists every ref the client offered, whether the server ever had it or not.
+        let existed: Vec<String> = commands
+            .iter()
+            .map(|c| c.name.strip_prefix("refs/heads/").unwrap_or(&c.name).to_string())
+            .filter(|b| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM branches WHERE name = ?1",
+                    rusqlite::params![b],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                    > 0
+            })
+            .collect();
+
         let before: Vec<(String, Option<String>)> = commands
             .iter()
             .map(|c| {
@@ -421,6 +463,18 @@ pub fn receive_pack(root: &std::path::Path, body: &[u8]) -> ZResult<Vec<u8>> {
 
         crate::git_bridge::import(&conn, &scratch, None)?;
 
+        // A branch the import created for a refused ref did not exist before this push, so removing
+        // it puts the repository back. Checking first whether the push created it is what keeps a
+        // refused push to an existing branch from deleting that branch's history.
+        for name in &refused {
+            // Only a branch that did not exist before this push is removed. One that already existed
+            // belongs to the repository, and a refused push to it must leave it alone.
+            let existed_before = existed.iter().any(|b| b == name);
+            if !existed_before {
+                let _ = conn.execute("DELETE FROM branches WHERE name = ?1", rusqlite::params![name]);
+            }
+        }
+
         // After the import every pushed commit has a changeset, so the branch can point at it.
         let mut out = pkt_line(b"unpack ok\n");
         for c in &commands {
@@ -429,6 +483,25 @@ pub fn receive_pack(root: &std::path::Path, body: &[u8]) -> ZResult<Vec<u8>> {
                 .strip_prefix("refs/heads/")
                 .unwrap_or(&c.name)
                 .to_string();
+
+            // A token scoped to a path could still rewrite every branch. The branch is the part a
+            // mistake costs the most to undo, so it is refused by name and the other refs in the
+            // same push still apply.
+            if let Some(permitted) = allowed {
+                if !permitted(&branch) {
+                    out.extend_from_slice(
+                        pkt_line(
+                            format!(
+                                "ng {} this token may not write that branch\n",
+                                c.name
+                            )
+                            .as_bytes(),
+                        )
+                        .as_slice(),
+                    );
+                    continue;
+                }
+            }
             let changeset: Option<String> = conn
                 .query_row(
                     "SELECT id FROM changesets WHERE git_commit = ?1",

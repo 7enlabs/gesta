@@ -20,6 +20,9 @@ version is current and freezes when the number changes, so `0.6.0` is a record a
 - `diff --to <branch>` without `--from` compares against that revision's parent instead of the empty
   tree. `--from ""` still asks for the whole tree.
 - `review --json` prints one parseable document instead of text.
+- A token can be scoped to named branches with `--branches`, so a write token for one branch
+  cannot rewrite another. A refused push leaves no branch behind.
+- A token removed while the server runs stops working on the next request, without a restart.
 - `gesta backup`, `gesta verify-backup` and `gesta restore-repo` copy and restore the whole
   store: every branch, tag and blame range, taken through SQLite's backup API so a repository being
   written still produces a consistent file. Restoring verifies first and keeps the old store until

@@ -2793,6 +2793,84 @@ def main():
             except Exception:
                 server.kill()
 
+    if want("branch-scope"):
+        # A token scoped to one branch rewrote every branch before this existed, and a refused push
+        # still created the branch it refused. Both are checked here because the second one only
+        # appears once the first one works.
+        import tempfile as _tfb2
+        import socket as _sockb
+        import time as _tmpb2
+
+        d = _tfb2.mkdtemp(prefix="gate-branch-")
+        sh(f"{ZF} init", cwd=d)
+        with open(os.path.join(d, "a.txt"), "w") as fh:
+            fh.write("one\n")
+        m = re.search(r"(cs[0-9a-f]+)", sh(f'{ZF} changeset create "first" --author t --json', cwd=d)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+
+        added = sh(f"{ZF} remote token add write agent1 --branches main", cwd=d)[1]
+        toks = [l for l in added.splitlines() if len(l.strip()) == 64]
+        if not toks:
+            record("a branch-scoped token can be created", False, added[:300])
+        else:
+            token = toks[0].strip()
+            s = _sockb.socket()
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+            s.close()
+            server = subprocess.Popen(
+                f"{ZF} serve --port {port}", shell=True, cwd=d,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            try:
+                for _ in range(50):
+                    try:
+                        with _sockb.create_connection(("127.0.0.1", port), timeout=0.2):
+                            break
+                    except OSError:
+                        _tmpb2.sleep(0.1)
+
+                url = f"http://agent1:{token}@127.0.0.1:{port}/git/repo"
+                out = _tfb2.mkdtemp(prefix="gate-branch-out-")
+                clone = os.path.join(out, "cl")
+                r = subprocess.run(f"git clone -q {url} {clone}", shell=True,
+                                   capture_output=True, text=True, timeout=120)
+                record("a branch-scoped token can clone", r.returncode == 0, r.stderr[-300:])
+
+                with open(os.path.join(clone, "a.txt"), "a") as fh:
+                    fh.write("two\n")
+                ident = "-c user.name=g -c user.email=g@l"
+                subprocess.run(f"git {ident} add -A", shell=True, cwd=clone, capture_output=True)
+                subprocess.run(f"git {ident} commit -q -m second", shell=True, cwd=clone, capture_output=True)
+
+                allowed = subprocess.run(f"git push {url} main", shell=True, cwd=clone,
+                                         capture_output=True, text=True, timeout=120)
+                record("and push to the branch it names", allowed.returncode == 0,
+                       (allowed.stderr or allowed.stdout)[-300:])
+
+                denied = subprocess.run(f"git push {url} main:other", shell=True, cwd=clone,
+                                        capture_output=True, text=True, timeout=120)
+                record(
+                    "and a push to another branch is refused",
+                    "may not write that branch" in (denied.stderr + denied.stdout),
+                    (denied.stderr or denied.stdout)[-300:],
+                )
+                # A refused push must leave no branch behind. It used to create the branch and then
+                # report the refusal, so the repository gained history nobody was allowed to write.
+                branches = sh(f"{ZF} branch list", cwd=d)[1]
+                record(
+                    "and the refused branch was not created",
+                    "other" not in branches,
+                    branches.strip()[:300],
+                )
+            finally:
+                server.terminate()
+                try:
+                    server.wait(timeout=10)
+                except Exception:
+                    server.kill()
+
     if want("token-revoke"):
         # A token removed while the server runs has to stop working, and a server left with no tokens
         # has to close rather than open. Both failed before this step existed: the table was read once

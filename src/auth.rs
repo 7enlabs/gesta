@@ -22,9 +22,14 @@ pub enum Role {
 pub struct Auth {
     tokens: HashMap<String, Grant>,
     pub required: bool,
-    /// When the entry the tokens came from was last modified, so a removal can be noticed without
-    /// re-reading a file that has not changed.
-    loaded_at: Option<std::time::SystemTime>,
+    /// What the file said last time it was read, so a change can be noticed without re-reading a
+    /// file that has not changed.
+    ///
+    /// The modification time alone is not enough: it has a coarse resolution on some file systems,
+    /// so adding a token and removing it within the same tick looks like no change at all. That
+    /// window is exactly when a person removes a leaked token. The length plus the mtime is cheap
+    /// and catches the case that matters, because a removal always shortens the file.
+    loaded_at: Option<(std::time::SystemTime, u64)>,
 }
 
 /// One authenticated token: who it is, what it may do, and where.
@@ -38,6 +43,12 @@ pub struct Grant {
     /// Unix timestamp after which the token is dead. `None` means it does not
     /// expire, which is the old behaviour and still the default.
     pub expires_at: Option<i64>,
+    /// Glob patterns for the branches this token may write. Empty means every branch, which is what
+    /// an entry without the field grants, so an existing auth file keeps working unchanged.
+    ///
+    /// Path scope answers "which file", and this answers "which line of history". A token that may
+    /// write one directory still rewrote every branch before this existed.
+    pub branches: Vec<String>,
 }
 
 impl Grant {
@@ -52,6 +63,20 @@ impl Grant {
     /// An empty scope means unrestricted. A pattern without a slash matches the
     /// file name at any depth, so `*.md` covers `docs/a.md` and `a.md`, which is
     /// what a person writing the pattern usually means.
+    /// Whether this token may write `branch`. Empty means every branch.
+    ///
+    /// Checked apart from the path scope because the two questions are different: a token scoped to
+    /// `docs/**` was still allowed to rewrite `main`, `release` and every other branch, and the
+    /// branch is the part a mistake costs the most to undo.
+    pub fn permits_branch(&self, branch: &str) -> bool {
+        if self.branches.is_empty() || self.role == Role::Read {
+            return true;
+        }
+        self.branches
+            .iter()
+            .any(|pat| glob_match(pat, branch) || pat == branch)
+    }
+
     pub fn permits(&self, path: &str) -> bool {
         if self.scope.is_empty() {
             return true;
@@ -146,13 +171,14 @@ impl Auth {
             // `sha256:<digest>:<role>:<name>` has four fields, the clear form
             // has three, so the digest marker has to be handled first.
             if let Some(rest) = line.strip_prefix("sha256:") {
-                let mut parts = rest.splitn(5, ':');
+                let mut parts = rest.splitn(6, ':');
                 let (Some(digest_hex), Some(role)) = (parts.next(), parts.next()) else {
                     continue;
                 };
                 let name = parts.next().unwrap_or("unnamed");
                 let scope = parts.next().unwrap_or("");
                 let expires = parts.next().unwrap_or("");
+                let branches = parts.next().unwrap_or("");
                 let digest_hex = digest_hex.trim().to_ascii_lowercase();
                 if digest_hex.len() != 64 || !digest_hex.chars().all(|c| c.is_ascii_hexdigit()) {
                     continue; // a malformed digest must never match anything
@@ -165,12 +191,13 @@ impl Auth {
                         role,
                         scope: parse_scope(scope),
                         expires_at: parse_expiry(expires),
+                        branches: parse_scope(branches),
                     },
                 );
                 continue;
             }
 
-            let mut parts = line.splitn(5, ':');
+            let mut parts = line.splitn(6, ':');
             let token = match parts.next() {
                 Some(t) if !t.trim().is_empty() => t.trim().to_string(),
                 _ => continue,
@@ -179,6 +206,7 @@ impl Auth {
             let name = parts.next().unwrap_or("unnamed").trim().to_string();
             let scope = parts.next().unwrap_or("");
             let expires = parts.next().unwrap_or("");
+            let branches = parts.next().unwrap_or("");
             tokens.insert(
                 digest(&token),
                 Grant {
@@ -186,6 +214,7 @@ impl Auth {
                     role,
                     scope: parse_scope(scope),
                     expires_at: parse_expiry(expires),
+                    branches: parse_scope(branches),
                 },
             );
         }
@@ -208,7 +237,9 @@ impl Auth {
     /// file is small and its modification time is one `stat`, so asking on every request costs less
     /// than the mistake.
     pub fn reload_if_changed(&mut self, path: &std::path::Path) {
-        let stamp = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        let stamp = std::fs::metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok().map(|t| (t, m.len())));
         if stamp == self.loaded_at {
             return;
         }
@@ -535,6 +566,7 @@ mod tests {
             role: Role::Write,
             scope: vec!["docs/**".into(), "*.md".into(), "src/lib/one.rs".into()],
             expires_at: None,
+            branches: Vec::new(),
         };
         assert!(g.permits("docs/a/b.md"));
         assert!(g.permits("README.md"));
@@ -569,5 +601,54 @@ mod tests {
         assert!(a.required, "removing the last token must not open the server");
         assert!(a.authenticate("secret").is_none(), "the removed token is gone");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_token_can_be_limited_to_one_branch() {
+        // Before the sixth field existed, a token scoped to one directory rewrote every branch.
+        // The file format gained the field at the end, so an entry written earlier reads the same.
+        let a = Auth::from_entries(&["t:write:agent:docs/**:".to_string()]);
+        let g = a.authenticate("t").unwrap();
+        assert!(g.branches.is_empty(), "an old entry grants every branch");
+        assert!(g.permits_branch("main"));
+
+        let b = Auth::from_entries(&["t:write:agent:::main".to_string()]);
+        let g = b.authenticate("t").unwrap();
+        assert_eq!(g.branches, vec!["main".to_string()]);
+        assert!(g.permits_branch("main"));
+        assert!(!g.permits_branch("release"));
+        assert!(!g.permits_branch("other"));
+    }
+
+    #[test]
+    fn a_read_token_is_never_limited_by_branch() {
+        // Reading is covered by the path scope, and refusing a read because a branch is not listed
+        // would make a branch field on a read token silently hide history.
+        let a = Auth::from_entries(&["t:read:agent:::main".to_string()]);
+        let g = a.authenticate("t").unwrap();
+        assert!(g.permits_branch("anything"), "a read grant is not branch limited");
+    }
+
+    #[test]
+    fn the_name_of_an_entry_is_the_third_field_even_with_optional_trailing_ones() {
+        // A removal matched on the name and used `splitn(3, ':')`, which leaves the remaining fields
+        // joined, so the name of `t:read:a:::main` read as `a:::main`. The removal matched nothing
+        // and reported nothing, and the token it was meant to kill kept working.
+        let line = "t:read:a:::main";
+        let mut parts = line.splitn(3, ':');
+        let _token = parts.next();
+        let _role = parts.next();
+        let tail = parts.next().unwrap();
+        let name = tail.split(':').next().unwrap();
+        assert_eq!(name, "a", "the name is the field before the optional ones");
+
+        // The same shape as a stored digest entry.
+        let hashed = "sha256:d:read:b:::release";
+        let rest = hashed.strip_prefix("sha256:").unwrap();
+        let mut parts = rest.splitn(3, ':');
+        let _digest = parts.next();
+        let _role = parts.next();
+        let tail = parts.next().unwrap();
+        assert_eq!(tail.split(':').next().unwrap(), "b");
     }
 }

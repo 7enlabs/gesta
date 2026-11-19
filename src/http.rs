@@ -113,6 +113,11 @@ impl Response {
             self.content_type,
             self.body.len()
         );
+        // A 401 without this header tells a browser or git to give up rather than to try. Git sends
+        // no credentials on the first request by design: it waits to be asked.
+        if self.status == 401 {
+            head.push_str("WWW-Authenticate: Basic realm=\"gesta\"\r\n");
+        }
         head.push_str("Cache-Control: no-store\r\n\r\n");
         let mut out = head.into_bytes();
         out.extend_from_slice(&self.body);
@@ -465,11 +470,19 @@ fn handle_tls_connection(
 ) -> ZResult<()> {
     let resp = match read_request_generic(&mut stream) {
         Ok(req) => {
-            let mut snapshot = match auth.lock() {
-                Ok(g) => g.clone(),
-                Err(poisoned) => poisoned.into_inner().clone(),
+            // Reloaded in place, under the lock: a copy that reloads itself and is then dropped
+            // forgets what it learned, and the next request starts from the table read at startup.
+            let snapshot = match auth.lock() {
+                Ok(mut g) => {
+                    g.reload_if_changed(auth_path);
+                    g.clone()
+                }
+                Err(poisoned) => {
+                    let mut g = poisoned.into_inner();
+                    g.reload_if_changed(auth_path);
+                    g.clone()
+                }
             };
-            snapshot.reload_if_changed(auth_path);
             route(root, &req, &snapshot)
         }
         Err(e) => Response::error(400, "Bad Request", e.to_string()),
@@ -540,11 +553,17 @@ fn handle_connection(
         Ok(req) => {
             // The lock is held only to take a copy. Reloading under the lock and routing under it
             // would serialise every request behind a file read for no reason.
-            let mut snapshot = match auth.lock() {
-                Ok(g) => g.clone(),
-                Err(poisoned) => poisoned.into_inner().clone(),
+            let snapshot = match auth.lock() {
+                Ok(mut g) => {
+                    g.reload_if_changed(auth_path);
+                    g.clone()
+                }
+                Err(poisoned) => {
+                    let mut g = poisoned.into_inner();
+                    g.reload_if_changed(auth_path);
+                    g.clone()
+                }
             };
-            snapshot.reload_if_changed(auth_path);
             route(root, &req, &snapshot)
         }
         Err(e) => Response::error(400, "Bad Request", e.to_string()),
@@ -744,7 +763,15 @@ pub fn route(root: &Path, req: &Request, auth: &Auth) -> Response {
             }
         }
         ("POST", p) if p.ends_with("/git-receive-pack") => {
-            match crate::gitserver::receive_pack(root, &req.body) {
+            // The grant when the server has one. A server with no tokens has already decided the
+            // request is allowed; a server with tokens refused an unknown one above.
+            let check = grant.as_ref().map(|g| {
+                let g = g.clone();
+                move |branch: &str| g.permits_branch(branch)
+            });
+            let allowed: Option<&dyn Fn(&str) -> bool> =
+                check.as_ref().map(|f| f as &dyn Fn(&str) -> bool);
+            match crate::gitserver::receive_pack_allowing(root, &req.body, allowed) {
                 Ok(bytes) => {
                     log_access(root, &who, "git-receive-pack", p, &format!("{} bytes", bytes.len()));
                     Response::ok_with_type(bytes, "application/x-git-receive-pack-result")

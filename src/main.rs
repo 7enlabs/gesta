@@ -810,6 +810,12 @@ enum TokenCmd {
         /// Store only the digest, so a leaked auth file cannot be replayed
         #[arg(long)]
         hashed: bool,
+        /// Paths this token may write, comma separated globs. Empty means every path
+        #[arg(long)]
+        scope: Option<String>,
+        /// Branches this token may write, comma separated globs. Empty means every branch
+        #[arg(long)]
+        branches: Option<String>,
     },
     /// List configured tokens without revealing them
     List,
@@ -1070,7 +1076,13 @@ fn run() -> ZResult<()> {
             }
             RemoteCmd::List => cli_remote::cmd_remote_list(),
             RemoteCmd::Token { sub } => match sub {
-                TokenCmd::Add { role, name, hashed } => cli_remote::cmd_token_add(&role, &name, hashed),
+                TokenCmd::Add { role, name, hashed, scope, branches } => cli_remote::cmd_token_add(
+                    &role,
+                    &name,
+                    hashed,
+                    scope.as_deref(),
+                    branches.as_deref(),
+                ),
                 TokenCmd::List => cli_remote::cmd_token_list(),
                 TokenCmd::Remove { selector } => cli_remote::cmd_token_remove(&selector),
             },

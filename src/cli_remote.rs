@@ -1359,7 +1359,13 @@ fn read_auth_file(root: &Path) -> ZResult<Vec<String>> {
 
 /// Add a token to `.gesta/auth`. The token is generated, never typed by the
 /// user, and printed once.
-pub fn cmd_token_add(role: &str, name: &str, hashed: bool) -> ZResult<()> {
+pub fn cmd_token_add(
+    role: &str,
+    name: &str,
+    hashed: bool,
+    scope: Option<&str>,
+    branches: Option<&str>,
+) -> ZResult<()> {
     let (root, _conn) = open_repo()?;
     let role = match role.to_ascii_lowercase().as_str() {
         "write" => "write",
@@ -1381,10 +1387,32 @@ pub fn cmd_token_add(role: &str, name: &str, hashed: bool) -> ZResult<()> {
     // `--hashed` writes only the digest: the file then cannot be replayed as a
     // credential if it leaks, at the cost of not being able to read the token
     // back from disk.
+    // token : role : name : paths : expires : branches. The expired field is empty here because
+    // `token add` has no flag for it and an empty field means "never"; writing five fields put the
+    // branch pattern where the expiry is parsed from, so the pattern was read as an expiry and the
+    // branch scope was read as absent.
+    let path_scope = scope.map(|s| s.trim().to_string()).unwrap_or_default();
+    let branch_scope = branches.map(|s| s.trim().to_string()).unwrap_or_default();
     let entry = if hashed {
-        format!("sha256:{}:{}:{}", auth::digest(&token), role, name.trim())
+        format!(
+            "sha256:{}:{}:{}:{}:{}:{}",
+            auth::digest(&token),
+            role,
+            name.trim(),
+            path_scope,
+            "",
+            branch_scope
+        )
     } else {
-        format!("{}:{}:{}", token, role, name.trim())
+        format!(
+            "{}:{}:{}:{}:{}:{}",
+            token,
+            role,
+            name.trim(),
+            path_scope,
+            "",
+            branch_scope
+        )
     };
     existing.push(entry);
     fs::write(&path, existing.join("\n") + "\n")?;
@@ -1417,18 +1445,27 @@ pub fn cmd_token_remove(selector: &str) -> ZResult<()> {
             kept.push(line);
             continue;
         }
-        // Both forms end with `<role>:<name>`, so the name is the last field
-        // either way; only the identifier before it differs.
+        // The name is the third field, and it is followed by optional scope, expiry and branch
+        // fields. Writing `splitn(3, ':')` and taking the last part returned `name:::main` as the
+        // name, so the entry never matched the name typed and the removal silently kept the token.
         let (name, id) = if let Some(rest) = l.strip_prefix("sha256:") {
             let mut parts = rest.splitn(3, ':');
             let digest = parts.next().unwrap_or("").to_string();
             let _role = parts.next();
-            (parts.next().unwrap_or("").to_string(), digest)
+            let tail = parts.next().unwrap_or("");
+            (
+                tail.split(':').next().unwrap_or("").trim().to_string(),
+                digest,
+            )
         } else {
             let mut parts = l.splitn(3, ':');
             let token = parts.next().unwrap_or("").to_string();
             let _role = parts.next();
-            (parts.next().unwrap_or("").to_string(), token)
+            let tail = parts.next().unwrap_or("");
+            (
+                tail.split(':').next().unwrap_or("").trim().to_string(),
+                token,
+            )
         };
         let tail: String = id.chars().rev().take(4).collect::<String>().chars().rev().collect();
         if name == selector || tail == selector {
