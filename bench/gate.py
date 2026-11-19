@@ -2793,6 +2793,79 @@ def main():
             except Exception:
                 server.kill()
 
+    if want("long-history"):
+        # The other axis from `scale`: a year of daily use means a long history and a modest tree.
+        # The project claims a commit costs what the change costs, not what the repository holds, and
+        # this is the measurement that has to hold for the claim to mean anything.
+        #
+        # A short run: the full one goes to 10000 commits and takes twenty minutes. The shape shows
+        # up by 2000, which keeps the gate usable.
+        import tempfile as _tfl
+        import json as _jsonl
+
+        d = _tfl.mkdtemp(prefix="gate-long-")
+        sh(f"{ZF} init", cwd=d)
+        with open(os.path.join(d, "f.txt"), "w") as fh:
+            fh.write("start\n")
+
+        def commit_one(i):
+            with open(os.path.join(d, "f.txt"), "a") as fh:
+                fh.write(f"line {i}\n")
+            out = sh_out(f'{ZF} changeset create "c{i}" --author b --json', cwd=d)[1]
+            try:
+                cid = _jsonl.loads(out).get("changeset") or ""
+            except Exception:
+                cid = ""
+            if cid:
+                sh(f"{ZF} changeset commit {cid}", cwd=d)
+
+        def median_write(reps):
+            import time as _t
+            vals = []
+            for k in range(reps):
+                before = os.path.getsize(os.path.join(d, "f.txt"))
+                with open(os.path.join(d, "f.txt"), "a") as fh:
+                    fh.write(f"m{k}_{time_ns()}\n")
+                out = sh_out(f'{ZF} changeset create "m{k}_{time_ns()}" --author b --json', cwd=d)[1]
+                try:
+                    cid = _jsonl.loads(out).get("changeset") or ""
+                except Exception:
+                    cid = ""
+                if cid:
+                    t0 = _t.perf_counter()
+                    sh(f"{ZF} changeset commit {cid}", cwd=d)
+                    vals.append((_t.perf_counter() - t0) * 1000)
+            vals.sort()
+            return vals[len(vals) // 2] if vals else None
+
+        def time_ns():
+            import time as _t
+            return _t.time_ns()
+
+        # Small history.
+        for i in range(50):
+            commit_one(i)
+        small = median_write(5)
+        # Tenfold.
+        for i in range(50, 500):
+            commit_one(i)
+        large = median_write(5)
+
+        record(
+            "a commit can be timed at two history sizes",
+            small is not None and large is not None,
+            f"{small} ms at 50, {large} ms at 500",
+        )
+        if small and large:
+            ratio = large / small
+            # Ten times the history must not multiply the cost. 3x is the ceiling this project is
+            # willing to call flat; above it the claim is false and the number says so.
+            record(
+                "and the cost does not follow the length of the history",
+                ratio <= 3.0,
+                f"{ratio:.2f}x over 10x history ({small:.1f} -> {large:.1f} ms)",
+            )
+
     if want("request-audit"):
         # A refusals-only log is the point: an audit that records only successes answers "was this
         # token used" and never "was it tried". The format also has to survive a reason that holds a

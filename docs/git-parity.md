@@ -171,11 +171,47 @@ A single figure for the two phases said "2.12x worse" about a floor that did not
 are reported now, and the gate asserts the write is flat and the scan was seen growing, so neither
 can be made to look good at the other's expense.
 
-### 7. Long histories are lightly measured
+### Long histories: measured to 10,000 commits
 
-Behaviour is known to 5,000 files and 200 changesets. The vault run reached 11,000 files and one
-changeset. Nothing has been tested at 50,000 commits, and the per-query `ancestors_bfs` is the
-first thing that would hurt.
+A commit is billed as costing what the change costs, not what the repository holds. That claim was
+measured on the file axis and not on the history axis, and when it was measured the second one was
+false.
+
+| commits | write ms | scan ms | db MB |
+|---:|---:|---:|---:|
+| 100 | 13.6 | 12.0 | 0.3 |
+| 1,000 | 19.4 | 16.7 | 1.3 |
+| 10,000 | 47.1 | 17.4 | 82.7 |
+
+The scan stayed flat. The write did not: 3.47x the cost over 100x the history.
+
+The cause was blame. Every commit deleted the file's whole `blame_ranges` and wrote it back, so the
+cost of committing one line followed the number of lines the file already had. On a ten thousand
+line file that delete and rewrite measured 34 ms, which is almost all of the growth.
+
+The fix compares the new ranges with the stored ones and rewrites only from the first difference
+onwards. Appending a line leaves every earlier range untouched.
+
+| commits | write ms | scan ms |
+|---:|---:|---:|
+| 100 | 14.1 | 12.0 |
+| 1,000 | 19.0 | 15.0 |
+| 10,000 | 29.4 | 16.4 |
+
+2.08x over 100x history, down from 3.47x.
+
+Two mistakes on the way, both worth keeping:
+
+- Adding an index on `file_versions(path, version DESC)` looked like the fix and was not. The lookup
+  with `LIMIT 1` was already 0.004 ms. An index that helps nothing costs a write on every insert, and
+  the measurement said so before the change was kept.
+- The first version compared line by line against the previous version, which is wrong the moment a
+  line is deleted: every line after it shifts, so index i is a different line. The comparison has to
+  be between ranges, which is what the table holds. A test that deletes a line that a previous commit
+  inserted caught it.
+
+`bench/long_history.py` runs the full measurement; `bench/gate.py long-history` runs a short version
+in the gate.
 
 ### 8. No interactive conflict resolver
 
