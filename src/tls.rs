@@ -526,6 +526,10 @@ mod tests {
             let mode = std::fs::metadata(&key).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "the private key must not be readable by others");
         }
+        // On Windows the mode bits do not exist, so the name is unused there and clippy refuses it
+        // under -D warnings. Naming the reason is better than an allow attribute that hides it.
+        #[cfg(not(unix))]
+        let _ = &key;
         let _ = std::fs::remove_dir_all(&d);
     }
 
