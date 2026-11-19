@@ -1443,7 +1443,10 @@ pub fn cmd_token_remove(selector: &str) -> ZResult<()> {
     }
     fs::write(&path, kept.join("\n") + if kept.is_empty() { "" } else { "\n" })?;
     println!("removed {} token(s) matching {:?}", removed, selector);
-    println!("Restart `gesta serve` for the change to take effect.");
+    // The running server notices the file changed and rebuilds its table, so a restart is a choice
+    // rather than a requirement. Saying "restart" when it is not needed teaches people to trust the
+    // wrong sentence.
+    println!("A running `gesta serve` picks this up on the next request; no restart needed.");
     Ok(())
 }
 

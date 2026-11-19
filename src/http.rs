@@ -432,8 +432,9 @@ pub fn serve_tls(
     }
     println!("press Ctrl-C to stop");
 
+    let auth_path = Arc::new(crate::repo_dir(&root).join("auth"));
     let root = Arc::new(root);
-    let auth = Arc::new(auth);
+    let auth = Arc::new(std::sync::Mutex::new(auth));
     for incoming in listener.incoming() {
         let stream = match incoming {
             Ok(s) => s,
@@ -441,11 +442,12 @@ pub fn serve_tls(
         };
         let root = Arc::clone(&root);
         let auth = Arc::clone(&auth);
+        let auth_path = Arc::clone(&auth_path);
         let cfg = Arc::clone(&cfg);
         std::thread::spawn(move || {
             match crate::tls::accept(stream, cfg) {
                 Ok(tls) => {
-                    let _ = handle_tls_connection(tls, &root, &auth);
+                    let _ = handle_tls_connection(tls, &root, &auth, &auth_path);
                 }
                 Err(e) => eprintln!("tls handshake failed: {}", e),
             }
@@ -455,9 +457,21 @@ pub fn serve_tls(
 }
 
 #[cfg(feature = "tls")]
-fn handle_tls_connection(mut stream: crate::tls::TlsStream, root: &Path, auth: &Auth) -> ZResult<()> {
+fn handle_tls_connection(
+    mut stream: crate::tls::TlsStream,
+    root: &Path,
+    auth: &std::sync::Mutex<Auth>,
+    auth_path: &Path,
+) -> ZResult<()> {
     let resp = match read_request_generic(&mut stream) {
-        Ok(req) => route(root, &req, auth),
+        Ok(req) => {
+            let mut snapshot = match auth.lock() {
+                Ok(g) => g.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            };
+            snapshot.reload_if_changed(auth_path);
+            route(root, &req, &snapshot)
+        }
         Err(e) => Response::error(400, "Bad Request", e.to_string()),
     };
     stream.write_all(&resp.to_bytes())?;
@@ -469,6 +483,10 @@ fn handle_tls_connection(mut stream: crate::tls::TlsStream, root: &Path, auth: &
 }
 
 pub fn serve(root: PathBuf, bind: String, port: u16, auth: Auth) -> ZResult<()> {
+    // The auth file, so a token removed while the server runs stops working without a restart.
+    // Built here rather than taken as an argument: the caller already read this file to build the
+    // Auth, and passing the path as well would let the two disagree.
+    let auth_path = crate::repo_dir(&root).join("auth");
     // The policy is decided before the socket exists. Binding first printed "listening on
     // http://0.0.0.0:8899" and then refused, so the one line a person reads said the server was up
     // when it was about to exit, and the port was open for the length of that message.
@@ -493,8 +511,9 @@ pub fn serve(root: PathBuf, bind: String, port: u16, auth: Auth) -> ZResult<()> 
 
     // The repository is opened per request: SQLite in WAL mode handles
     // concurrent readers, and a long-lived Connection would need a mutex.
+    let auth_path = Arc::new(auth_path);
     let root = Arc::new(root);
-    let auth = Arc::new(auth);
+    let auth = Arc::new(std::sync::Mutex::new(auth));
     for incoming in listener.incoming() {
         let stream = match incoming {
             Ok(s) => s,
@@ -502,17 +521,32 @@ pub fn serve(root: PathBuf, bind: String, port: u16, auth: Auth) -> ZResult<()> 
         };
         let root = Arc::clone(&root);
         let auth = Arc::clone(&auth);
+        let auth_path = Arc::clone(&auth_path);
         std::thread::spawn(move || {
-            let _ = handle_connection(stream, &root, &auth);
+            let _ = handle_connection(stream, &root, &auth, &auth_path);
         });
     }
     Ok(())
 }
 
-fn handle_connection(mut stream: TcpStream, root: &Path, auth: &Auth) -> ZResult<()> {
+fn handle_connection(
+    mut stream: TcpStream,
+    root: &Path,
+    auth: &std::sync::Mutex<Auth>,
+    auth_path: &Path,
+) -> ZResult<()> {
     stream.set_read_timeout(Some(Duration::from_secs(60)))?;
     let resp = match read_request(&mut stream) {
-        Ok(req) => route(root, &req, auth),
+        Ok(req) => {
+            // The lock is held only to take a copy. Reloading under the lock and routing under it
+            // would serialise every request behind a file read for no reason.
+            let mut snapshot = match auth.lock() {
+                Ok(g) => g.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            };
+            snapshot.reload_if_changed(auth_path);
+            route(root, &req, &snapshot)
+        }
         Err(e) => Response::error(400, "Bad Request", e.to_string()),
     };
     stream.write_all(&resp.to_bytes())?;

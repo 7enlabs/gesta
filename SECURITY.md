@@ -61,10 +61,13 @@ secret store is sealed with a passphrase; the repository content is not encrypte
 
 ## Handling a leaked token
 
-`gesta remote token remove <selector>` takes an entry out of `.gesta/auth`, and the command prints
-`Restart 'gesta serve' for the change to take effect.` Do that: remove, then restart the server. Until
-the restart the old token is still accepted, because the server read the file when it started and
-does not watch it.
+`gesta remote token remove <selector>` takes an entry out of `.gesta/auth`. A running server notices
+the file changed on its next request and rebuilds its table, so the token stops working without a
+restart.
+
+Removing the last token closes the server rather than opening it. That distinction matters: a server
+that answered requests with authentication and then answers them without would turn an incident into
+a wider one. The auth requirement is decided at startup and does not come back.
 
 Rotate anything the token could reach. The access log shows what a token asked for and cannot show
 whether the person holding it was the one you gave it to, so a token that was used before removal and

@@ -2793,6 +2793,78 @@ def main():
             except Exception:
                 server.kill()
 
+    if want("token-revoke"):
+        # A token removed while the server runs has to stop working, and a server left with no tokens
+        # has to close rather than open. Both failed before this step existed: the table was read once
+        # at startup, and rebuilding from an empty file cleared the "auth required" flag, so removing
+        # the last token turned an authenticated server into an open one.
+        import tempfile as _tft
+        import socket as _sockt
+        import time as _tmpt
+
+        d = _tft.mkdtemp(prefix="gate-revoke-")
+        sh(f"{ZF} init", cwd=d)
+        with open(os.path.join(d, "f.txt"), "w") as fh:
+            fh.write("x\n")
+        m = re.search(r"(cs[0-9a-f]+)", sh(f'{ZF} changeset create "seed" --author t --json', cwd=d)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+
+        added = sh(f"{ZF} remote token add read agent1", cwd=d)[1]
+        lines = [l for l in added.splitlines() if len(l.strip()) == 64]
+        if not lines:
+            record("a token can be created", False, added[:300])
+        else:
+            token = lines[0].strip()
+            s = _sockt.socket()
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+            s.close()
+            server = subprocess.Popen(
+                f"{ZF} serve --port {port}", shell=True, cwd=d,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            try:
+                for _ in range(50):
+                    try:
+                        with _sockt.create_connection(("127.0.0.1", port), timeout=0.2):
+                            break
+                    except OSError:
+                        _tmpt.sleep(0.1)
+
+                def status(tok=None):
+                    cmd = f'curl -s -o /dev/null -w "%{{http_code}}" '                           f'http://127.0.0.1:{port}/v1/file?path=f.txt'
+                    if tok:
+                        cmd = f'curl -s -o /dev/null -w "%{{http_code}}" '                               f'-H "Authorization: Bearer {tok}" '                               f'http://127.0.0.1:{port}/v1/file?path=f.txt'
+                    return subprocess.run(cmd, shell=True, capture_output=True, text=True).stdout.strip()
+
+                record("a read without a token is refused", status() == "401", status())
+                record("and the token is accepted", status(token) == "200", status(token))
+
+                sh(f"{ZF} remote token remove agent1", cwd=d)
+                _tmpt.sleep(0.6)
+
+                # The same server, the same token, no restart.
+                after = status(token)
+                record(
+                    "a removed token stops working on the running server",
+                    after == "401",
+                    f"status {after} (401 means the removal took effect)",
+                )
+                # And a server with no tokens must close, not open.
+                anon = status()
+                record(
+                    "and the server does not fall open when the last token is removed",
+                    anon == "401",
+                    f"status {anon} (200 here would be an open server)",
+                )
+            finally:
+                server.terminate()
+                try:
+                    server.wait(timeout=10)
+                except Exception:
+                    server.kill()
+
     if want("backup"):
         # A backup that loses what a bundle does not carry is the failure this step exists for: a
         # bundle holds one branch and the objects it reaches, and a person asking for a backup means

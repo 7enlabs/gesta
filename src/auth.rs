@@ -18,9 +18,13 @@ pub enum Role {
 
 /// Token store. Tokens are kept as SHA-256 digests, never in clear text, so a
 /// leaked config file does not leak working credentials.
+#[derive(Debug, Clone)]
 pub struct Auth {
     tokens: HashMap<String, Grant>,
     pub required: bool,
+    /// When the entry the tokens came from was last modified, so a removal can be noticed without
+    /// re-reading a file that has not changed.
+    loaded_at: Option<std::time::SystemTime>,
 }
 
 /// One authenticated token: who it is, what it may do, and where.
@@ -185,11 +189,44 @@ impl Auth {
                 },
             );
         }
-        Auth { required: !tokens.is_empty(), tokens }
+        Auth {
+            required: !tokens.is_empty(),
+            tokens,
+            loaded_at: None,
+        }
     }
 
     pub fn token_count(&self) -> usize {
         self.tokens.len()
+    }
+
+    /// Rebuild from the auth file if it changed since the last time this was asked.
+    ///
+    /// A token is removed by editing a file, and a running server had already read it, so the old
+    /// token kept working until a restart. That is the gap between "the token is gone" and "the
+    /// token stopped working", and closing it is the whole point of removing a leaked token. The
+    /// file is small and its modification time is one `stat`, so asking on every request costs less
+    /// than the mistake.
+    pub fn reload_if_changed(&mut self, path: &std::path::Path) {
+        let stamp = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        if stamp == self.loaded_at {
+            return;
+        }
+        let entries = match std::fs::read_to_string(path) {
+            Ok(text) => text.lines().map(|l| l.to_string()).collect::<Vec<_>>(),
+            // A file that vanished is a file with no tokens. Refusing every request because the
+            // file is missing would turn a removal into an outage, and accepting them would turn it
+            // into an open server.
+            Err(_) => Vec::new(),
+        };
+        // Required-ness is decided when the server starts and does not come back. Rebuilding from an
+        // emptied file would clear this flag, and a server that was authenticating every request
+        // would answer the next one without asking. Removing the last token has to mean "nobody gets
+        // in", which is the opposite of "everybody gets in".
+        let was_required = self.required;
+        *self = Auth::from_entries(&entries);
+        self.required = was_required;
+        self.loaded_at = stamp;
     }
 
     /// Resolve a presented token to a role, or `None` when it is unknown.
@@ -505,5 +542,32 @@ mod tests {
         assert!(g.permits("src/lib/one.rs"));
         assert!(!g.permits("src/lib/two.rs"));
         assert!(!g.permits("src/main.rs"));
+    }
+
+    #[test]
+    fn removing_the_last_token_closes_the_server_rather_than_opening_it() {
+        // Rebuilding from an emptied file cleared `required`, so a server that had been checking
+        // every request stopped checking them. Removing a leaked token then made the server open to
+        // everyone, which is the opposite of what the person removing it intended.
+        let dir = std::env::temp_dir().join(format!("gesta-auth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("auth");
+        std::fs::write(&file, "secret:read:alice\n").unwrap();
+
+        let mut a = Auth::from_entries(&["secret:read:alice".to_string()]);
+        a.required = true;
+        a.reload_if_changed(&file);
+        assert!(a.required, "still required while a token is present");
+        assert!(a.authenticate("secret").is_some());
+
+        std::fs::write(&file, "").unwrap();
+        // A modification time has a coarse resolution on some file systems, so the content change is
+        // what the reload looks for; force it visible by touching the file again.
+        a.loaded_at = None;
+        a.reload_if_changed(&file);
+        assert!(a.required, "removing the last token must not open the server");
+        assert!(a.authenticate("secret").is_none(), "the removed token is gone");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
