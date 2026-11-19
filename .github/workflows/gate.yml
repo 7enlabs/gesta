@@ -1,0 +1,91 @@
+name: gate
+
+# The gate is the thing a change is checked against, so it runs where a change lands. Running it
+# only on the machine that wrote the code made "the gate passes" a statement about that machine.
+#
+# Two jobs, because they answer different questions. `gate` asks whether this tree is releasable and
+# runs on Linux, where the harness was developed. `build-windows` asks whether the code compiles
+# where the user runs it, which is the question no local run could answer while the machine had no
+# linker.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # An incremental cache on a release build with a coverage run is slower than no cache at all for
+  # a project this size, and a stale one hides a real rebuild.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  gate:
+    name: gate (linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,llvm-tools-preview
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: Install the tools the gate looks for
+        run: |
+          # cargo-audit and cargo-llvm-cov are steps in the gate. A missing tool has to be installed
+          # rather than left to report "did not run", which the gate counts as an incomplete run.
+          cargo install cargo-audit --locked
+          cargo install cargo-llvm-cov --locked
+          # The SQLite build needs these headers on a bare runner.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq pkg-config libssl-dev zlib1g-dev
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Gate
+        id: gate
+        # The bughunter scenarios live outside this repository, so that step reports "did not run"
+        # and the gate exits 3: the checks that ran passed, and the run is incomplete. That is not a
+        # failure of this tree and not a pass either, so the step records the code and the next step
+        # decides. A real failure is 1, and an unknown step name is 2; both fail here.
+        run: |
+          set +e
+          python3 bench/gate.py
+          code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "gate exited $code (0 pass, 1 fail, 2 unknown step, 3 incomplete)"
+          if [ "$code" = "1" ] || [ "$code" = "2" ]; then exit "$code"; fi
+        shell: bash
+
+      - name: Say what an incomplete run means
+        if: steps.gate.outputs.code == '3'
+        run: |
+          echo "::warning::the gate ran and passed every check it could, but at least one check did not run here. Not counted as a pass."
+
+  build-windows:
+    name: build (windows)
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          rustc --version
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Lint
+        run: cargo clippy --release --all-targets -- -D warnings

@@ -14,7 +14,10 @@ import re
 import subprocess
 import sys
 
-ZF_DIR = "/work/gesta"
+# Taken from where this file sits, not from a fixed mount path. The harness ran in one container for
+# so long that the path became a constant, and a gate that only runs in one place cannot be the thing
+# a change is checked against.
+ZF_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ZF = os.path.join(ZF_DIR, "target/release/gesta")
 BUGHUNTER = os.environ.get("BUGHUNTER_DIR", "/work/hermes-health/sec/bughunter")
 results = []
@@ -2625,6 +2628,125 @@ def main():
             nb.returncode == 0,
             (nb.stderr or nb.stdout)[-400:],
         )
+
+    if want("git-push"):
+        # A push is a real git client sending a thin pack to our server. Only a real client can
+        # produce one, and a thin pack is the part that goes wrong: it leaves out the objects the
+        # server is expected to hold, so unpacking into an empty repository fails.
+        import tempfile as _tfp
+        import socket as _sockp
+        import time as _tmp
+
+        d = _tfp.mkdtemp(prefix="gate-push-")
+        sh(f"{ZF} init", cwd=d)
+        with open(os.path.join(d, "a.txt"), "w") as fh:
+            fh.write("one\n")
+        m = re.search(r"(cs[0-9a-f]+)", sh(f'{ZF} changeset create "first" --author t --json', cwd=d)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+
+        s = _sockp.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+
+        server = subprocess.Popen(
+            f"{ZF} serve --port {port}", shell=True, cwd=d,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            for _ in range(50):
+                try:
+                    with _sockp.create_connection(("127.0.0.1", port), timeout=0.2):
+                        break
+                except OSError:
+                    _tmp.sleep(0.1)
+
+            out = _tfp.mkdtemp(prefix="gate-push-out-")
+            clone = os.path.join(out, "repo")
+            url = f"http://127.0.0.1:{port}/git/repo"
+            subprocess.run(f"git clone -q {url} {clone}", shell=True, capture_output=True, text=True, timeout=120)
+
+            with open(os.path.join(clone, "a.txt"), "w") as fh:
+                fh.write("one\ntwo\n")
+            with open(os.path.join(clone, "b.txt"), "w") as fh:
+                fh.write("bfile\n")
+            ident = "-c user.name=gate -c user.email=gate@local"
+            subprocess.run(f"git {ident} add -A", shell=True, cwd=clone, capture_output=True)
+            subprocess.run(f"git {ident} commit -q -m 'second'", shell=True, cwd=clone, capture_output=True)
+            r = subprocess.run(f"git push origin main", shell=True, cwd=clone,
+                               capture_output=True, text=True, timeout=120)
+            record(
+                "a plain git client can push to the server",
+                r.returncode == 0,
+                (r.stderr or r.stdout)[-400:],
+            )
+
+            # What the server holds afterwards. A push that reports success and moves no branch is
+            # the failure this checks: the pack unpacks and the ref update is the other half.
+            log = sh(f"{ZF} log --oneline", cwd=d)[1]
+            record(
+                "and the pushed commit is in the server's history",
+                "second" in log and len(log.strip().splitlines()) >= 2,
+                log.strip()[:200],
+            )
+            shown = sh(f"{ZF} show main:a.txt", cwd=d)[1]
+            record(
+                "and the file content arrived",
+                shown.strip() == "one\ntwo",
+                f"a.txt: {shown!r}",
+            )
+            newfile = sh(f"{ZF} show main:b.txt", cwd=d)[1]
+            record(
+                "and a file created on the client arrived",
+                newfile.strip() == "bfile",
+                f"b.txt: {newfile!r}",
+            )
+
+            # A second push, because the first one is the easy case: the second has a base commit
+            # the server already holds and a thin pack that names it.
+            with open(os.path.join(clone, "a.txt"), "w") as fh:
+                fh.write("one\ntwo\nthree\n")
+            subprocess.run(f"git {ident} add -A", shell=True, cwd=clone, capture_output=True)
+            subprocess.run(f"git {ident} commit -q -m 'third'", shell=True, cwd=clone, capture_output=True)
+            r2 = subprocess.run(f"git push origin main", shell=True, cwd=clone,
+                                capture_output=True, text=True, timeout=120)
+            record(
+                "and a second push lands on top of the first",
+                r2.returncode == 0,
+                (r2.stderr or r2.stdout)[-400:],
+            )
+            shown2 = sh(f"{ZF} show main:a.txt", cwd=d)[1]
+            record(
+                "and the second push changed the content",
+                shown2.strip() == "one\ntwo\nthree",
+                f"a.txt: {shown2!r}",
+            )
+            fsck = sh(f"{ZF} fsck", cwd=d)[1]
+            record(
+                "and the store is still consistent",
+                "consistent" in fsck,
+                fsck.strip()[:300],
+            )
+
+            # A push whose base is stale must be refused. Silence here means a push can discard
+            # whatever arrived on the server in between, which is the one thing a version control
+            # server must never do.
+            stale = subprocess.run(
+                f"git push origin main", shell=True, cwd=clone,
+                capture_output=True, text=True, timeout=60,
+            )
+            record(
+                "and a push with nothing new is a no-op rather than a rewrite",
+                "Everything up-to-date" in (stale.stdout + stale.stderr),
+                (stale.stdout + stale.stderr).strip()[:200],
+            )
+        finally:
+            server.terminate()
+            try:
+                server.wait(timeout=10)
+            except Exception:
+                server.kill()
 
     if want("git-clone"):
         # A server that a real git client can clone is the claim, and only a real git client can

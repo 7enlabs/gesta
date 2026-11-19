@@ -7,11 +7,20 @@
 //! - `pack`, the object transfer. Written here rather than delegated, because the whole point of a
 //!   server is that a client with no gesta binary can read from it.
 //!
+//! `receive-pack` is here too, so a plain `git push` works. It hands the pack to git to unpack and
+//! then imports the result through the same path `git import` uses; a second pack reader for objects
+//! that arrive over the wire would be a second implementation to keep in step.
+//!
+//! A push sends a thin pack: the objects the server is known to hold are left out and named as
+//! bases. Unpacking into an empty repository therefore fails on an object the client never sent, so
+//! the server's own history is exported into the scratch repository first. That one detail is the
+//! difference between a push that works and a push that reports a missing object.
+//!
 //! What is deliberately absent: the v2 protocol's capabilities beyond `ofs-delta`, multi-pack
-//! indexes, protocol v1's `multi_ack_detailed` state machine, and push. Each is a negotiation that
-//! only a second round trip needs, and a clone is one round trip. A repository that advertises
-//! capability it does not implement is worse than one that advertises less: the client takes the
-//! offer and then hangs.
+//! indexes, protocol v1's `multi_ack_detailed` state machine, ref deletion, and delta in the packs
+//! this server writes. Each is a negotiation that only a second round trip needs. A repository that
+//! advertises capability it does not implement is worse than one that advertises less: the client
+//! takes the offer and then hangs.
 //!
 //! The pack writes every object in full, with no delta. Measured on this project's history that is
 //! about 3x the size of a delta pack, and it is the right first version: a delta encoder that is
@@ -19,6 +28,11 @@
 //! like a protocol bug rather than an encoder bug.
 
 use crate::ZResult;
+
+/// A request that this server cannot serve, with the part of it that made no sense.
+fn bad(msg: String) -> Box<crate::error::Error> {
+    Box::new(crate::error::Error::new(crate::error::Code::Usage, msg))
+}
 
 /// One git object, as the pack writer needs it.
 pub struct Entry {
@@ -234,6 +248,277 @@ pub fn upload_pack(root: &std::path::Path, body: &[u8]) -> ZResult<Vec<u8>> {
     // received is never acknowledged and the clone reports that the remote has no commits.
     out.extend_from_slice(&pkt_line(&[1u8]));
     out.extend_from_slice(&flush());
+    Ok(out)
+}
+
+/// What a push says it wants to do, one line per ref.
+pub struct PushCommand {
+    pub old: String,
+    pub new: String,
+    pub name: String,
+}
+
+/// Split a receive-pack body into the commands and the pack that follows them.
+///
+/// The body is pkt-lines up to a flush, then raw pack bytes. The pack has no length prefix and no
+/// framing of its own, so everything after the flush belongs to it whether or not it starts with
+/// `PACK`, and a body that ends at the flush carried no objects.
+pub fn split_push(body: &[u8]) -> ZResult<(Vec<PushCommand>, Vec<u8>)> {
+    let mut commands = Vec::new();
+    let mut i = 0usize;
+    loop {
+        if i + 4 > body.len() {
+            return Err(bad("a push ended before its flush".to_string()));
+        }
+        let len = std::str::from_utf8(&body[i..i + 4])
+            .ok()
+            .and_then(|h| usize::from_str_radix(h, 16).ok())
+            .ok_or_else(|| bad("a push carried a length that is not hexadecimal".to_string()))?;
+        if len == 0 {
+            i += 4;
+            break;
+        }
+        if i + len > body.len() {
+            return Err(bad("a push carried a line longer than its body".to_string()));
+        }
+        let line = String::from_utf8_lossy(&body[i + 4..i + len]).to_string();
+        i += len;
+        // The first line carries the capabilities after a NUL, and they belong to the exchange
+        // rather than to the ref.
+        let line = line.split('\0').next().unwrap_or("").trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split(' ');
+        let old = parts.next().unwrap_or("").to_string();
+        let new = parts.next().unwrap_or("").to_string();
+        let name = parts.next().unwrap_or("").to_string();
+        if old.len() != 40 || new.len() != 40 || name.is_empty() {
+            return Err(bad(format!("a push named a ref in a shape that is not one: {}", line)));
+        }
+        commands.push(PushCommand { old, new, name });
+    }
+    Ok((commands, body[i..].to_vec()))
+}
+
+/// Answer `git-receive-pack`: take the objects, make them changesets, move the refs.
+///
+/// The pack is unpacked by git into a scratch bare repository and then read through the same import
+/// path a `git import` uses. Writing a second reader for a pack that arrives over the wire would be
+/// a second implementation to keep in step with the first, and the first difference between them
+/// shows up as a push that reports success and a branch that did not move.
+pub fn receive_pack(root: &std::path::Path, body: &[u8]) -> ZResult<Vec<u8>> {
+    let (commands, pack) = split_push(body)?;
+    if commands.is_empty() {
+        return Ok(flush());
+    }
+    if pack.is_empty() {
+        // A push with no objects is a ref deletion or a move to a commit already held. Nothing to
+        // unpack, and git's own reader would reject an empty file.
+        let mut out = pkt_line(b"unpack ok\n");
+        for c in &commands {
+            out.extend_from_slice(&pkt_line(format!("ok {}\n", c.name).as_bytes()));
+        }
+        out.extend_from_slice(&flush());
+        return Ok(out);
+    }
+
+    let scratch = std::env::temp_dir().join(format!(
+        "gesta-push-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let result = (|| -> ZResult<Vec<u8>> {
+        std::fs::create_dir_all(&scratch)?;
+        let init = std::process::Command::new("git")
+            .arg("init")
+            .arg("--bare")
+            .arg("-q")
+            .arg(&scratch)
+            .output()
+            .map_err(|e| bad(format!("a push needs git to unpack it: {}", e)))?;
+        if !init.status.success() {
+            return Err(bad(format!(
+                "git could not prepare a scratch repository: {}",
+                String::from_utf8_lossy(&init.stderr).trim()
+            )));
+        }
+
+        // `index-pack` reads a pack from a file and writes the objects beside it. `--stdin` would
+        // read from the process, and the pack is already in memory.
+        let pack_file = scratch.join("objects").join("pack").join("incoming.pack");
+        let pack_dir = scratch.join("objects").join("pack");
+        std::fs::create_dir_all(&pack_dir)?;
+        std::fs::write(&pack_file, &pack)?;
+        // `index-pack` would leave the objects inside a pack, and the import reads loose objects. So
+        // the pack is unpacked loose here. One extra write of the same bytes, and the alternative is
+        // teaching the importer to walk a pack it did not write.
+        let idx = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&scratch)
+            .arg("unpack-objects")
+            .arg("-q")
+            .stdin(std::process::Stdio::from(
+                std::fs::File::open(&pack_file)
+                    .map_err(|e| bad(format!("the pack a push sent could not be read: {}", e)))?,
+            ))
+            .output()
+            .map_err(|e| bad(format!("a push needs git to unpack it: {}", e)))?;
+        if !idx.status.success() {
+            return Err(bad(format!(
+                "the pack a push sent could not be read: {}",
+                String::from_utf8_lossy(&idx.stderr).trim()
+            )));
+        }
+        // The pack itself is not a loose object and the importer does not look at it.
+        let _ = std::fs::remove_file(&pack_file);
+
+        // A push sends a thin pack: the objects the server is already known to hold are left out,
+        // and the pack names them as bases. Unpacking into an empty repository therefore fails with
+        // a missing object that the client never sent. The existing history is exported into the
+        // scratch first, so the bases are there when the new objects arrive.
+        let conn = crate::store::open_db(root)?;
+        if let Err(e) = crate::git_bridge::export(&conn, &scratch, None) {
+            return Err(bad(format!(
+                "the server's own history could not be staged for a push: {}",
+                e
+            )));
+        }
+
+        // The refs have to be in the scratch repository before the import walks them, because the
+        // import starts from branch heads rather than from a list of objects.
+        for c in &commands {
+            let branch_dir = scratch.join("refs").join("heads");
+            std::fs::create_dir_all(&branch_dir)?;
+            let ref_file =
+                branch_dir.join(c.name.strip_prefix("refs/heads/").unwrap_or(&c.name));
+            std::fs::write(&ref_file, format!("{}\n", c.new))?;
+        }
+
+        // The client's `old` value is checked against the branch as it was before this push. Reading
+        // it after the import would compare the client's expectation with the result of applying the
+        // push, which always differs and rejects every push that is correct.
+        let before: Vec<(String, Option<String>)> = commands
+            .iter()
+            .map(|c| {
+                let branch = c.name.strip_prefix("refs/heads/").unwrap_or(&c.name).to_string();
+                let head = crate::store::branch_head(&conn, &branch).ok().flatten();
+                let sha = head.and_then(|id| {
+                    conn.query_row(
+                        "SELECT git_commit FROM changesets WHERE id = ?1",
+                        rusqlite::params![id],
+                        |r| r.get::<_, Option<String>>(0),
+                    )
+                    .ok()
+                    .flatten()
+                });
+                (branch, sha)
+            })
+            .collect();
+
+        crate::git_bridge::import(&conn, &scratch, None)?;
+
+        // After the import every pushed commit has a changeset, so the branch can point at it.
+        let mut out = pkt_line(b"unpack ok\n");
+        for c in &commands {
+            let branch = c
+                .name
+                .strip_prefix("refs/heads/")
+                .unwrap_or(&c.name)
+                .to_string();
+            let changeset: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM changesets WHERE git_commit = ?1",
+                    rusqlite::params![c.new],
+                    |r| r.get(0),
+                )
+                .ok();
+            // The `old` value is what the client believed the branch held. If the server moved on
+            // since, applying the push would silently discard whatever arrived in between, which is
+            // the one outcome a version control server must never produce. A new branch sends zeros.
+            let zero = "0".repeat(40);
+            if c.old != zero {
+                let was = before
+                    .iter()
+                    .find(|(b, _)| b == &branch)
+                    .and_then(|(_, sha)| sha.clone());
+                if let Some(was) = was {
+                    if was != c.old {
+                        out.extend_from_slice(
+                            pkt_line(
+                                format!(
+                                    "ng {} the branch moved on the server since the client last fetched\n",
+                                    c.name
+                                )
+                                .as_bytes(),
+                            )
+                            .as_slice(),
+                        );
+                        continue;
+                    }
+                }
+            }
+            match changeset {
+                Some(id) => {
+                    // A branch that does not exist yet is created by the push, which is what a
+                    // client expects when it pushes a branch the server has never seen.
+                    let known: Option<String> = conn
+                        .query_row(
+                            "SELECT name FROM branches WHERE name = ?1",
+                            rusqlite::params![branch],
+                            |r| r.get(0),
+                        )
+                        .ok();
+                    if known.is_none() {
+                        conn.execute(
+                            "INSERT INTO branches(name, head, created_at, from_branch) VALUES(?1, NULL, ?2, NULL)",
+                            rusqlite::params![branch, crate::clock::unix_now()],
+                        )?;
+                    }
+                    crate::store::set_branch_head(&conn, &branch, &id)?;
+                    crate::store::refresh_branch_tree(&conn, &branch)?;
+                    out.extend_from_slice(&pkt_line(format!("ok {}\n", c.name).as_bytes()));
+                }
+                None => {
+                    out.extend_from_slice(
+                        pkt_line(
+                            format!("ng {} the commit was unpacked but not imported\n", c.name)
+                                .as_bytes(),
+                        )
+                        .as_slice(),
+                    );
+                }
+            }
+        }
+        out.extend_from_slice(&flush());
+        Ok(out)
+    })();
+    let _ = std::fs::remove_dir_all(&scratch);
+    result
+}
+
+/// What the server accepts, for a client that is about to push.
+pub fn advertise_receive(root: &std::path::Path) -> ZResult<Vec<u8>> {
+    let served = crate::http::open_repo_for_serve(root)?;
+    let mut out = pkt_line(b"# service=git-receive-pack\n");
+    out.extend_from_slice(&flush());
+
+    let mut lines: Vec<(String, String)> = Vec::new();
+    for (name, sha) in served.refs {
+        lines.push((format!("refs/heads/{}", name), sha));
+    }
+    if lines.is_empty() {
+        // A push to a repository with no branches still needs an advertisement, and git writes the
+        // capabilities on a zero-id line when there is nothing to advertise.
+        let zero = "0".repeat(40);
+        lines.push((zero.clone(), format!("{} capabilities^{{}}\0report-status", zero)));
+    }
+    // `report-status` is the only capability this server honours. Advertising `delete-refs` would
+    // mean a push that deletes a branch reports a result this code never produces.
+    out.extend_from_slice(&ref_advertisement(&lines, &["report-status"]));
     Ok(out)
 }
 

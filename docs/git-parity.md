@@ -108,16 +108,16 @@ the result.
 The gate asserts this with a source repository written at `+0700`, because a `+0000` source matches
 whether the code is right or wrong, which is how the fault survived a test that read the export back.
 
-### 4. The server speaks enough of the git protocol to clone
+### 4. The server speaks enough of the git protocol to clone and to push
 
-`gesta serve` answers the two requests a clone makes: `info/refs?service=git-upload-pack` and
-`POST git-upload-pack`. `git clone http://host/git/repo` produces a working tree with the content,
-the history and a clean status.
+`gesta serve` answers the four requests a client makes: `info/refs?service=git-upload-pack`,
+`POST git-upload-pack`, `info/refs?service=git-receive-pack` and `POST git-receive-pack`. A plain
+git client clones, and a plain git client pushes.
 
 That is the check, and the only one worth making: a test that reads our own response back proves the
 response is well formed and nothing about whether git agrees with it.
 
-Four details produced the same symptom, an empty working tree:
+Six details each produce a symptom that looks like a different bug:
 
 - The pkt-line length counts its own four byte header.
 - The first ref line carries the capabilities after a NUL, and only the first one.
@@ -125,11 +125,21 @@ Four details produced the same symptom, an empty working tree:
 - `HEAD` has to be advertised as a ref of its own alongside `symref=HEAD:refs/heads/main`. Without
   the `HEAD` line git files everything under `refs/remotes/origin` and leaves the tree empty with a
   warning about a missing ref.
+- A push sends a **thin pack**: the objects the server is known to hold are left out and named as
+  bases. Unpacking into an empty repository fails on an object the client never sent, so the server's
+  own history is exported into the scratch repository before the new objects arrive. This is the
+  detail that separates a push that works from a push that reports a missing object.
+- The client's `old` value has to be compared with the branch **before** the import moves it.
+  Reading it afterwards compares the client's expectation with the result of applying the push, which
+  always differs, and every correct push is rejected.
 
-What is absent: push, the v2 protocol, `multi_ack_detailed`, and any delta in the pack. The pack is a
-full copy, about 3x a delta pack on this project, and a negotiation that sent only what the client
-asked for would need its `have` list. Absent on purpose, and named here so the next person does not
-read the absence as a bug.
+`index-pack` is not enough to unpack a push: it leaves the objects inside a pack, and the importer
+reads loose objects. `unpack-objects` writes them loose, which is the shape the next step needs.
+
+What is absent: the v2 protocol, `multi_ack_detailed`, ref deletion, and any delta in the packs this
+server writes. The pack it sends is a full copy, about 3x a delta pack on this project, and a
+negotiation that sent only what the client asked for would need its `have` list. Absent on purpose,
+and named here so the next person does not read the absence as a bug.
 
 ### 5. No SSH transport
 

@@ -585,7 +585,19 @@ pub fn route(root: &Path, req: &Request, auth: &Auth) -> Response {
         // A git client sends a path it was given, not one of ours, and it authenticates with Basic
         // while our tokens use Bearer. Both are read, because a clone that cannot authenticate is a
         // clone nobody finishes.
-        (_, p) if p.contains("/info/refs") || p.ends_with("/git-upload-pack") => Some(Role::Read),
+        // A push writes, so the advertisement for receive-pack and the POST that follows it both
+        // need Write. Serving the advertisement to a read-only token would let a client start a
+        // push it cannot finish.
+        (_, p) if p.contains("/info/refs") => {
+            let service = p.split("service=").nth(1).unwrap_or("");
+            if service.starts_with("git-receive-pack") {
+                Some(Role::Write)
+            } else {
+                Some(Role::Read)
+            }
+        }
+        (_, p) if p.ends_with("/git-receive-pack") => Some(Role::Write),
+        (_, p) if p.ends_with("/git-upload-pack") => Some(Role::Read),
         (_, p) if p.starts_with("/v1/") => Some(Role::Read),
         _ => None,
     };
@@ -665,21 +677,46 @@ pub fn route(root: &Path, req: &Request, auth: &Auth) -> Response {
         // `git clone http://host/git/repo` asks for `info/refs?service=git-upload-pack` first, and
         // then POSTs to `git-upload-pack`. Two requests, and a repository that answers the first and
         // not the second makes the client fail after it has already printed progress.
+        // One block for both services. Two blocks where the first matched every `/info/refs` made the
+        // second unreachable, and a push then read an upload-pack advertisement and failed with a
+        // message about a service the server never got a chance to serve.
         ("GET", p) if p.contains("/info/refs") => {
             let service = req.param("service").unwrap_or("");
-            if service != "git-upload-pack" {
-                return Response::error(
+            match service {
+                "git-upload-pack" => match crate::gitserver::advertise(root) {
+                    Ok(body) => {
+                        log_access(root, &who, "git-info-refs", p, &format!("{} bytes", body.len()));
+                        Response::ok_with_type(body, "application/x-git-upload-pack-advertisement")
+                    }
+                    Err(e) => Response::error(500, "Internal Server Error", e.to_string()),
+                },
+                "git-receive-pack" => match crate::gitserver::advertise_receive(root) {
+                    Ok(bytes) => {
+                        log_access(root, &who, "git-receive-pack-advert", p, &format!("{} bytes", bytes.len()));
+                        Response::ok_with_type(bytes, "application/x-git-receive-pack-advertisement")
+                    }
+                    Err(e) => Response::error(500, "Internal Server Error", e.to_string()),
+                },
+                other => Response::error(
                     403,
                     "Forbidden",
-                    format!("service {} is not served here (only git-upload-pack)", service),
-                );
+                    format!("service {} is not served here (git-upload-pack and git-receive-pack are)", other),
+                ),
             }
-            match crate::gitserver::advertise(root) {
-                Ok(body) => {
-                    log_access(root, &who, "git-info-refs", p, &format!("{} bytes", body.len()));
-                    Response::ok_with_type(body, "application/x-git-upload-pack-advertisement")
+        }
+        ("POST", p) if p.ends_with("/git-receive-pack") => {
+            match crate::gitserver::receive_pack(root, &req.body) {
+                Ok(bytes) => {
+                    log_access(root, &who, "git-receive-pack", p, &format!("{} bytes", bytes.len()));
+                    Response::ok_with_type(bytes, "application/x-git-receive-pack-result")
                 }
-                Err(e) => Response::error(500, "Internal Server Error", e.to_string()),
+                // A pack that could not be unpacked is the client's bytes, not our failure. The
+                // message also goes to stderr: git prints only the status code, so a reason that
+                // lives only in the body is a reason nobody reads.
+                Err(e) => {
+                    eprintln!("receive-pack refused: {}", e);
+                    Response::error(400, "Bad Request", e.to_string())
+                }
             }
         }
         ("POST", p) if p.ends_with("/git-upload-pack") => {
