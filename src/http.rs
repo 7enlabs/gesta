@@ -270,17 +270,6 @@ pub fn is_http_url(url: &str) -> bool {
     url.starts_with("http://") || url.starts_with("https://")
 }
 
-/// Perform one HTTP request with an optional bearer token.
-#[allow(dead_code)] // kept as the two-argument form used by older callers and tests
-pub fn request_with_token(
-    method: &str,
-    url: &str,
-    body: Option<&[u8]>,
-    token: Option<&str>,
-) -> ZResult<(u16, Vec<u8>)> {
-    request_with_pin(method, url, body, token, None)
-}
-
 /// Same as `request_with_token`, plus a certificate pin for a private server.
 ///
 /// `pin` is the SHA-256 fingerprint a server printed when it started. Without

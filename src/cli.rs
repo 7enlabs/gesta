@@ -536,8 +536,96 @@ pub fn cmd_changeset_create_meta(
     }
 }
 
+/// Scan the content a changeset is about to store, and refuse if it looks like a credential.
+///
+/// At commit time, on the bytes that are about to become the record, because that is the last
+/// moment where refusing costs nothing. After the commit the secret is in the history, and removing
+/// it means rewriting a record other people may already have.
+///
+/// A finding is refused rather than warned about by default. A warning in a stream of output is a
+/// warning nobody reads, and the alternative to a refused commit is a command that names the exact
+/// entry to add to the allowlist, which takes one line.
+#[cfg(feature = "regex")]
+fn refuse_secrets(conn: &rusqlite::Connection, root: &std::path::Path, id: &str) -> ZResult<()> {
+    let paths: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT path FROM changeset_files WHERE changeset_id = ?1 AND new_hash IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![id], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    let mut scanner = crate::leak::Scanner::default();
+    scanner.load_allowlist(root);
+
+    let mut found: Vec<crate::leak::Finding> = Vec::new();
+    for path in &paths {
+        if !crate::leak::worth_scanning(path) {
+            continue;
+        }
+        // The bytes the commit would store, not the file on disk: the working tree may have moved
+        // on, and the question is what becomes the record.
+        let hash: String = match conn.query_row(
+            "SELECT new_hash FROM changeset_files WHERE changeset_id = ?1 AND path = ?2",
+            rusqlite::params![id, path],
+            |r| r.get::<_, Option<String>>(0),
+        ) {
+            Ok(Some(h)) => h,
+            _ => continue,
+        };
+        let body = match crate::store::get_object(conn, &hash) {
+            Ok(b) => b,
+            // A binary object is not text and is not scanned; `worth_scanning` covers most of it,
+            // and this covers the rest without turning a commit into an error about encoding.
+            Err(_) => continue,
+        };
+        found.extend(scanner.scan_text(path, &body));
+    }
+
+    if found.is_empty() {
+        return Ok(());
+    }
+
+    let mut msg = format!(
+        "{} possible secret(s) in this changeset. Nothing was written.\n",
+        found.len()
+    );
+    for f in found.iter().take(10) {
+        msg.push_str(&format!(
+            "  {}  {}  {}\n",
+            f.path,
+            f.rule,
+            f.redacted
+        ));
+    }
+    if found.len() > 10 {
+        msg.push_str(&format!("  and {} more\n", found.len() - 10));
+    }
+    msg.push_str(
+        "\nIf one of these is a fixture rather than a credential, add it to .gesta/secret-allowlist:\n",
+    );
+    for f in found.iter().take(3) {
+        msg.push_str(&format!("  path {}\n", f.path));
+    }
+    msg.push_str(
+        "  rule <id>        turn a rule off for this repository\n  stopword <word>  treat a match as a placeholder\n",
+    );
+    Err(bad(msg))
+}
+
+#[cfg(not(feature = "regex"))]
+fn refuse_secrets(_conn: &rusqlite::Connection, _root: &std::path::Path, _id: &str) -> ZResult<()> {
+    Ok(())
+}
+
 pub fn cmd_changeset_commit(id: &str) -> ZResult<()> {
     let (root, conn) = open_repo()?;
+    // Before the hook and before anything is written: a refusal here leaves the repository exactly
+    // as it was, which is the whole point of checking at this moment.
+    refuse_secrets(&conn, &root, id)?;
     // The hook runs before anything is written, so a refusal leaves the
     // repository exactly as it was. A hook that ran afterwards could only report
     // a commit that already happened.
@@ -2665,6 +2753,9 @@ pub fn cmd_secret(sub: crate::SecretCmd) -> ZResult<()> {
                 println!("no entry named {}", name);
             }
             Ok(())
+        }
+        SecretCmd::Scan { history, json_scan } => {
+            crate::cli_remote::cmd_secret_scan(history, json_scan)
         }
     }
 }

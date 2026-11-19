@@ -136,34 +136,16 @@ def main():
         # A hardcoded credential in the source is a release blocker. The patterns
         # are deliberately narrow: a wide one flags every test fixture and gets
         # ignored, which is worse than not having it.
-        patterns = [
-            r"sk-[A-Za-z0-9]{20,}",
-            r"ghp_[A-Za-z0-9]{20,}",
-            r"github_pat_[A-Za-z0-9_]{20,}",
-            r"AKIA[0-9A-Z]{16}",
-            r"(?i)(password|passwd|secret|api_key|apikey)\s*[:=]\s*\"[^\"]{12,}\"",
-        ]
-        bad = []
-        for f in sorted(os.listdir(os.path.join(ZF_DIR, "src"))):
-            if not f.endswith(".rs"):
-                continue
-            text = open(os.path.join(ZF_DIR, "src", f), encoding="utf-8").read()
-            for pat in patterns:
-                for m in re.finditer(pat, text):
-                    line = text[: m.start()].count("\n") + 1
-                    lines = text.splitlines()
-                    # A published example value is not a credential. The marker may
-                    # sit on the line itself or on one of the three above it, so a
-                    # comment can introduce a small block. A real key pasted with
-                    # the marker is still a deliberate act, not an accident.
-                    window = lines[max(0, line - 4):line]
-                    lowered = [l.lower() for l in window]
-                    if any(
-                        "published example" in l or "test vector" in l for l in lowered
-                    ):
-                        continue
-                    bad.append(f"{f}:{line} {m.group(0)[:40]}")
-        record("no hardcoded credential in src", not bad, "\n".join(bad[:10]))
+        # The tool's own scanner rather than a second list of patterns here. Two lists drift, and
+        # the one in the tool is the one that runs at commit time, so a difference between them
+        # would mean the gate passes a tree the tool would refuse.
+        r = sh(f"{ZF} secret scan", cwd=ZF_DIR)
+        own = r[1]
+        record(
+            "no hardcoded credential in src",
+            "no secrets found" in own,
+            own[:400],
+        )
 
     if want("brief-fix"):
         # The fix does the safe half and names what it refused. A fix that silently skips work
@@ -2464,6 +2446,137 @@ def main():
             "the blame table does not duplicate the author or the timestamp",
             "author" not in cols and "committed_at" not in cols,
             f"columns: {', '.join(cols)}",
+        )
+
+    if want("secrets"):
+        # A scanner that refuses the project's own test fixtures is a scanner nobody keeps, and one
+        # that never refuses anything is decoration. Both halves are asserted, because each is easy
+        # to get by breaking the other.
+        import tempfile as _tf
+        import json as _js_s
+
+        d = _tf.mkdtemp(prefix="gate-secret-")
+        sh(f"{ZF} init", cwd=d)
+
+        def commit(name: str, body: str):
+            with open(os.path.join(d, name), "w") as fh:
+                fh.write(body)
+            r = sh(f'{ZF} changeset create "x" --author t --json', cwd=d)[1]
+            try:
+                cs = _js_s.loads(r).get("changeset")
+            except Exception:
+                return None, r
+            if not cs:
+                return None, r
+            out = sh(f"{ZF} changeset commit {cs}", cwd=d)
+            return out[0], out[1]
+
+        rc, out = commit("real.py", 'aws_key = "AKIA2E4F6G8H0J2K4L6M"\n')
+        record(
+            "a credential stops the commit",
+            rc != 0 and "possible secret" in out,
+            f"exit {rc}: {out[:200]}",
+        )
+        # Nothing may be written by a refused commit, or the check is a notification.
+        log = sh(f"{ZF} log --oneline", cwd=d)[1]
+        record(
+            "and nothing is written when it does",
+            "real.py" not in log and "add" not in log.lower(),
+            f"history after the refusal: {log[:200]!r}",
+        )
+
+        # The placeholder key from the provider's documentation has to pass, or the first thing a
+        # person does is switch the check off.
+        #
+        # The earlier step's file is removed first: a changeset covers every change in the tree, so
+        # leaving it would make this step refuse for the previous step's reason.
+        os.remove(os.path.join(d, "real.py"))
+        rc2, out2 = commit("doc.py", 'aws_key = "AKIAIOSFODNN7EXAMPLE"\n')
+        record(
+            "the documented placeholder key is not a finding",
+            rc2 == 0,
+            f"exit {rc2}: {out2[:200]}",
+        )
+
+        # The allowlist is the escape hatch for fixtures, and it has to actually suppress.
+        os.makedirs(os.path.join(d, ".gesta"), exist_ok=True)
+        with open(os.path.join(d, ".gesta", "secret-allowlist"), "w") as fh:
+            fh.write("path real.py\n")
+        os.remove(os.path.join(d, "doc.py"))
+        rc3, out3 = commit("real.py", 'aws_key = "AKIA2E4F6G8H0J2K4L6M"\n')
+        record(
+            "an allowlist entry lets a fixture through",
+            rc3 == 0,
+            f"exit {rc3}: {out3[:200]}",
+        )
+
+        # History finds what the working tree no longer holds, which is the finding a commit check
+        # cannot produce.
+        d2 = _tf.mkdtemp(prefix="gate-secret-hist-")
+        sh(f"{ZF} init", cwd=d2)
+        os.makedirs(os.path.join(d2, ".gesta"), exist_ok=True)
+        with open(os.path.join(d2, ".gesta", "secret-allowlist"), "w") as fh:
+            fh.write("path leak.txt\n")
+        with open(os.path.join(d2, "leak.txt"), "w") as fh:
+            fh.write('token = "ghp_9f8e7d6c5b4a39281706f5e4d3c2b1a0f9e8"\n')
+        r = sh(f'{ZF} changeset create "leak" --author t --json', cwd=d2)[1]
+        m = re.search(r"(cs[0-9a-f]+)", r)
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d2)
+        os.remove(os.path.join(d2, "leak.txt"))
+        os.remove(os.path.join(d2, ".gesta", "secret-allowlist"))
+        r2 = sh(f'{ZF} changeset create "remove" --author t --json', cwd=d2)[1]
+        m2 = re.search(r"(cs[0-9a-f]+)", r2)
+        if m2:
+            sh(f"{ZF} changeset commit {m2.group(1)}", cwd=d2)
+
+        now = sh(f"{ZF} secret scan", cwd=d2)[1]
+        record(
+            "a deleted secret leaves the working tree clean",
+            "no secrets found" in now,
+            now[:200],
+        )
+        hist = sh(f"{ZF} secret scan --history --json", cwd=d2)[1]
+        try:
+            doc = _js_s.loads(hist)
+            ok = doc.get("findings") == 1 and doc["items"][0]["rule"] == "github-pat"
+            detail = hist[:220]
+        except Exception as exc:
+            ok, detail = False, f"not one document: {exc}"
+        record("and history still finds it", ok, detail)
+
+        # The report must not repeat the secret. A scanner that prints the key has leaked it again.
+        plain = sh(f"{ZF} secret scan --history", cwd=d2)[1]
+        record(
+            "the report redacts what it found",
+            "ghp_9f8e7d6c5b4a39281706f5e4d3c2b1a0f9e8" not in plain and "ghp_***" in plain,
+            plain[:200],
+        )
+
+        # And this repository has to pass its own check, or the first commit after this lands is a
+        # commit the project cannot make.
+        own = sh(f"{ZF} secret scan", cwd=ZF_DIR)[1]
+        record(
+            "this repository passes its own scan",
+            "no secrets found" in own,
+            own[:300],
+        )
+
+        # The feature gates have to compile too. A build that only works with every optional
+        # dependency present is a build that breaks for the person who wanted a smaller binary, and
+        # a cfg block that does not compile is invisible until somebody tries it.
+        # Built into a separate target directory, and the main binary is rebuilt afterwards.
+        # Cargo writes the same output path regardless of features, so a check that built without
+        # them would leave the rest of the gate running a binary with no TLS and report the next
+        # suite as broken for a reason this step caused.
+        nb = subprocess.run(
+            "cargo build --release --no-default-features --target-dir target/nofeat",
+            shell=True, cwd=ZF_DIR, capture_output=True, text=True, timeout=900,
+        )
+        record(
+            "the build without optional features compiles",
+            nb.returncode == 0,
+            (nb.stderr or nb.stdout)[-400:],
         )
 
     if want("disk"):

@@ -22,6 +22,8 @@ mod impact;
 mod hooks;
 mod http;
 mod json;
+#[cfg(feature = "regex")]
+mod leak;
 mod mcp;
 mod error;
 mod privacy;
@@ -670,6 +672,15 @@ enum SecretCmd {
     List,
     /// Remove one entry
     Remove { name: String },
+    /// Look for anything that looks like a credential
+    Scan {
+        /// Read every stored version, so a secret that was deleted still shows up
+        #[arg(long)]
+        history: bool,
+        /// Machine readable
+        #[arg(long = "json")]
+        json_scan: bool,
+    },
 }
 
 #[derive(Subcommand)]

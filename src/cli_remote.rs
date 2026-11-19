@@ -1776,3 +1776,139 @@ pub fn cmd_attributes_why(path: &str, json: bool) -> ZResult<()> {
     }
     Ok(())
 }
+
+/// Scan the working tree, or the stored history, for anything that looks like a credential.
+///
+/// The commit path refuses one changeset at a time. This answers the other question a person asks
+/// after the fact: what is already in here, and how long has it been there. It reads the objects
+/// that are stored, so a secret that was committed and deleted still shows up with the changeset
+/// that introduced it, which is exactly the finding a commit-time check cannot produce.
+#[cfg(feature = "regex")]
+pub fn cmd_secret_scan(history: bool, json: bool) -> ZResult<()> {
+    let (root, conn) = open_repo()?;
+    let mut scanner = crate::leak::Scanner::default();
+    scanner.load_allowlist(&root);
+
+    // path -> the changeset a finding was first seen in. The newest is not interesting; the oldest
+    // is, because that is the one that has to be reverted.
+    let mut findings: Vec<(String, crate::leak::Finding)> = Vec::new();
+    let mut scanned = 0usize;
+
+    if history {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT fv.path, fv.hash, fv.changeset_id
+             FROM file_versions fv JOIN objects o ON o.hash = fv.hash
+             ORDER BY fv.path, fv.version",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (path, hash, _cs) = row?;
+            if !crate::leak::worth_scanning(&path) {
+                continue;
+            }
+            let body = match crate::store::get_object(&conn, &hash) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            scanned += 1;
+            findings.extend(scanner.scan_text(&path, &body).into_iter().map(|f| (path.clone(), f)));
+        }
+    } else {
+        let branch = current_branch(&conn)?;
+        let files = match branch_head(&conn, &branch)? {
+            Some(h) => crate::repo::tree_at(&conn, &h)?,
+            None => Vec::new(),
+        };
+        for (path, hash) in &files {
+            if !crate::leak::worth_scanning(path) {
+                continue;
+            }
+            let body = match crate::store::get_object(&conn, hash) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            scanned += 1;
+            findings.extend(
+                scanner
+                    .scan_text(path, &body)
+                    .into_iter()
+                    .map(|f| (path.clone(), f)),
+            );
+        }
+    }
+
+    // One row per fingerprint. A secret committed and never edited appears once per version
+    // otherwise, and a report that repeats the same key fifty times buries the tenth secret.
+    let mut seen = std::collections::HashSet::new();
+    findings.retain(|(_, f)| seen.insert(f.fingerprint.clone()));
+
+    if json {
+        let items = findings
+            .iter()
+            .map(|(_, f)| {
+                crate::json::Json::obj(vec![
+                    ("rule", crate::json::Json::str(f.rule.clone())),
+                    ("path", crate::json::Json::str(f.path.clone())),
+                    ("line", crate::json::Json::int(f.line as i64)),
+                    ("redacted", crate::json::Json::str(f.redacted.clone())),
+                    ("fingerprint", crate::json::Json::str(f.fingerprint.clone())),
+                    (
+                        "entropy",
+                        match f.entropy {
+                            Some(e) => crate::json::Json::str(format!("{:.2}", e)),
+                            None => crate::json::Json::Null,
+                        },
+                    ),
+                ])
+            })
+            .collect();
+        crate::cli::emit_object(vec![
+            (
+                "scope",
+                crate::json::Json::str(if history { "history" } else { "working tree" }),
+            ),
+            ("scanned", crate::json::Json::int(scanned as i64)),
+            ("findings", crate::json::Json::int(findings.len() as i64)),
+            ("items", crate::json::Json::arr(items)),
+        ]);
+        return Ok(());
+    }
+
+    if findings.is_empty() {
+        println!(
+            "no secrets found ({} object(s) scanned)",
+            scanned
+        );
+        return Ok(());
+    }
+    println!("{} possible secret(s) in {} object(s):", findings.len(), scanned);
+    for (_, f) in &findings {
+        println!("  {}", f);
+        if let Some(e) = f.entropy {
+            println!("      entropy {:.2}   fingerprint {}", e, f.fingerprint);
+        } else {
+            println!("      fingerprint {}", f.fingerprint);
+        }
+    }
+    // A finding is only worth reporting if the next step is clear.
+    println!(
+        "\nto stop reporting a fixture: add `path <glob>` or `stopword <word>` to .gesta/secret-allowlist"
+    );
+    println!("a credential that is already committed has to be reverted and then rotated, in that order");
+    Ok(())
+}
+
+#[cfg(not(feature = "regex"))]
+pub fn cmd_secret_scan(_history: bool, _json: bool) -> ZResult<()> {
+    Err(crate::error::Error::new(
+        crate::error::Code::Usage,
+        "secret scanning needs the regex feature, which this build does not have",
+    )
+    .into())
+}

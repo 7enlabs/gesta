@@ -20,6 +20,11 @@ version is current and freezes when the number changes, so `0.6.0` is a record a
 - `diff --to <branch>` without `--from` compares against that revision's parent instead of the empty
   tree. `--from ""` still asks for the whole tree.
 - `review --json` prints one parseable document instead of text.
+- Secret scanning at commit time. A changeset whose content looks like a credential is refused and
+  nothing is written; `secret scan [--history]` answers the same question for the tree and for every
+  stored version. Rules are a pattern plus a per-rule entropy floor, findings carry a fingerprint that
+  does not move with the line number, and `.gesta/secret-allowlist` covers the fixtures a project
+  needs to commit.
 - `bench/scale.py` measures the scan and the write apart, because one figure for both hid a flat
   write behind a growing scan. Measured: the write costs 1.28x more in a repository 16x larger.
 - `prune_cache` asks whether any path disappeared before reading the whole table back.

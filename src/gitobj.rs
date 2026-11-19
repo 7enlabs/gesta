@@ -274,38 +274,6 @@ impl Repo {
         )))
     }
 
-    /// The value of a ref, or nothing when it does not exist.
-    #[allow(dead_code)]
-    pub fn read_ref(&self, name: &str) -> ZResult<Option<String>> {
-        let path = self.git_dir.join(name);
-        if path.is_file() {
-            let text = std::fs::read_to_string(&path)?;
-            let text = text.trim();
-            if let Some(target) = text.strip_prefix("ref:") {
-                // A symbolic ref points at another ref, which may itself be symbolic.
-                return self.read_ref(target.trim());
-            }
-            if !text.is_empty() {
-                return Ok(Some(text.to_string()));
-            }
-        }
-        // A ref can also live in packed-refs.
-        let packed = self.git_dir.join("packed-refs");
-        if let Ok(text) = std::fs::read_to_string(packed) {
-            for line in text.lines() {
-                if line.starts_with('#') || line.starts_with('^') {
-                    continue;
-                }
-                if let Some((hash, r)) = line.split_once(' ') {
-                    if r.trim() == name {
-                        return Ok(Some(hash.to_string()));
-                    }
-                }
-            }
-        }
-        Ok(None)
-    }
-
     /// Write a ref, creating it if needed.
     pub fn write_ref(&self, name: &str, hash: &str) -> ZResult<()> {
         let path = self.git_dir.join(name);

@@ -669,6 +669,31 @@ mod tests {
         vec![c1, c2]
     }
 
+    /// The commit id a git branch points at, read the way git stores it.
+    ///
+    /// A test helper rather than a method on `Repo`: the production code never asks a git
+    /// repository for a ref, and a public method kept alive only by its own test is a method that
+    /// will drift from what anybody needs.
+    fn head_of(repo: &Repo, branch: &str) -> String {
+        let loose = repo.git_dir.join("refs").join("heads").join(branch);
+        if let Ok(text) = std::fs::read_to_string(&loose) {
+            return text.trim().to_string();
+        }
+        // A ref that has been packed lives in packed-refs, one line per ref.
+        let packed = std::fs::read_to_string(repo.git_dir.join("packed-refs")).unwrap_or_default();
+        for line in packed.lines() {
+            if line.starts_with('#') || line.trim().is_empty() {
+                continue;
+            }
+            if let Some((hash, name)) = line.split_once(' ') {
+                if name.trim() == format!("refs/heads/{}", branch) {
+                    return hash.trim().to_string();
+                }
+            }
+        }
+        panic!("no such ref: refs/heads/{}", branch);
+    }
+
     #[test]
     fn an_imported_repository_can_read_its_files() {
         let src = temp("import-src");
@@ -721,7 +746,7 @@ mod tests {
         // The names a round trip produces have to match the originals: a commit id is the hash of
         // its tree, its parents, its author line and its message, so equal ids prove all four.
         let repo = Repo::open(&out).unwrap();
-        let head = repo.read_ref("refs/heads/main").unwrap().unwrap();
+        let head = head_of(&repo, "main");
         assert_eq!(
             head, original[1],
             "the exported commit got a different name than the one it came from"
@@ -797,7 +822,7 @@ mod tests {
         let out = temp("nested-out");
         export(&conn, &out, None).unwrap();
         let back = Repo::open(&out).unwrap();
-        let head2 = back.read_ref("refs/heads/main").unwrap().unwrap();
+        let head2 = head_of(&back, "main");
         assert_eq!(head2, c, "the round trip changed the commit name");
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&out);
