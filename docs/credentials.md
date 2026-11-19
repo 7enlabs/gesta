@@ -107,3 +107,32 @@ Two rules that are not obvious:
   refused ref reports `ng`, and any branch the refused ref would have created is removed. Creating it
   and then reporting a refusal would put history in the repository that the caller was not allowed to
   write.
+
+## The audit record
+
+Every authenticated request and every refusal is one JSON line in `.gesta/audit.log`:
+
+```json
+{"action":"GET","at":"2026-11-19T16:01:28Z","decision":"no-token","reason":"missing or invalid token","target":"/v1/file","who":"anonymous"}
+```
+
+The decisions are `allowed`, `no-token`, `expired`, `wrong-role`, `path-refused`, `branch-refused`,
+`bad-request` and `failed`.
+
+The refusals are the reason the file exists. `access.log` records what succeeded, which answers "was
+this token used" and never "was it tried". An audit that only holds successes shows nothing at the
+moment somebody is guessing tokens.
+
+```bash
+gesta remote token audit              # everything, newest last
+gesta remote token audit --refused    # only what was turned away
+gesta remote token audit --limit 20   # the last 20
+gesta remote token audit --json       # one document, for a script
+```
+
+A line that does not parse is kept and reported as `unreadable` rather than skipped. A log that
+quietly drops the line it could not read hides the damage, which is the one thing an audit must
+never do.
+
+The file is appended to and never truncated. Rotating it is the operator's job, the same way it is
+for any log.

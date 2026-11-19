@@ -820,6 +820,15 @@ enum TokenCmd {
     },
     /// List configured tokens without revealing them
     List,
+    /// Show what the server decided: allowed, refused, and why
+    Audit {
+        /// Only the requests that were turned away
+        #[arg(long)]
+        refused: bool,
+        /// Show only the last N events
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Remove a token by name or by its last four characters
     Remove { selector: String },
 }
@@ -1086,6 +1095,9 @@ fn run() -> ZResult<()> {
                 ),
                 TokenCmd::List => cli_remote::cmd_token_list(),
                 TokenCmd::Remove { selector } => cli_remote::cmd_token_remove(&selector),
+                TokenCmd::Audit { refused, limit } => {
+                    cli_remote::cmd_audit(refused, limit, json)
+                }
             },
             RemoteCmd::Ls { remote } => cli_remote::cmd_remote_ls(&remote),
             RemoteCmd::Deepen { depth, unshallow, remote, branch, dry_run } => {

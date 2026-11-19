@@ -1967,3 +1967,58 @@ pub fn cmd_secret_scan(_history: bool, _json: bool) -> ZResult<()> {
     )
     .into())
 }
+
+/// Show what the server decided, newest last.
+///
+/// `--refused` answers the question a person asks after an incident: what was tried and turned away.
+/// Without it the whole record is shown, which is what answers "was this token used".
+pub fn cmd_audit(refused: bool, limit: Option<usize>, json_out: bool) -> ZResult<()> {
+    let (root, _conn) = open_repo()?;
+    let rows = crate::audit::read(&root, refused, limit)?;
+    if rows.is_empty() {
+        println!(
+            "no {} events recorded",
+            if refused { "refused" } else { "audit" }
+        );
+        return Ok(());
+    }
+    if json_out {
+        // One document holding an array, so a caller parses once rather than line by line.
+        let items: Vec<crate::json::Json> = rows
+            .iter()
+            .map(|e| {
+                crate::json::Json::obj(vec![
+                    ("at", crate::json::Json::str(e.at.clone())),
+                    ("who", crate::json::Json::str(e.who.clone())),
+                    ("decision", crate::json::Json::str(e.decision.clone())),
+                    ("action", crate::json::Json::str(e.action.clone())),
+                    ("target", crate::json::Json::str(e.target.clone())),
+                    ("reason", crate::json::Json::str(e.reason.clone())),
+                ])
+            })
+            .collect();
+        let doc = crate::json::Json::obj(vec![
+            ("schema", crate::json::Json::str("gesta@1")),
+            ("count", crate::json::Json::int(rows.len() as i64)),
+            ("events", crate::json::Json::Arr(items)),
+        ]);
+        println!("{}", doc.render());
+        return Ok(());
+    }
+    for e in &rows {
+        if e.decision == "unreadable" {
+            println!("  ?  unreadable line: {}", e.raw);
+            continue;
+        }
+        let mark = if e.decision == "allowed" { "ok" } else { "!!" };
+        println!(
+            "  {} {} {} {} -> {} {}",
+            mark, e.at, e.who, e.action, e.target, e.decision
+        );
+        if !e.reason.is_empty() {
+            println!("      {}", e.reason);
+        }
+    }
+    println!("\n{} event(s)", rows.len());
+    Ok(())
+}

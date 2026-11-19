@@ -20,6 +20,8 @@ version is current and freezes when the number changes, so `0.6.0` is a record a
 - `diff --to <branch>` without `--from` compares against that revision's parent instead of the empty
   tree. `--from ""` still asks for the whole tree.
 - `review --json` prints one parseable document instead of text.
+- Every authenticated request and every refusal is one JSON line in `.gesta/audit.log`, read with
+  `gesta remote token audit --refused`. A log that held only successes never showed what was tried.
 - A token can be scoped to named branches with `--branches`, so a write token for one branch
   cannot rewrite another. A refused push leaves no branch behind.
 - A token removed while the server runs stops working on the next request, without a restart.

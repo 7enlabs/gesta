@@ -2793,6 +2793,111 @@ def main():
             except Exception:
                 server.kill()
 
+    if want("request-audit"):
+        # A refusals-only log is the point: an audit that records only successes answers "was this
+        # token used" and never "was it tried". The format also has to survive a reason that holds a
+        # quote or a newline, because those come from paths and branch names.
+        import tempfile as _tfa
+        import socket as _socka
+        import time as _tmpa
+        import json as _jsona
+
+        d = _tfa.mkdtemp(prefix="gate-audit-")
+        sh(f"{ZF} init", cwd=d)
+        with open(os.path.join(d, "f.txt"), "w") as fh:
+            fh.write("x\n")
+        m = re.search(r"(cs[0-9a-f]+)", sh(f'{ZF} changeset create "s" --author t --json', cwd=d)[1])
+        if m:
+            sh(f"{ZF} changeset commit {m.group(1)}", cwd=d)
+        added = sh(f"{ZF} remote token add read agent1", cwd=d)[1]
+        toks = [l for l in added.splitlines() if len(l.strip()) == 64]
+        if not toks:
+            record("a token can be created for the audit check", False, added[:300])
+        else:
+            token = toks[0].strip()
+            s = _socka.socket()
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+            s.close()
+            server = subprocess.Popen(
+                f"{ZF} serve --port {port}", shell=True, cwd=d,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            try:
+                for _ in range(50):
+                    try:
+                        with _socka.create_connection(("127.0.0.1", port), timeout=0.2):
+                            break
+                    except OSError:
+                        _tmpa.sleep(0.1)
+
+                url = f"http://127.0.0.1:{port}/v1/file?path=f.txt"
+                subprocess.run(f'curl -s -o /dev/null -H "Authorization: Bearer {token}" "{url}"',
+                               shell=True, capture_output=True)
+                # No credential: this is the line that did not exist before.
+                subprocess.run(f'curl -s -o /dev/null "{url}"', shell=True, capture_output=True)
+                # A path with a quote and a slash, to prove the reason cannot break a line.
+                subprocess.run(
+                    f'curl -s -o /dev/null "{url.replace("f.txt", "a%22b.txt")}"',
+                    shell=True, capture_output=True,
+                )
+            finally:
+                server.terminate()
+                try:
+                    server.wait(timeout=10)
+                except Exception:
+                    server.kill()
+
+            log = os.path.join(d, ".gesta", "audit.log")
+            lines = [l for l in open(log, encoding="utf-8").read().splitlines() if l.strip()] if os.path.exists(log) else []
+            parsed = []
+            bad = 0
+            for line in lines:
+                try:
+                    parsed.append(_jsona.loads(line))
+                except Exception:
+                    bad += 1
+            record(
+                "every recorded event is one JSON document",
+                len(lines) > 0 and bad == 0,
+                f"{len(lines)} line(s), {bad} unparsable",
+            )
+            decisions = [e.get("decision") for e in parsed]
+            record(
+                "a request that succeeded is recorded",
+                "allowed" in decisions,
+                str(decisions),
+            )
+            record(
+                "and a request refused for having no token is recorded",
+                "no-token" in decisions,
+                str(decisions),
+            )
+
+            refused = sh(f"{ZF} remote token audit --refused", cwd=d)[1]
+            record(
+                "the refused view shows the refusal and not the success",
+                "no-token" in refused and "allowed" not in refused.replace("no-token", ""),
+                refused.strip()[:300],
+            )
+            allowed_view = sh(f"{ZF} remote token audit", cwd=d)[1]
+            record(
+                "and the full view shows both",
+                "no-token" in allowed_view and "allowed" in allowed_view,
+                allowed_view.strip()[:300],
+            )
+            js = sh(f"{ZF} remote token audit --json", cwd=d)[1]
+            try:
+                doc = _jsona.loads(js)
+                is_doc = doc.get("schema") == "gesta@1" and isinstance(doc.get("events"), list)
+            except Exception:
+                is_doc = False
+            record(
+                "and the JSON form is one document, not one per line",
+                is_doc,
+                js.strip()[:200],
+            )
+
     if want("branch-scope"):
         # A token scoped to one branch rewrote every branch before this existed, and a refused push
         # still created the branch it refused. Both are checked here because the second one only

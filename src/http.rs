@@ -662,6 +662,9 @@ pub fn route(root: &Path, req: &Request, auth: &Auth) -> Response {
 
     let mut who = "anonymous".to_string();
     let mut grant: Option<crate::auth::Grant> = None;
+    // Recorded once the decision is made. A request with no credential requirement is not an event
+    // worth a line, but one that was authenticated is.
+    let mut record_allowed = false;
     if let Some(needed) = needed {
         if auth.required {
             let presented = req
@@ -680,15 +683,40 @@ pub fn route(root: &Path, req: &Request, auth: &Auth) -> Response {
                 Some(crate::auth::AuthOutcome::Granted(g)) if Auth::allows(g.role, needed) => {
                     who = g.name.clone();
                     grant = Some(g);
+                    record_allowed = true;
                 }
                 Some(crate::auth::AuthOutcome::Expired(name)) => {
+                    crate::audit::record(
+                        root,
+                        &crate::audit::Event {
+                            who: &name,
+                            decision: crate::audit::Decision::Expired,
+                            action: req.method.as_str(),
+                            target: path,
+                            reason: "token expired",
+                            remote: None,
+                        },
+                    );
                     return Response::error(
                         401,
                         "Unauthorized",
                         format!("token for {} expired", name),
                     )
                 }
-                Some(crate::auth::AuthOutcome::Granted(_)) => {
+                Some(crate::auth::AuthOutcome::Granted(g)) => {
+                    // A real token asking for more than it has. The name is recorded because this is
+                    // a misconfiguration worth finding, not an attack worth hiding.
+                    crate::audit::record(
+                        root,
+                        &crate::audit::Event {
+                            who: &g.name,
+                            decision: crate::audit::Decision::WrongRole,
+                            action: req.method.as_str(),
+                            target: path,
+                            reason: &format!("needs {:?}, token is {:?}", needed, g.role),
+                            remote: None,
+                        },
+                    );
                     return Response::error(
                         403,
                         "Forbidden",
@@ -698,6 +726,19 @@ pub fn route(root: &Path, req: &Request, auth: &Auth) -> Response {
                 None | Some(crate::auth::AuthOutcome::Unknown) => {
                     // A short sleep blunts online guessing without needing state
                     // per client. It costs an attacker 200 ms per attempt.
+                    // Recorded before the sleep, so a flood of guesses leaves one line each rather
+                    // than a file that grows only after the attacker gives up.
+                    crate::audit::record(
+                        root,
+                        &crate::audit::Event {
+                            who: "anonymous",
+                            decision: crate::audit::Decision::NoToken,
+                            action: req.method.as_str(),
+                            target: path,
+                            reason: "missing or invalid token",
+                            remote: None,
+                        },
+                    );
                     std::thread::sleep(std::time::Duration::from_millis(200));
                     return Response::error(
                         401,
@@ -707,6 +748,22 @@ pub fn route(root: &Path, req: &Request, auth: &Auth) -> Response {
                 }
             }
         }
+    }
+
+    // Written after the auth decision and before the work, so a request that is about to run appears
+    // in the record even if it then fails part way.
+    if record_allowed {
+        crate::audit::record(
+            root,
+            &crate::audit::Event {
+                who: &who,
+                decision: crate::audit::Decision::Allowed,
+                action: req.method.as_str(),
+                target: path,
+                reason: "",
+                remote: None,
+            },
+        );
     }
 
     match (req.method.as_str(), path) {
