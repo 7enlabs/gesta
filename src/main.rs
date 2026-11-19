@@ -547,6 +547,11 @@ enum ChangesetCmd {
         message: String,
         #[arg(long, default_value = "agent")]
         author: String,
+        /// Limit the snapshot to these paths. Repeat to name more. Without it the snapshot is the
+        /// whole tree, which is what one person wants and what two agents in one checkout cannot
+        /// share: each would record the other's work as its own.
+        #[arg(long = "path", value_name = "PATH")]
+        paths: Vec<String>,
         /// Which session produced this change, so the reasoning stays attached.
         /// Defaults to GESTA_SESSION when that is set.
         #[arg(long)]
@@ -992,13 +997,14 @@ fn run() -> ZResult<()> {
         Cmd::Log { limit, oneline, .. } => cli::cmd_log(limit, oneline),
         Cmd::Changeset { sub } => match sub {
             ChangesetCmd::Sign { id, key } => cli::cmd_sign(&id, key.as_deref()),
-            ChangesetCmd::Create { message, author, session, intent } => {
+            ChangesetCmd::Create { message, author, paths, session, intent } => {
                 let session = session.or_else(|| std::env::var("GESTA_SESSION").ok());
-                cli::cmd_changeset_create_meta(
+                cli::cmd_changeset_create_paths(
                     &message,
                     &author,
                     session.as_deref(),
                     intent.as_deref(),
+                    &paths,
                 )
             }
             ChangesetCmd::Commit { id } => cli::cmd_changeset_commit(&id),

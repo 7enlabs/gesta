@@ -20,6 +20,10 @@ version is current and freezes when the number changes, so `0.6.0` is a record a
 - `diff --to <branch>` without `--from` compares against that revision's parent instead of the empty
   tree. `--from ""` still asks for the whole tree.
 - `review --json` prints one parseable document instead of text.
+- `changeset create --path` limits a snapshot to named paths, so two agents in one checkout do not
+  record each other's work under their own name.
+- `bench/many_writers.py` measures 100 concurrent writers; every one lands a commit and fsck is
+  clean.
 - A commit no longer rewrites the file's whole blame table. On a 10,000 commit history the write
   went from 47.1 to 29.4 ms, and the growth over 100x history from 3.47x to 2.08x.
 - `bench/long_history.py` measures a commit against the length of the history.

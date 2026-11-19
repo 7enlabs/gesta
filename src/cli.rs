@@ -518,16 +518,20 @@ pub fn cmd_log(limit: usize, oneline: bool) -> ZResult<()> {
 /// change. A message says what happened; the session and intent keep it attached to the
 /// conversation that produced it, so a reviewer can ask why instead of guessing from the
 /// shape of the diff.
-pub fn cmd_changeset_create_meta(
+///
+/// A snapshot covers the whole tree unless `paths` names some, which is what lets two writers share
+/// one checkout without recording each other's files.
+pub fn cmd_changeset_create_paths(
     message: &str,
     author: &str,
     session: Option<&str>,
     intent: Option<&str>,
+    paths: &[String],
 ) -> ZResult<()> {
     let (root, conn) = open_repo()?;
     let branch = current_branch(&conn)?;
 
-    match store::with_retry(|| repo::create_changeset(&conn, &root, message, author))? {
+    match store::with_retry(|| repo::create_changeset_scoped(&conn, &root, message, author, paths))? {
         None => {
             println!("nothing to snapshot: working tree matches branch {}", branch);
             Ok(())
@@ -2232,8 +2236,14 @@ pub fn cmd_changeset_json(sub: crate::ChangesetCmd) -> YResultAlias {
             emit(Json::arr(rows.collect::<rusqlite::Result<Vec<_>>>()?));
             Ok(())
         }
-        crate::ChangesetCmd::Create { message, author, session, intent } => {
-            cmd_changeset_create_json(&message, &author, session.as_deref(), intent.as_deref())
+        crate::ChangesetCmd::Create { message, author, paths, session, intent } => {
+            cmd_changeset_create_json(
+                &message,
+                &author,
+                session.as_deref(),
+                intent.as_deref(),
+                &paths,
+            )
         }
         crate::ChangesetCmd::Commit { id } => cmd_changeset_commit_json(&id),
         // A caller that asked for JSON and got text has a silent failure: it parses nothing and
@@ -2251,10 +2261,12 @@ fn cmd_changeset_create_json(
     author: &str,
     session: Option<&str>,
     intent: Option<&str>,
+    paths: &[String],
 ) -> YResultAlias {
     let (root, conn) = open_repo()?;
     let branch = current_branch(&conn)?;
-    let made = store::with_retry(|| repo::create_changeset(&conn, &root, message, author))?;
+    let made =
+        store::with_retry(|| repo::create_changeset_scoped(&conn, &root, message, author, paths))?;
     let Some(cs) = made else {
         // Nothing to snapshot is not an error, and a caller still needs a shape to read.
         emit(Json::obj(vec![

@@ -171,6 +171,30 @@ A single figure for the two phases said "2.12x worse" about a floor that did not
 are reported now, and the gate asserts the write is flat and the scan was seen growing, so neither
 can be made to look good at the other's expense.
 
+### Many writers in one checkout
+
+SQLite takes one writer at a time, so the question is not whether writes serialise but whether the
+store survives the queue. Measured with writers started together:
+
+| writers | landed | wall ms | median ms | p95 ms | changesets | fsck |
+|---:|---:|---:|---:|---:|---:|---|
+| 20 | 20 | 309 | 52 | 135 | 21 | clean |
+| 100 | 100 | 1185 | 172 | 307 | 101 | clean |
+
+Every writer landed exactly one commit and `fsck` was clean at both sizes. The drain time grew 3.83x
+for 5x the writers, which is what a serialised queue costs when the work per write is small.
+
+The measurement found a real bug before it found a number. Writers that snapshot the whole tree
+record each other's files: at 100 writers one changeset held 39 files belonging to other writers, and
+one writer was told `changed: false` because the file it had just written had already been committed
+by somebody else. Nothing was lost, but authorship was wrong, which for an agent surface is worse
+than losing a commit because it looks correct.
+
+`changeset create --path` limits the snapshot. A path matches itself or a parent of itself, so naming
+a directory covers what is under it. Without the flag the snapshot is still the whole tree.
+
+`bench/many_writers.py` runs the measurement; `bench/gate.py writer-scope` checks the scoping.
+
 ### Long histories: measured to 10,000 commits
 
 A commit is billed as costing what the change costs, not what the repository holds. That claim was

@@ -142,6 +142,35 @@ pub fn create_changeset(
     message: &str,
     author: &str,
 ) -> ZResult<Option<NewChangeset>> {
+    create_changeset_scoped(conn, root, message, author, &[])
+}
+
+/// `create_changeset`, optionally limited to a set of paths.
+///
+/// A snapshot of the whole tree is one writer's answer. Two agents working in one checkout need
+/// theirs separated, or each records the other's files under its own name. A path matches when it is
+/// the path, or when it is a parent of it, so naming a directory covers what is under it.
+pub fn create_changeset_scoped(
+    conn: &Connection,
+    root: &Path,
+    message: &str,
+    author: &str,
+    paths: &[String],
+) -> ZResult<Option<NewChangeset>> {
+    let wanted: Vec<String> = paths
+        .iter()
+        .map(|p| p.trim_start_matches("./").replace('\\', "/"))
+        .collect();
+    let in_scope = |rel: &str| -> bool {
+        if wanted.is_empty() {
+            return true;
+        }
+        wanted.iter().any(|w| {
+            rel == w
+                || rel.starts_with(&format!("{w}/"))
+                || w.is_empty()
+        })
+    };
     let branch = current_branch(conn)?;
     let rules = load_ignore_rules(root, conn)?;
     let scope = crate::sparse::SparseScope::load(conn)?;
@@ -173,7 +202,7 @@ pub fn create_changeset(
         }
     }
     for f in scanned.files {
-        if !scope.contains(&f.rel) {
+        if !scope.contains(&f.rel) || !in_scope(&f.rel) {
             continue;
         }
         seen.insert(f.rel.clone());
@@ -205,7 +234,7 @@ pub fn create_changeset(
     let mut tracked: Vec<String> = committed.keys().cloned().collect();
     tracked.sort();
     for path in tracked {
-        if !scope.contains(&path) {
+        if !scope.contains(&path) || !in_scope(&path) {
             continue;
         }
         if !seen.contains(&path) && !root.join(&path).exists() {
@@ -1961,6 +1990,74 @@ pub fn land_branch(
         assert_eq!(authors.get(1).map(|s| s.as_str()), Some("bob"), "inserted line: {:?}", authors);
         assert_eq!(authors.last().map(|s| s.as_str()), Some("dave"), "appended line: {:?}", authors);
         assert_eq!(authors.len(), 6, "one entry per line: {:?}", authors);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+
+    #[test]
+    fn a_scoped_snapshot_leaves_another_writer_files_alone() {
+        // Two writers in one checkout is the case the whole feature exists for. Without the path
+        // filter each snapshot records every changed file, so the second writer's commit carries the
+        // first writer's work under its own name.
+        let d = std::env::temp_dir().join(format!("gesta-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join(".gesta")).unwrap();
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        let conn = crate::store::open_db(&d).unwrap();
+        crate::store::init_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO branches(name, head, created_at, from_branch) VALUES('main', NULL, 0, NULL)",
+            [],
+        )
+        .unwrap();
+
+        std::fs::write(d.join("a.txt"), "a\n").unwrap();
+        std::fs::write(d.join("sub/c.txt"), "c\n").unwrap();
+        let base = crate::repo::create_changeset(&conn, &d, "base", "base").unwrap();
+        crate::repo::commit_one(&conn, &base.unwrap().id).unwrap();
+
+        std::fs::write(d.join("a.txt"), "a2\n").unwrap();
+        std::fs::write(d.join("sub/c.txt"), "c2\n").unwrap();
+
+        let mine = crate::repo::create_changeset_scoped(
+            &conn,
+            &d,
+            "mine",
+            "alice",
+            &["a.txt".to_string()],
+        )
+        .unwrap()
+        .expect("alice changed a.txt");
+        let theirs = crate::repo::create_changeset_scoped(
+            &conn,
+            &d,
+            "theirs",
+            "bob",
+            &["sub".to_string()],
+        )
+        .unwrap()
+        .expect("bob changed sub/c.txt");
+
+        let paths_of = |id: &str| -> Vec<String> {
+            let mut stmt = conn
+                .prepare("SELECT path FROM changeset_files WHERE changeset_id = ?1 ORDER BY path")
+                .unwrap();
+            let rows = stmt
+                .query_map(params![id], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows
+        };
+
+        assert_eq!(paths_of(&mine.id), vec!["a.txt".to_string()]);
+        assert_eq!(paths_of(&theirs.id), vec!["sub/c.txt".to_string()]);
+
+        // And with no paths, the snapshot is the whole tree, which is what one writer wants.
+        std::fs::write(d.join("a.txt"), "a3\n").unwrap();
+        let all = crate::repo::create_changeset(&conn, &d, "all", "carol").unwrap().unwrap();
+        assert!(paths_of(&all.id).contains(&"a.txt".to_string()));
+
         let _ = std::fs::remove_dir_all(&d);
     }
 

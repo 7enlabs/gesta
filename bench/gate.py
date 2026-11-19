@@ -2866,6 +2866,67 @@ def main():
                 f"{ratio:.2f}x over 10x history ({small:.1f} -> {large:.1f} ms)",
             )
 
+    def _jsonw(text):
+        import json as _jw
+        try:
+            return _jw.loads(text)
+        except Exception:
+            return None
+
+    if want("writer-scope"):
+        # Two writers in one checkout. Each snapshot must record its own file and nothing else, or
+        # every commit carries the other writer's work under the wrong name.
+        import tempfile as _tfw
+
+        d = _tfw.mkdtemp(prefix="gate-scope-")
+        sh(f"{ZF} init", cwd=d)
+        os.makedirs(os.path.join(d, "sub"), exist_ok=True)
+        for rel, body in (("a.txt", "a\n"), ("sub/c.txt", "c\n")):
+            with open(os.path.join(d, rel), "w") as fh:
+                fh.write(body)
+        out = sh_out(f'{ZF} changeset create "base" --author base --json', cwd=d)[1]
+        base = _jsonw(out).get("changeset") if _jsonw(out) else None
+        if base:
+            sh(f"{ZF} changeset commit {base}", cwd=d)
+
+        with open(os.path.join(d, "a.txt"), "w") as fh:
+            fh.write("a2\n")
+        with open(os.path.join(d, "sub", "c.txt"), "w") as fh:
+            fh.write("c2\n")
+
+        alice = _jsonw(sh_out(f'{ZF} changeset create "mine" --author alice --path a.txt --json', cwd=d)[1])
+        bob = _jsonw(sh_out(f'{ZF} changeset create "theirs" --author bob --path sub --json', cwd=d)[1])
+
+        a_paths = sorted(f["path"] for f in (alice or {}).get("files", []))
+        b_paths = sorted(f["path"] for f in (bob or {}).get("files", []))
+
+        record(
+            "a snapshot can be limited to a path",
+            a_paths == ["a.txt"],
+            f"alice recorded {a_paths}",
+        )
+        record(
+            "and a directory covers what is under it",
+            b_paths == ["sub/c.txt"],
+            f"bob recorded {b_paths}",
+        )
+        record(
+            "so two writers in one checkout do not record each other's work",
+            "sub/c.txt" not in a_paths and "a.txt" not in b_paths,
+            f"alice {a_paths}, bob {b_paths}",
+        )
+
+        # Without a path the snapshot is still the whole tree.
+        with open(os.path.join(d, "a.txt"), "w") as fh:
+            fh.write("a3\n")
+        whole = _jsonw(sh_out(f'{ZF} changeset create "all" --author carol --json', cwd=d)[1])
+        whole_paths = sorted(f["path"] for f in (whole or {}).get("files", []))
+        record(
+            "and without a path the whole tree is still what a snapshot means",
+            "a.txt" in whole_paths,
+            f"carol recorded {whole_paths}",
+        )
+
     if want("request-audit"):
         # A refusals-only log is the point: an audit that records only successes answers "was this
         # token used" and never "was it tried". The format also has to survive a reason that holds a
