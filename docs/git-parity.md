@@ -171,6 +171,57 @@ A single figure for the two phases said "2.12x worse" about a floor that did not
 are reported now, and the gate asserts the write is flat and the scan was seen growing, so neither
 can be made to look good at the other's expense.
 
+### 100,000 files: the write holds, the scan does not
+
+The write claim was measured to 8,000 files. At 100,000 it still holds, and the comparison to the
+tool this replaces flips in one column and not the other.
+
+| files | gesta scan | git status | gesta write | git add+commit |
+|---:|---:|---:|---:|---:|
+| 8,000 | 33.1 | 11.0 | 13.4 | 15.6 |
+| 100,000 | 454.7 | 78.4 | 13.2 | 100.2 |
+
+The write is flat: 13.4 to 13.2 ms while the tree grew 12x, against git going 15.6 to 100.2. Above
+roughly 10,000 files a commit is several times cheaper here.
+
+The whole path says the opposite. A commit is a scan and a write, and at 100,000 files:
+
+| | gesta | git |
+|---|---:|---:|
+| scan + write, one file changed | 446.4 ms | 108.1 ms |
+
+The scan is 5.8x slower than `git status` and it swallows the write advantage. Measuring only the
+write would have reported a win on the phase nobody runs alone.
+
+Where the 364 ms of `status` goes at 100,000 files, measured part by part rather than guessed:
+
+| part | ms |
+|---|---:|
+| walk only (scandir + stat per entry) | 195.8 |
+| plus a relative path per entry | 261.5 |
+| cache load, 100,002 rows | 47.7 |
+| hash map built from those rows | 12.3 |
+
+There is no single culprit. The kernel floor for stat-ing 100,000 files is 186.7 ms, so the tool is
+about 1.95x its floor, and the extra is work git does not do: an ignore rule per path, a relative path
+string per file, a cache read, and a hash map. Each is defensible on its own. Together they cost more
+than the write they were protecting.
+
+Two things measured and rejected as the cause: sorting the 100,002 collected paths costs 8.1 ms, and
+the walk order is already unsorted, so the sort is not free but it is not the problem either.
+
+What would close the gap, in the order the numbers point at:
+
+- Read the stat cache into a hash map keyed by path without building an intermediate dict, and drop
+  the rows the walk never visits in the same pass instead of a second one.
+- Skip the ignore rule for a path whose parent directory was already matched by a directory rule,
+  which is most paths in a tree with a `target` or `node_modules` directory.
+- Compare the directory's own mtime with the recorded one and reuse every entry under it when it has
+  not changed. Git does not do this and it is why `git status` is 78 ms; the stat cache currently
+  saves the read but not the walk.
+
+None of those is done. The number above is what the tool does today.
+
 ### Many writers in one checkout
 
 SQLite takes one writer at a time, so the question is not whether writes serialise but whether the

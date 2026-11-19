@@ -22,6 +22,9 @@ version is current and freezes when the number changes, so `0.6.0` is a record a
 - `review --json` prints one parseable document instead of text.
 - `changeset create --path` limits a snapshot to named paths, so two agents in one checkout do not
   record each other's work under their own name.
+- Measured to 100,000 files: the write stays flat at 13 ms while `git add` plus commit goes from
+  15.6 to 100.2 ms. The scan is 5.8x slower than `git status` at that size, so the whole path is
+  slower here, which the documentation says plainly.
 - `bench/many_writers.py` measures 100 concurrent writers; every one lands a commit and fsck is
   clean.
 - A commit no longer rewrites the file's whole blame table. On a 10,000 commit history the write

@@ -2927,6 +2927,53 @@ def main():
             f"carol recorded {whole_paths}",
         )
 
+    if want("write-flat"):
+        # The claim is that a write costs what the change costs. This checks the shape at two sizes
+        # that the gate can afford, not the 100000 file point, which takes about fifteen minutes.
+        import tempfile as _tf
+
+        measured = []
+        for n in (200, 2000):
+            d = _tf.mkdtemp(prefix=f"gate-flat-{n}-")
+            sh(f"{ZF} init", cwd=d)
+            for i in range(n):
+                with open(os.path.join(d, f"f{i}.txt"), "w") as fh:
+                    fh.write(f"file {i}\n")
+            out = sh_out(f'{ZF} changeset create "seed" --author b --json', cwd=d)[1]
+            seed = _jsonw(out).get("changeset") if _jsonw(out) else None
+            if seed:
+                sh(f"{ZF} changeset commit {seed}", cwd=d)
+            import time as _t
+            vals = []
+            for k in range(3):
+                with open(os.path.join(d, f"f0.txt"), "a") as fh:
+                    fh.write(f"{k}\n")
+                out = sh_out(f'{ZF} changeset create "w{k}" --author b --json', cwd=d)[1]
+                cid = _jsonw(out).get("changeset") if _jsonw(out) else None
+                if cid:
+                    t0 = _t.perf_counter()
+                    sh(f"{ZF} changeset commit {cid}", cwd=d)
+                    vals.append((_t.perf_counter() - t0) * 1000)
+            vals.sort()
+            measured.append((n, vals[len(vals) // 2] if vals else None))
+            import shutil as _sh_wf
+
+            _sh_wf.rmtree(d, ignore_errors=True)
+
+        small, large = measured[0][1], measured[-1][1]
+        record(
+            "a commit can be timed at two tree sizes",
+            small is not None and large is not None,
+            f"{small} ms at 200 files, {large} ms at 2000",
+        )
+        if small and large:
+            ratio = large / small
+            record(
+                "and the write does not follow the size of the tree",
+                ratio <= 2.0,
+                f"{ratio:.2f}x for 10x the files ({small:.1f} -> {large:.1f} ms)",
+            )
+
     if want("request-audit"):
         # A refusals-only log is the point: an audit that records only successes answers "was this
         # token used" and never "was it tried". The format also has to survive a reason that holds a

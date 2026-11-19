@@ -155,7 +155,12 @@ def main():
     print("  create reads the tree, commit writes the change. Git's `add -A` plays the scan here.")
     print()
     print(f"{'files':>7} {'gesta create':>14} {'gesta commit':>14} {'git add+commit':>16}  {'write ratio':>11}")
-    for n in (500, 2000, 8000):
+    # 100000 is the size a monorepo reaches and the number this project has not been measured at.
+    # The sizes are read from the command line so a long run is a choice and not a surprise.
+    sizes = (500, 2000, 8000)
+    if "--sizes" in sys.argv:
+        sizes = tuple(int(x) for x in sys.argv[sys.argv.index("--sizes") + 1].split(","))
+    for n in sizes:
         g = os.path.join(ROOT, f"g{n}")
         t = os.path.join(ROOT, f"t{n}")
         build(g, n)
