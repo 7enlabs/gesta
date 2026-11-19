@@ -281,10 +281,24 @@ pub fn digest(token: &str) -> String {
 /// to a weak source, because a guessable token is worse than no server.
 pub fn generate_token(bytes: usize) -> std::io::Result<String> {
     let mut buf = vec![0u8; bytes];
-    let mut f = std::fs::File::open("/dev/urandom")?;
-    use std::io::Read;
-    f.read_exact(&mut buf)?;
+    // `/dev/urandom` does not exist on Windows, so the old version made every token command fail
+    // there with "the system cannot find the path specified". Reading the system source through the
+    // standard library is the portable answer, and it costs no dependency that a build without TLS
+    // would have to carry anyway.
+    fill_random(&mut buf)?;
     Ok(hex::encode(buf))
+}
+
+/// Fill a buffer from the operating system's random source.
+///
+/// `/dev/urandom` is a Unix path and does not exist on Windows, so the old version made every token
+/// command fail there. `ring` is not optional in this crate (the secret store needs it in a build
+/// without TLS), and its generator is the system source on every platform.
+fn fill_random(buf: &mut [u8]) -> std::io::Result<()> {
+    use ring::rand::{SecureRandom, SystemRandom};
+    SystemRandom::new()
+        .fill(buf)
+        .map_err(|_| std::io::Error::other("the system random source refused"))
 }
 
 /// A bind address is private when it can only be reached from this machine.

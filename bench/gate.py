@@ -1825,11 +1825,15 @@ def main():
             path = os.path.join(tmp, f"w{i}.txt")
             with open(path, "w") as fh:
                 fh.write(f"writer {i}\n")
+            # Each writer commits the changeset it just made, by name. Taking the first id from
+            # `changeset list` picks whichever changeset another process created a moment ago, so
+            # twenty writers committed each other's work and some of their own was never committed.
+            # The check then reported lost changesets, which was true and was the harness's doing.
             procs.append(
                 subprocess.Popen(
                     ["bash", "-lc",
-                     f"{ZF} changeset create w{i} --author p{i} >/dev/null 2>&1; "
-                     f"c=$({ZF} changeset list --json 2>/dev/null | grep -oE 'cs[0-9a-f]+' | head -1); "
+                     f"c=$({ZF} changeset create w{i} --author p{i} --json 2>/dev/null "
+                     f"| grep -oE 'cs[0-9a-f]+' | head -1); "
                      f"[ -n \"$c\" ] && {ZF} changeset commit $c >/dev/null 2>&1; true"],
                     cwd=tmp,
                 )
