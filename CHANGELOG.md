@@ -78,6 +78,20 @@ no delta, no v2, no ref deletion.
 
 ## Unreleased
 
+### Protected branches
+
+- `gesta branch protect <name>` makes a push to that branch need a sign-off, and
+  `gesta changeset approve <id> --by <reviewer>` is the sign-off. Both live in the store, so a clone
+  carries the rule.
+- A new `approve` role may read and sign off and may not write. A reviewer holding a write token is
+  the failure this prevents.
+- An approval from the credential that is pushing does not count.
+- A refused push leaves the branch where it was. The import used to move it before the gate ran, so a
+  rejected push had landed.
+- A server with no tokens refuses a push to a protected branch and says so, because an anonymous
+  pusher cannot be told apart from a reviewer.
+- `bench/branch_protect.py` drives a real git client for six checks; the gate runs it.
+
 ### A fetch sends the change, not the tree
 
 - `git fetch` now honours the client's `have` list: every object those commits reach is left out of

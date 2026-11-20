@@ -507,6 +507,7 @@ pub fn receive_pack_allowing(
     root: &std::path::Path,
     body: &[u8],
     allowed: Option<&dyn Fn(&str) -> bool>,
+    pusher: &str,
 ) -> ZResult<Vec<u8>> {
     let (commands, pack) = split_push(body)?;
 
@@ -716,12 +717,15 @@ pub fn receive_pack_allowing(
             })
             .collect();
 
-        let before: Vec<(String, Option<String>)> = commands
+        // The git sha and the changeset id the branch pointed at. The id is what a refusal needs: the
+        // import moves the branch as it creates changesets, so a gate that only refuses the `ok` line
+        // leaves the branch where the import put it, and git reports a rejected push that landed.
+        let before: Vec<(String, Option<String>, Option<String>)> = commands
             .iter()
             .map(|c| {
                 let branch = c.name.strip_prefix("refs/heads/").unwrap_or(&c.name).to_string();
                 let head = crate::store::branch_head(&conn, &branch).ok().flatten();
-                let sha = head.and_then(|id| {
+                let sha = head.as_ref().and_then(|id| {
                     conn.query_row(
                         "SELECT git_commit FROM changesets WHERE id = ?1",
                         rusqlite::params![id],
@@ -730,7 +734,7 @@ pub fn receive_pack_allowing(
                     .ok()
                     .flatten()
                 });
-                (branch, sha)
+                (branch, sha, head)
             })
             .collect();
 
@@ -782,6 +786,42 @@ pub fn receive_pack_allowing(
                     |r| r.get(0),
                 )
                 .ok();
+
+            // A protected branch needs a sign-off from a credential other than the one pushing.
+            // Checked here, after the import, because the approval names a changeset and the
+            // changeset only exists once the objects have landed. A refusal leaves the branch where
+            // it was: the row is reported `ng` and the history is not moved.
+            if let Some(cs) = &changeset {
+                if let Err(e) = crate::approval::check_push(&conn, &branch, cs, pusher) {
+                    // The import already moved the branch. Putting it back is what makes the refusal
+                    // true: git prints `! [remote rejected]` and the branch is where it was.
+                    let had = before
+                        .iter()
+                        .find(|(b, _, _)| b == &branch)
+                        .and_then(|(_, _, id)| id.clone());
+                    match had {
+                        Some(prev) => {
+                            let _ = crate::store::set_branch_head(&conn, &branch, &prev);
+                            let _ = crate::store::refresh_branch_tree(&conn, &branch);
+                        }
+                        // A push that created the branch: undo the creation.
+                        None => {
+                            let _ = conn.execute(
+                                "DELETE FROM branches WHERE name = ?1",
+                                rusqlite::params![branch],
+                            );
+                            let _ = conn.execute(
+                                "DELETE FROM branch_tree WHERE branch = ?1",
+                                rusqlite::params![branch],
+                            );
+                        }
+                    }
+                    out.extend_from_slice(
+                        pkt_line(format!("ng {} {}\n", c.name, e).as_bytes()).as_slice(),
+                    );
+                    continue;
+                }
+            }
             // The `old` value is what the client believed the branch held. If the server moved on
             // since, applying the push would silently discard whatever arrived in between, which is
             // the one outcome a version control server must never produce. A new branch sends zeros.
@@ -794,8 +834,8 @@ pub fn receive_pack_allowing(
                 if c.old != zero {
                     let was = before
                         .iter()
-                        .find(|(b, _)| b == &branch)
-                        .and_then(|(_, sha)| sha.clone());
+                        .find(|(b, _, _)| b == &branch)
+                        .and_then(|(_, sha, _)| sha.clone());
                     if let Some(was) = was {
                         if was != c.old {
                             out.extend_from_slice(
@@ -857,8 +897,8 @@ pub fn receive_pack_allowing(
             if c.old != zero {
                 let was = before
                     .iter()
-                    .find(|(b, _)| b == &branch)
-                    .and_then(|(_, sha)| sha.clone());
+                    .find(|(b, _, _)| b == &branch)
+                    .and_then(|(_, sha, _)| sha.clone());
                 if let Some(was) = was {
                     if was != c.old {
                         out.extend_from_slice(
@@ -1104,7 +1144,7 @@ mod tests {
         body.extend_from_slice(payload);
         body.extend_from_slice(b"0000");
 
-        let reply = receive_pack_allowing(&d, &body, None).expect("a deletion needs no pack");
+        let reply = receive_pack_allowing(&d, &body, None, "tester").expect("a deletion needs no pack");
         let text = String::from_utf8_lossy(&reply);
         assert!(text.contains("ok refs/heads/gone"), "reply: {}", text);
 
@@ -1152,7 +1192,7 @@ mod tests {
         body.extend_from_slice(payload);
         body.extend_from_slice(b"0000");
 
-        let reply = receive_pack_allowing(&d, &body, None).unwrap();
+        let reply = receive_pack_allowing(&d, &body, None, "tester").unwrap();
         let text = String::from_utf8_lossy(&reply);
         assert!(text.contains("ng refs/heads/only"), "reply: {}", text);
         assert!(text.contains("last branch"), "reply: {}", text);

@@ -1,6 +1,7 @@
 //! Access control for the HTTP remote.
 //!
-//! Two roles: a read token may clone and pull, a write token may also push. A
+//! Three roles: read may clone and pull, approve may also sign off a change to a protected branch,
+//! write may also push. A
 //! token may also carry a comma-separated list of path globs; a write that
 //! touches a path outside that list is refused. When the server has no tokens
 //! configured it refuses to bind to anything except a loopback address, so an
@@ -10,9 +11,15 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 /// What a token is allowed to do.
+///
+/// Ordered, because the check is `role >= needed` and that shape only works if every step is a step
+/// up. `Approve` sits between: a reviewer reads and signs off, and does not write. Giving a reviewer
+/// a write token so it can approve is how a review gate becomes a formality, because the same
+/// credential can then push the thing it is reviewing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Role {
     Read,
+    Approve,
     Write,
 }
 
@@ -330,10 +337,10 @@ fn parse_scope(s: &str) -> Vec<String> {
 }
 
 fn parse_role(s: &str) -> Role {
-    if s.trim().eq_ignore_ascii_case("write") {
-        Role::Write
-    } else {
-        Role::Read
+    match s.trim().to_ascii_lowercase().as_str() {
+        "write" => Role::Write,
+        "approve" => Role::Approve,
+        _ => Role::Read,
     }
 }
 

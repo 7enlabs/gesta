@@ -58,3 +58,36 @@ measurement should replace the rules with it; the shape of the output stays the 
 It also does not decide anything. `review` shows a band and a threshold filters the
 list. Landing a change without a person reading it is a policy decision that belongs to
 whoever owns the repository, not to this tool.
+
+## A protected branch needs a second credential
+
+A review that a reviewer cannot enforce is advice. `gesta branch protect main` makes it a rule the
+server applies to a push:
+
+```
+gesta branch protect main              # from now on a push to main needs a sign-off
+gesta changeset approve cs1a2b3c --by reviewer
+gesta changeset approvals cs1a2b3c     # who signed, in order
+gesta branch protect main --unset      # back to normal
+```
+
+The role `approve` may read and sign off and may **not** write. That separation is the point. A
+repository where the reviewer holds a write token turns the gate into a formality, because the same
+credential can push the thing it just approved.
+
+An approval from the pusher does not count. `check_push` compares the signer against the name behind
+the pushing token and refuses when they match, so a change needs a reader who is somebody else.
+
+A push that fails the gate leaves the branch where it was. This was the first thing the test found:
+the import moves the branch as it creates changesets, so refusing only the `ok` line produced a push
+that git reported as rejected and that had landed anyway. The refusal now puts the previous head back,
+and `bench/branch_protect.py` reads the branch from the server after the refusal rather than trusting
+the message.
+
+A server running without tokens calls every pusher `anonymous`, and an anonymous pusher cannot be told
+apart from a reviewer. A protected branch therefore refuses such a push and says to add a token, which
+is the honest answer rather than accepting an approval nobody can check.
+
+`bench/branch_protect.py` drives a real git client against a real server for six checks: refused with
+no approval, the branch did not move, refused when the pusher approved its own change, allowed when
+another name did, and an unprotected branch needs none of it.

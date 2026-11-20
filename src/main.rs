@@ -3,6 +3,7 @@
 //! Server-side changesets, content-addressed compressed objects, derived blame
 //! and history, three-way merge, remote sync, and an operation log for undo.
 
+mod approval;
 mod attributes;
 mod backup;
 mod audit;
@@ -590,6 +591,27 @@ enum ChangesetCmd {
         #[arg(long)]
         key: Option<String>,
     },
+    /// Sign off a changeset so it may be pushed to a protected branch
+    ///
+    /// The approval names who signed it, and a protected branch refuses a push whose only approval is
+    /// from the credential doing the pushing.
+    Approve {
+        id: String,
+        /// Who is signing off. A reviewer's name, not the author's.
+        #[arg(long, default_value = "reviewer")]
+        by: String,
+    },
+    /// Show who has signed off on a changeset
+    Approvals { id: String },
+    /// Find the changeset that holds a given git commit
+    ///
+    /// A commit imported from git has a changeset id of its own, and the two names are not derivable
+    /// from one another. Naming the changeset for a commit therefore needs this lookup.
+    Find {
+        /// The git commit id, full or abbreviated
+        #[arg(long)]
+        commit: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -693,6 +715,13 @@ enum BranchCmd {
         author: String,
     },
     Info { name: String },
+    /// Protect a branch so a push to it needs a sign-off from another credential
+    Protect {
+        name: String,
+        /// Remove the protection instead of adding it
+        #[arg(long)]
+        unset: bool,
+    },
     /// Report what a merge would conflict on, without touching anything
     Conflicts {
         source: String,
@@ -1010,6 +1039,9 @@ fn run() -> ZResult<()> {
         Cmd::Log { limit, oneline, .. } => cli::cmd_log(limit, oneline),
         Cmd::Changeset { sub } => match sub {
             ChangesetCmd::Sign { id, key } => cli::cmd_sign(&id, key.as_deref()),
+            ChangesetCmd::Approve { id, by } => cli::cmd_approve(&id, &by),
+            ChangesetCmd::Approvals { id } => cli::cmd_approvals(&id),
+            ChangesetCmd::Find { commit } => cli::cmd_changeset_for_commit(&commit),
             ChangesetCmd::Create { message, author, paths, session, intent } => {
                 let session = session.or_else(|| std::env::var("GESTA_SESSION").ok());
                 cli::cmd_changeset_create_paths(
@@ -1097,6 +1129,7 @@ fn run() -> ZResult<()> {
             BranchCmd::Delete { name } => cli::cmd_branch_delete(&name),
             BranchCmd::Merge { source, target, author } => cli::cmd_branch_merge(&source, &target, &author),
             BranchCmd::Info { name } => cli::cmd_branch_info(&name),
+            BranchCmd::Protect { name, unset } => cli::cmd_branch_protect(&name, unset),
             BranchCmd::Conflicts { source, target } => cli::cmd_merge_preview(&source, &target),
         },
         Cmd::Remote { sub } => match sub {

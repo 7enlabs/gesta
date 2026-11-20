@@ -172,6 +172,16 @@ pub fn init_schema(conn: &Connection) -> ZResult<()> {
             created_at  INTEGER NOT NULL,
             from_branch TEXT
         );
+        -- A protected branch refuses a write that no approve token has signed off. The refusal lives
+        -- beside the push rather than in a hook, because a hook is a program an operator has to
+        -- install, and a gate nobody installs is not a gate.
+        CREATE TABLE IF NOT EXISTS approvals (
+            changeset_id TEXT NOT NULL,
+            branch       TEXT NOT NULL,
+            signer       TEXT NOT NULL,
+            created_at   INTEGER NOT NULL,
+            PRIMARY KEY (changeset_id, signer)
+        );
         CREATE TABLE IF NOT EXISTS tags (
             name         TEXT PRIMARY KEY,
             changeset_id TEXT NOT NULL,
@@ -389,6 +399,8 @@ pub fn migrate(conn: &Connection) -> ZResult<bool> {
     if !table_columns(conn, "changesets")?.iter().any(|c| c == "parent2") {
         conn.execute_batch("ALTER TABLE changesets ADD COLUMN parent2 TEXT")?;
     }
+    // A branch is unprotected by default, which is what every repository created before this is.
+    ensure_column(conn, "branches", "protected", "INTEGER NOT NULL DEFAULT 0")?;
     init_schema(conn)?;
     // Migration ran, so the caller has to re-read the schema it cached. The value was always true
     // here; `changed` tracked columns added along the way and nothing read it.

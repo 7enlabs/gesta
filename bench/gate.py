@@ -3242,6 +3242,20 @@ def main():
                     proc.kill()
                 _shv.rmtree(d, ignore_errors=True)
 
+    if want("branch-protect"):
+        # A review gate either holds over a real push or it is decoration. This drives a real git
+        # client against a real server: refused with no approval, refused when the pusher approved its
+        # own change, allowed when another name did.
+        r = sh_out(
+            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'branch_protect.py')}",
+            cwd=ZF_DIR,
+        )
+        record(
+            "a protected branch refuses a push until another credential approves it",
+            r[0] == 0 and "6/6 protected-branch checks pass" in r[1],
+            (r[1] or "")[-400:],
+        )
+
     if want("fetch-negotiate"):
         # A fetch after the first one names the commits it holds. A server that ignores that list
         # sends the whole repository again and still looks correct, so this counts bytes on the wire

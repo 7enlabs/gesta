@@ -1809,6 +1809,97 @@ pub fn cmd_branch_delete(name: &str) -> ZResult<()> {
     Ok(())
 }
 
+/// Protect a branch, or stop protecting it.
+///
+/// The gate is a row on the branch plus an approval per changeset, and both live in the store, so a
+/// clone carries them. A hook file would be simpler and would also be something an operator has to
+/// install and keep installed.
+pub fn cmd_branch_protect(name: &str, unset: bool) -> ZResult<()> {
+    let (_root, conn) = open_repo()?;
+    if crate::store::branch_head(&conn, name).is_err() {
+        return Err(bad(format!("no such branch: {}{}", name, branch_names(&conn))));
+    }
+    if !crate::approval::set_protected(&conn, name, !unset)? {
+        return Err(bad(format!("no such branch: {}", name)));
+    }
+    if unset {
+        println!("{} is no longer protected; a push to it needs no approval", name);
+    } else {
+        println!(
+            "{} is protected: a push to it now needs a sign-off from a credential other than the one pushing",
+            name
+        );
+        println!("sign off a changeset with: gesta changeset approve <id> --by <reviewer>");
+    }
+    Ok(())
+}
+
+/// Sign off a changeset.
+pub fn cmd_approve(id: &str, by: &str) -> ZResult<()> {
+    let (_root, conn) = open_repo()?;
+    let branch: String = conn
+        .query_row(
+            "SELECT COALESCE(branch, 'main') FROM changesets WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .map_err(|_| bad(format!("no such changeset: {}", id)))?;
+    crate::approval::approve(&conn, id, &branch, by)?;
+    let signers = crate::approval::approvers(&conn, id)?;
+    println!("{} approved by {} (approvals: {})", id, by, signers.join(", "));
+    if crate::approval::is_protected(&conn, &branch)? && signers.len() == 1 {
+        // Worth saying here rather than at the push: a single approval is enough only if the pusher
+        // is a different credential, and that is the thing people get wrong.
+        println!(
+            "note: {} is protected, so this approval counts only for a push from a different credential than {}",
+            branch, by
+        );
+    }
+    Ok(())
+}
+
+/// Print the changeset that holds a git commit.
+///
+/// Matched on a prefix rather than the whole id: a person reading `git log` has the short form, and
+/// asking them to fetch the long one is the reason a lookup gets skipped.
+pub fn cmd_changeset_for_commit(commit: &str) -> ZResult<()> {
+    let (_root, conn) = open_repo()?;
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "SELECT id, COALESCE(git_commit, '') FROM changesets
+             WHERE git_commit IS NOT NULL AND git_commit LIKE ?1
+             ORDER BY created_at DESC LIMIT 1",
+            rusqlite::params![format!("{}%", commit)],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok();
+    match row {
+        Some((id, full)) => println!("{} {}", id, full),
+        None => {
+            return Err(bad(format!(
+                "no changeset holds a commit starting with {}; a commit that arrived by git push is imported only when the push is accepted",
+                commit
+            )))
+        }
+    }
+    Ok(())
+}
+
+/// Show who signed off on a changeset.
+pub fn cmd_approvals(id: &str) -> ZResult<()> {
+    let (_root, conn) = open_repo()?;
+    let signers = crate::approval::approvers(&conn, id)?;
+    if signers.is_empty() {
+        println!("{} has no approvals", id);
+        return Ok(());
+    }
+    println!("{} approved by:", id);
+    for s in signers {
+        println!("  {}", s);
+    }
+    Ok(())
+}
+
 /// Print the conflicts of a merge attempt as JSON.
 pub fn cmd_branch_merge_json(source: &str, target: &str, author: &str) -> ZResult<()> {
     let (root, conn) = open_repo()?;
@@ -2345,6 +2436,7 @@ pub fn dispatch_branch_text(sub: crate::BranchCmd) -> ZResult<()> {
         crate::BranchCmd::Delete { name } => cmd_branch_delete(&name),
         crate::BranchCmd::Merge { source, target, author } => cmd_branch_merge(&source, &target, &author),
         crate::BranchCmd::Info { name } => cmd_branch_info(&name),
+        crate::BranchCmd::Protect { name, unset } => cmd_branch_protect(&name, unset),
         crate::BranchCmd::Conflicts { source, target } => cmd_merge_preview(&source, &target),
     }
 }

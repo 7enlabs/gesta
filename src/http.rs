@@ -854,7 +854,7 @@ pub fn route(
             });
             let allowed: Option<&dyn Fn(&str) -> bool> =
                 check.as_ref().map(|f| f as &dyn Fn(&str) -> bool);
-            match crate::gitserver::receive_pack_allowing(root, &req.body, allowed) {
+            match crate::gitserver::receive_pack_allowing(root, &req.body, allowed, &who) {
                 Ok(bytes) => {
                     log_access(root, &who, "git-receive-pack", p, &format!("{} bytes", bytes.len()));
                     Response::ok_with_type(bytes, "application/x-git-receive-pack-result")
