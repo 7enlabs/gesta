@@ -1301,6 +1301,26 @@ pub fn cmd_serve(
     let (root, _conn) = open_repo()?;
     let auth = auth::Auth::from_entries(&read_auth_file(&root)?);
 
+    // The audit collector is configured by two entries in `.gesta/audit-url` and
+    // `.gesta/audit-token`, so a collector that moves is a file edit rather than a flag on every
+    // command. The token lives in its own file so the URL, which proxies log, never carries it.
+    let forward = {
+        let url_path = crate::repo_dir(&root).join("audit-url");
+        match std::fs::read_to_string(&url_path) {
+            Ok(url) if !url.trim().is_empty() => {
+                let token = std::fs::read_to_string(crate::repo_dir(&root).join("audit-token"))
+                    .ok()
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty());
+                Some(crate::audit_forward::Forwarder::start(
+                    url.trim().to_string(),
+                    token,
+                ))
+            }
+            _ => None,
+        }
+    };
+
     // Without the tls feature the flags still parse, so the error names the
     // cause. A build that silently ignores --tls would be the worst outcome: the
     // operator would believe the port is encrypted.
@@ -1312,9 +1332,11 @@ pub fn cmd_serve(
     }
 
     match tls {
-        None => http::serve(root, bind.to_string(), port, auth),
+        None => http::serve(root, bind.to_string(), port, auth, forward),
         #[cfg(feature = "tls")]
         Some("self-signed") => {
+            let forward = forward.clone();
+            let _ = &forward;
             // A generated certificate is for a private network. Writing it under
             // The repository directory keeps it with the code and out of a changeset,
             // since that directory is never tracked.

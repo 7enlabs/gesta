@@ -76,6 +76,16 @@ no delta, no v2, no ref deletion.
   stream. Raising the zlib level changes nothing (47.3 MB at level 6, 47.2 at level 9).
 
 
+## Unreleased
+
+### Forwarding the audit record
+
+- `gesta serve` posts each audit line to a collector configured in `.gesta/audit-url`, with the bearer
+  token in `.gesta/audit-token` so the URL never carries a credential.
+- Delivery is queued and drained on a background thread: a dead collector cannot slow a request, and a
+  full queue is counted rather than grown.
+- `bench/audit_e2e.py` runs the real server against a real collector.
+
 ## 0.7.0, 2026-11-20
 
 ### A branch as a drive, and packs that delta

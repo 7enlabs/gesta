@@ -3242,6 +3242,20 @@ def main():
                     proc.kill()
                 _shv.rmtree(d, ignore_errors=True)
 
+    if want("audit-forward"):
+        # The record is a local file, which cannot answer "what happened across the fleet". A forwarder
+        # posts each event to a collector, and this runs the real server against a real one: the
+        # request, the auth decision, the file write, the queue and the POST as one path.
+        r = sh_out(
+            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'audit_e2e.py')}",
+            cwd=ZF_DIR,
+        )
+        record(
+            "an audit line reaches a collector across a socket",
+            r[0] == 0 and "4/4 audit checks pass" in r[1],
+            (r[1] or "")[-400:],
+        )
+
     if want("request-audit"):
         # A refusals-only log is the point: an audit that records only successes answers "was this
         # token used" and never "was it tried". The format also has to survive a reason that holds a

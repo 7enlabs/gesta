@@ -75,6 +75,19 @@ pub struct Event<'a> {
 /// failure is printed once to stderr so an operator who looks sees it.
 #[allow(dead_code)]
 pub fn record(root: &std::path::Path, event: &Event) {
+    record_with(root, event, None)
+}
+
+/// `record`, and also hand the line to a forwarder when one is configured.
+///
+/// The local file is written first and unconditionally. A collector being down must not cost the
+/// record on the machine that produced it, and the file is what an operator reads when the collector
+/// is the thing that broke.
+pub fn record_with(
+    root: &std::path::Path,
+    event: &Event,
+    forward: Option<&crate::audit_forward::Forwarder>,
+) {
     let path = crate::repo_dir(root).join("audit.log");
     let mut fields: Vec<(&str, String)> = vec![
         ("at", crate::clock::format_rfc3339(crate::clock::unix_now())),
@@ -102,6 +115,12 @@ pub fn record(root: &std::path::Path, event: &Event) {
         if f.write_all(line.as_bytes()).is_err() {
             eprintln!("audit log is not writable: {}", path.display());
         }
+    }
+
+    // After the file, never instead of it. The send does not block, so a slow collector cannot slow a
+    // request, and a full queue is counted by the forwarder rather than raised here.
+    if let Some(f) = forward {
+        let _ = f.send(&line);
     }
 }
 

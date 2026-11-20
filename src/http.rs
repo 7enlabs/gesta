@@ -452,7 +452,9 @@ pub fn serve_tls(
         std::thread::spawn(move || {
             match crate::tls::accept(stream, cfg) {
                 Ok(tls) => {
-                    let _ = handle_tls_connection(tls, &root, &auth, &auth_path);
+                    // TLS serving does not forward audit lines yet: the collector is reached over plain HTTP
+                    // on a private network, and a TLS listener is a different deployment.
+                    let _ = handle_tls_connection(tls, &root, &auth, &auth_path, None);
                 }
                 Err(e) => eprintln!("tls handshake failed: {}", e),
             }
@@ -467,6 +469,7 @@ fn handle_tls_connection(
     root: &Path,
     auth: &std::sync::Mutex<Auth>,
     auth_path: &Path,
+    forward: Option<&crate::audit_forward::Forwarder>,
 ) -> ZResult<()> {
     let resp = match read_request_generic(&mut stream) {
         Ok(req) => {
@@ -483,7 +486,7 @@ fn handle_tls_connection(
                     g.clone()
                 }
             };
-            route(root, &req, &snapshot)
+            route(root, &req, &snapshot, forward)
         }
         Err(e) => Response::error(400, "Bad Request", e.to_string()),
     };
@@ -495,7 +498,13 @@ fn handle_tls_connection(
     Ok(())
 }
 
-pub fn serve(root: PathBuf, bind: String, port: u16, auth: Auth) -> ZResult<()> {
+pub fn serve(
+    root: PathBuf,
+    bind: String,
+    port: u16,
+    auth: Auth,
+    forward: Option<crate::audit_forward::Forwarder>,
+) -> ZResult<()> {
     // The auth file, so a token removed while the server runs stops working without a restart.
     // Built here rather than taken as an argument: the caller already read this file to build the
     // Auth, and passing the path as well would let the two disagree.
@@ -520,6 +529,9 @@ pub fn serve(root: PathBuf, bind: String, port: u16, auth: Auth) -> ZResult<()> 
     } else {
         println!("access: open, loopback only");
     }
+    if forward.is_some() {
+        println!("audit: forwarding to the configured collector");
+    }
     println!("press Ctrl-C to stop");
 
     // The repository is opened per request: SQLite in WAL mode handles
@@ -527,6 +539,9 @@ pub fn serve(root: PathBuf, bind: String, port: u16, auth: Auth) -> ZResult<()> 
     let auth_path = Arc::new(auth_path);
     let root = Arc::new(root);
     let auth = Arc::new(std::sync::Mutex::new(auth));
+    // Shared rather than moved: every connection thread hands its events to the same queue, and the
+    // forwarder is Clone for exactly this shape.
+    let forward = Arc::new(forward);
     for incoming in listener.incoming() {
         let stream = match incoming {
             Ok(s) => s,
@@ -535,8 +550,9 @@ pub fn serve(root: PathBuf, bind: String, port: u16, auth: Auth) -> ZResult<()> 
         let root = Arc::clone(&root);
         let auth = Arc::clone(&auth);
         let auth_path = Arc::clone(&auth_path);
+        let forward = Arc::clone(&forward);
         std::thread::spawn(move || {
-            let _ = handle_connection(stream, &root, &auth, &auth_path);
+            let _ = handle_connection(stream, &root, &auth, &auth_path, forward.as_ref().as_ref());
         });
     }
     Ok(())
@@ -547,6 +563,7 @@ fn handle_connection(
     root: &Path,
     auth: &std::sync::Mutex<Auth>,
     auth_path: &Path,
+    forward: Option<&crate::audit_forward::Forwarder>,
 ) -> ZResult<()> {
     stream.set_read_timeout(Some(Duration::from_secs(60)))?;
     let resp = match read_request(&mut stream) {
@@ -564,7 +581,7 @@ fn handle_connection(
                     g.clone()
                 }
             };
-            route(root, &req, &snapshot)
+            route(root, &req, &snapshot, forward)
         }
         Err(e) => Response::error(400, "Bad Request", e.to_string()),
     };
@@ -630,7 +647,12 @@ fn read_request_generic<S: Read>(stream: &mut S) -> ZResult<Request> {
 
 /// Dispatch one request. Kept separate from socket code so routes and access
 /// control can be tested without a network.
-pub fn route(root: &Path, req: &Request, auth: &Auth) -> Response {
+pub fn route(
+    root: &Path,
+    req: &Request,
+    auth: &Auth,
+    forward: Option<&crate::audit_forward::Forwarder>,
+) -> Response {
     let path = req.path.trim_end_matches('/');
 
     // Health is open so a monitor can tell the process is alive without a
@@ -686,7 +708,7 @@ pub fn route(root: &Path, req: &Request, auth: &Auth) -> Response {
                     record_allowed = true;
                 }
                 Some(crate::auth::AuthOutcome::Expired(name)) => {
-                    crate::audit::record(
+                    crate::audit::record_with(
                         root,
                         &crate::audit::Event {
                             who: &name,
@@ -696,6 +718,7 @@ pub fn route(root: &Path, req: &Request, auth: &Auth) -> Response {
                             reason: "token expired",
                             remote: None,
                         },
+                        forward,
                     );
                     return Response::error(
                         401,
@@ -706,7 +729,7 @@ pub fn route(root: &Path, req: &Request, auth: &Auth) -> Response {
                 Some(crate::auth::AuthOutcome::Granted(g)) => {
                     // A real token asking for more than it has. The name is recorded because this is
                     // a misconfiguration worth finding, not an attack worth hiding.
-                    crate::audit::record(
+                    crate::audit::record_with(
                         root,
                         &crate::audit::Event {
                             who: &g.name,
@@ -716,6 +739,7 @@ pub fn route(root: &Path, req: &Request, auth: &Auth) -> Response {
                             reason: &format!("needs {:?}, token is {:?}", needed, g.role),
                             remote: None,
                         },
+                        forward,
                     );
                     return Response::error(
                         403,
@@ -728,7 +752,7 @@ pub fn route(root: &Path, req: &Request, auth: &Auth) -> Response {
                     // per client. It costs an attacker 200 ms per attempt.
                     // Recorded before the sleep, so a flood of guesses leaves one line each rather
                     // than a file that grows only after the attacker gives up.
-                    crate::audit::record(
+                    crate::audit::record_with(
                         root,
                         &crate::audit::Event {
                             who: "anonymous",
@@ -738,6 +762,7 @@ pub fn route(root: &Path, req: &Request, auth: &Auth) -> Response {
                             reason: "missing or invalid token",
                             remote: None,
                         },
+                        forward,
                     );
                     std::thread::sleep(std::time::Duration::from_millis(200));
                     return Response::error(
@@ -753,7 +778,7 @@ pub fn route(root: &Path, req: &Request, auth: &Auth) -> Response {
     // Written after the auth decision and before the work, so a request that is about to run appears
     // in the record even if it then fails part way.
     if record_allowed {
-        crate::audit::record(
+        crate::audit::record_with(
             root,
             &crate::audit::Event {
                 who: &who,
@@ -763,6 +788,7 @@ pub fn route(root: &Path, req: &Request, auth: &Auth) -> Response {
                 reason: "",
                 remote: None,
             },
+            forward,
         );
     }
 
@@ -1355,7 +1381,7 @@ mod tests {
             body: vec![],
             authorization: None,
         };
-        let resp = route(Path::new("/tmp/does-not-matter"), &req, &Auth::from_entries(&[]));
+        let resp = route(Path::new("/tmp/does-not-matter"), &req, &Auth::from_entries(&[]), None);
         assert_eq!(resp.status, 405);
     }
 
@@ -1368,7 +1394,7 @@ mod tests {
             body: vec![],
             authorization: None,
         };
-        let resp = route(Path::new("/tmp/does-not-matter"), &req, &Auth::from_entries(&[]));
+        let resp = route(Path::new("/tmp/does-not-matter"), &req, &Auth::from_entries(&[]), None);
         assert_eq!(resp.status, 405);
     }
 
@@ -1381,7 +1407,7 @@ mod tests {
             body: vec![],
             authorization: None,
         };
-        let resp = route(Path::new("/tmp/does-not-matter"), &req, &Auth::from_entries(&[]));
+        let resp = route(Path::new("/tmp/does-not-matter"), &req, &Auth::from_entries(&[]), None);
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, b"ok".to_vec());
     }

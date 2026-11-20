@@ -425,6 +425,34 @@ Five gate steps run against a real mount:
 | and the listing carries the size the store recorded |
 | and a write is refused rather than silently dropped |
 
+### Forwarding the record
+
+The audit record is a file, which answers "what happened on this machine" and cannot answer "what
+happened across the fleet" without somebody reading every file. `gesta serve` now posts each event to a
+collector as it is written, so a refusal is visible while it is still worth acting on.
+
+Configured by two files rather than flags, because a collector that moves should be a file edit and not
+a change to every command that starts a server:
+
+- `.gesta/audit-url` holds the URL.
+- `.gesta/audit-token` holds the bearer token, in its own file so the URL, which every proxy logs, never
+  carries a credential.
+
+Three properties decide whether this is safe to run in production, and each is a test:
+
+| property | why | how it is checked |
+|---|---|---|
+| a request never waits for the network | a slow collector must not slow a served request | 50 sends against a dead port finish in under 200 ms |
+| a full queue is counted, not grown | an unbounded queue is a memory leak with a security-shaped name | the depth is bounded and `send` reports the drop |
+| the token is not in the URL | a URL is logged everywhere it passes | the end-to-end test asserts the header and the absence from the URL |
+
+The local file is written first and unconditionally. A collector being down must not cost the record on
+the machine that produced it, because the file is what an operator reads when the collector is the thing
+that broke.
+
+`bench/audit_e2e.py` runs the real server against a real collector: a refused request, a served one, the
+token on the wire, and the token absent from the URL.
+
 What is genuinely left:
 
 - Avoid loading cache rows for paths the walk will not visit. The two passes are separate today, so a
