@@ -2974,6 +2974,67 @@ def main():
                 f"{ratio:.2f}x for 10x the files ({small:.1f} -> {large:.1f} ms)",
             )
 
+    if want("status-ratio"):
+        # The comparison to git is the project's headline claim, and it was once assembled out of two
+        # separate runs plus a run in the wrong directory. This checks that the script which measures
+        # it refuses bad inputs and reports the shape it promises.
+        import tempfile as _tf_sr
+
+        d = _tf_sr.mkdtemp(prefix="gate-ratio-")
+        sh(f"{ZF} init", cwd=d)
+        for i in range(60):
+            with open(os.path.join(d, f"f{i}.txt"), "w") as fh:
+                fh.write(f"file {i}\n")
+        out = sh_out(f'{ZF} changeset create "seed" --author b --json', cwd=d)[1]
+        seed = _jsonw(out).get("changeset") if _jsonw(out) else None
+        if seed:
+            sh(f"{ZF} changeset commit {seed}", cwd=d)
+
+        gd = _tf_sr.mkdtemp(prefix="gate-ratio-git-")
+        sh("git init -q -b main && git config user.email a@b.c && git config user.name g", cwd=gd)
+        for i in range(60):
+            with open(os.path.join(gd, f"f{i}.txt"), "w") as fh:
+                fh.write(f"file {i}\n")
+        sh("git add -A && git commit -qm seed", cwd=gd)
+
+        # The script needs a settled tree: a file written moments ago is re-read by design.
+        import time as _t_sr
+
+        _t_sr.sleep(2.5)
+        r = sh_out(
+            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'status_vs_git.py')} "
+            f"--dir {d} --git-dir {gd} --rounds 5",
+            cwd=ZF_DIR,
+        )
+        text = r[1]
+        got_ratio = re.search(r"ratio: ([0-9.]+)x", text)
+        record(
+            "the comparison to git is produced by one script that runs both tools",
+            got_ratio is not None,
+            got_ratio.group(0) if got_ratio else text[-200:],
+        )
+        # And it must refuse a directory that is not the kind of repository it was told to expect.
+        bad = sh_out(
+            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'status_vs_git.py')} "
+            f"--dir {d} --git-dir {d} --rounds 3",
+            cwd=ZF_DIR,
+        )
+        # sh_out returns (returncode, stdout); the refusal goes to stderr, so it is captured here.
+        refusal = subprocess.run(
+            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'status_vs_git.py')} "
+            f"--dir {d} --git-dir {d} --rounds 3",
+            shell=True, cwd=ZF_DIR, capture_output=True, text=True,
+        )
+        record(
+            "and it refuses to time a directory that is not a git repository",
+            "not a git repository" in (refusal.stderr + refusal.stdout),
+            (refusal.stderr + refusal.stdout).strip()[:120],
+        )
+        import shutil as _sh_sr
+
+        _sh_sr.rmtree(d, ignore_errors=True)
+        _sh_sr.rmtree(gd, ignore_errors=True)
+
     if want("request-audit"):
         # A refusals-only log is the point: an audit that records only successes answers "was this
         # token used" and never "was it tried". The format also has to survive a reason that holds a

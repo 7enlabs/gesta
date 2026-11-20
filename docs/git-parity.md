@@ -311,6 +311,28 @@ directory.
 path is what found it: `committed_tree` was 41 ms, the scan 234 ms, and the rest of `diff_worktree` 67
 ms of which most was that redundant stat.
 
+### Reading these numbers
+
+Absolute times moved between runs on the same machine, by more than some of the changes measured here.
+The same binary reported 279, 239 and 216 ms on three runs an hour apart with the machine idle, and a
+binary run from the bind mount rather than from `/tmp` was 50% slower. Two comparison mistakes were
+made from that before it was noticed: a ratio assembled out of two separate runs, and an `git status`
+timed in a directory that was not a git repository, which returns in 2 ms.
+
+`bench/status_vs_git.py` is the answer. It alternates the two tools round by round so drift hits both,
+refuses to run unless both directories are repositories of the kind it expects, copies the binary off
+the bind mount, and prints the median with p10 and p90. Every ratio in this file is meant to come from
+a run of it.
+
+Two runs of it, an hour apart:
+
+| | gesta median | git median | ratio |
+|---|---:|---:|---:|
+| run 1 | 214.5 ms | 58.1 ms | 3.69x |
+| run 2 | 215.3 ms | 58.8 ms | 3.66x |
+
+Those agree, which the numbers assembled by hand did not.
+
 What is genuinely left:
 
 - Avoid loading cache rows for paths the walk will not visit. The two passes are separate today, so a
