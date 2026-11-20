@@ -3,8 +3,9 @@
 Every entry here comes from a commit in this repository, and every version boundary is a commit
 that changed the version in `Cargo.toml`. Nothing is dated by plan: a date is when the work landed.
 
-The project has no git tags. A tag would say "this is a release" and nothing here is published, so
-the version numbers in `Cargo.toml` are the only boundary and this file follows them.
+A version boundary is a tag from 0.7.0 onward, and the tag is pushed with a GitHub release whose notes
+are this file's section for that version. Before 0.7.0 there are no tags: those versions were never
+published, so the version numbers in `Cargo.toml` were the only boundary.
 
 ## How to read this
 
@@ -74,6 +75,21 @@ no delta, no v2, no ref deletion.
 - The remaining gap is cross-file compression, measured at 1.50x by joining the objects into one
   stream. Raising the zlib level changes nothing (47.3 MB at level 6, 47.2 at level 9).
 
+
+## 0.7.0, 2026-11-20
+
+### A branch as a drive, and packs that delta
+
+- `gesta mount X:` presents a branch through WinFSP without a checkout. Read-only, because a write to a
+  branch that is not checked out is a merge policy and not a filesystem call.
+- The pack this server writes carries git deltas. On this project's history: 6633 to 1700 KiB, 6.65x
+  git's pack to 1.70x, with git fsck clean and every object rebuilding byte for byte.
+- Delta chains are capped at 50, which is git's own limit. A cap of 8 was tried and made the pack
+  larger, because git's own pack of this history reaches 34 levels.
+- The first build of this project on Windows. The Windows SDK and LLVM were missing, and Smart App
+  Control blocked every cargo build script until it was turned off.
+- `status` at 100000 files went from 388 to 274 ms across this release, and the comparison with git is
+  now produced by one script that runs both tools rather than assembled from separate runs.
 
 ## 0.6.0, 2026-11-18
 
