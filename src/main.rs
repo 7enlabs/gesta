@@ -30,6 +30,7 @@ mod impact;
 mod hooks;
 mod http;
 mod json;
+mod keyring;
 #[cfg(feature = "regex")]
 mod leak;
 mod mcp;
@@ -789,6 +790,20 @@ enum KeyCmd {
         #[arg(long)]
         path: Option<String>,
     },
+    /// Replace the active signing key, archiving the old one instead of deleting it
+    ///
+    /// A signature names the public key it was made with, so nothing has to be re-signed. The old
+    /// private key is kept because a disputed signature is worth being able to check by hand.
+    Rotate {
+        /// Where to write the new key; defaults to the one in use
+        #[arg(long)]
+        path: Option<String>,
+        /// Report what would happen without touching a file
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show the keys this repository has used and which one is active
+    List,
 }
 
 #[derive(Subcommand)]
@@ -1224,6 +1239,8 @@ fn run() -> ZResult<()> {
         Cmd::Gc => cli_remote::cmd_gc(),
         Cmd::Key { sub } => match sub {
             KeyCmd::Generate { path } => cli::cmd_key_generate(path.as_deref()),
+            KeyCmd::Rotate { path, dry_run } => cli::cmd_key_rotate(path.as_deref(), dry_run),
+            KeyCmd::List => cli::cmd_key_list(),
         },
         Cmd::Verify { id, key } => cli::cmd_verify(id.as_deref(), key.as_deref()),
         Cmd::Stats => cli_remote::cmd_stats(),

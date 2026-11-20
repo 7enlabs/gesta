@@ -3242,6 +3242,19 @@ def main():
                     proc.kill()
                 _shv.rmtree(d, ignore_errors=True)
 
+    if want("key-rotate"):
+        # A rotation that invalidates history is worse than no rotation: the person rotating
+        # believes they improved things. This signs, rotates, and verifies the old signature.
+        r = sh_out(
+            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'key_rotate.py')}",
+            cwd=ZF_DIR,
+        )
+        record(
+            "a key rotation keeps every old signature verifiable",
+            r[0] == 0 and "7/7 key rotation checks pass" in r[1],
+            (r[1] or "")[-400:],
+        )
+
     if want("submodule"):
         # A submodule checkout holds another repository's files. If the parent walk records them,
         # another project's content lands in this history, which is the failure nested

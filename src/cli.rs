@@ -1172,10 +1172,103 @@ pub fn cmd_key_generate(path: Option<&str>) -> ZResult<()> {
         None => crate::sign::default_key_path(),
     };
     let key = crate::sign::SigningKey::generate(&path)?;
+    // Recorded here as well as on rotation: a repository that never rotates still has to be able to
+    // answer "which keys were ours", and a record that starts at the first rotation answers for half
+    // the history.
+    if let Ok((root, _)) = open_repo() {
+        crate::keyring::record_active(&root, &key.public_hex(), &key.path, crate::now())?;
+    }
     println!("created a signing key: {}", key.path.display());
     println!("public key: {}", key.public_hex());
     println!();
     println!("Give that public key to anyone who should verify your changesets.");
+    Ok(())
+}
+
+/// Replace the active signing key, archiving the one in use.
+///
+/// Nothing is re-signed. A signature names the public key it was made with, so an old changeset keeps
+/// verifying against the old key for as long as that public key is known. The archive exists for the
+/// case a person cannot reconstruct: a signature is disputed and the private half has to be found.
+pub fn cmd_key_rotate(path: Option<&str>, dry_run: bool) -> ZResult<()> {
+    let (root, _conn) = open_repo()?;
+    let target = match path {
+        Some(p) => std::path::PathBuf::from(p),
+        None => crate::sign::default_key_path(),
+    };
+
+    // What is active now, from the record rather than from the file: a key made with `--path` lives
+    // somewhere else, and rotating the default path would leave the real key in place and sign with
+    // the wrong one for as long as nobody looked.
+    let current = crate::keyring::active(&root)?;
+    let current_path = current
+        .as_ref()
+        .map(|r| std::path::PathBuf::from(&r.path))
+        .unwrap_or_else(|| target.clone());
+
+    if dry_run {
+        println!("would archive: {}", current_path.display());
+        println!("would create:  {}", target.display());
+        if let Some(r) = &current {
+            println!("the key in use is {}", &r.public_hex[..16.min(r.public_hex.len())]);
+        } else {
+            println!("no key is recorded as active");
+        }
+        return Ok(());
+    }
+
+    // The old key moves aside before the new one is made, so a crash between the two steps leaves an
+    // archived key and no active one rather than two keys claiming the same filename.
+    let mut archived = None;
+    if current_path.exists() {
+        let public = match crate::sign::SigningKey::load(&current_path) {
+            Ok(k) => k.public_hex(),
+            Err(_) => crate::keyring::active(&root)?
+                .map(|r| r.public_hex)
+                .unwrap_or_default(),
+        };
+        if !public.is_empty() {
+            archived = Some(crate::keyring::archive(&current_path, &public)?);
+        }
+    }
+
+    let key = crate::sign::SigningKey::generate(&target)?;
+    crate::keyring::record_active(&root, &key.public_hex(), &key.path, crate::now())?;
+
+    if let Some(a) = archived {
+        println!("archived the old key to {}", a.display());
+    }
+    println!("created a new signing key: {}", key.path.display());
+    println!("public key: {}", key.public_hex());
+    println!();
+    println!("Changesets signed with the old key still verify: a signature names the key it was made with.");
+    println!("Give the new public key to anyone who should verify your changesets.");
+    Ok(())
+}
+
+/// Show the keys this repository has used.
+pub fn cmd_key_list() -> ZResult<()> {
+    let (root, _conn) = open_repo()?;
+    let records = crate::keyring::read_records(&root)?;
+    if records.is_empty() {
+        println!("no signing keys recorded for this repository");
+        println!("create one with: gesta key generate");
+        return Ok(());
+    }
+    for r in records {
+        let state = match r.retired_at {
+            None => "active".to_string(),
+            // A unix second, printed as one. There is no date formatter in this tree and a
+            // rotation is read once, so a number that can be compared is enough.
+            Some(t) => format!("retired at {} (unix)", t),
+        };
+        let present = if std::path::Path::new(&r.path).exists() {
+            ""
+        } else {
+            "  (file is gone)"
+        };
+        println!("{}  {}  {}{}", &r.public_hex[..16.min(r.public_hex.len())], state, r.path, present);
+    }
     Ok(())
 }
 
@@ -1212,7 +1305,7 @@ pub fn cmd_sign(id: &str, key_path: Option<&str>) -> ZResult<()> {
 
 /// Check a changeset's signature.
 pub fn cmd_verify(id: Option<&str>, key_hex: Option<&str>) -> ZResult<()> {
-    let (_root, conn) = open_repo()?;
+    let (root, conn) = open_repo()?;
     let id = match id {
         Some(i) => i.to_string(),
         None => {
@@ -1253,6 +1346,20 @@ pub fn cmd_verify(id: Option<&str>, key_hex: Option<&str>) -> ZResult<()> {
     };
     crate::sign::verify(&public, &id, &message, &author, parent.as_deref(), &signature)?;
     println!("{} verifies against {}", id, public);
+    // The maths checking out answers "was this signed by that key", not "is that key ours".
+    // Any signature verifies against its own public half, so a key this repository has never
+    // used is worth naming: it means the changeset arrived from somewhere else.
+    if !crate::keyring::was_ours(&root, &public)? {
+        if let Some(a) = crate::keyring::active(&root)? {
+            if a.public_hex != public {
+                println!(
+                    "note: {} is not a key this repository has recorded; the active one is {}",
+                    &public[..16.min(public.len())],
+                    &a.public_hex[..16.min(a.public_hex.len())]
+                );
+            }
+        }
+    }
     Ok(())
 }
 
