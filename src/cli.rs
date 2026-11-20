@@ -2923,6 +2923,99 @@ fn read_hidden(prompt: &str) -> ZResult<String> {
     }
 }
 
+/// Handle `gesta submodule`.
+pub fn cmd_submodule(sub: crate::SubmoduleCmd, json: bool) -> ZResult<()> {
+    use crate::SubmoduleCmd;
+    match sub {
+        SubmoduleCmd::Add { path, url, branch } => {
+            let (root, _conn) = open_repo()?;
+            let mut subs = crate::submodule::read_gitmodules(&root)?;
+            if subs.contains_key(&path) {
+                return Err(bad(format!("submodule {} already exists", path)));
+            }
+            subs.insert(path.clone(), crate::submodule::Submodule {
+                path: path.clone(),
+                url: url.clone(),
+                branch,
+                commit: None,
+            });
+            crate::submodule::write_gitmodules(&root, &subs)?;
+            println!("added submodule {} -> {}", path, url.clone());
+            println!("run `gesta submodule init` to clone it");
+            Ok(())
+        }
+        SubmoduleCmd::Init => {
+            let (root, _conn) = open_repo()?;
+            let cloned = crate::submodule::submodule_init(&root)?;
+            if cloned.is_empty() {
+                println!("all submodules already initialized");
+            } else {
+                for c in cloned {
+                    println!("cloned {}", c);
+                }
+            }
+            Ok(())
+        }
+        SubmoduleCmd::Update => {
+            let (root, _conn) = open_repo()?;
+            let updated = crate::submodule::submodule_update(&root)?;
+            if updated.is_empty() {
+                println!("all submodules up to date");
+            } else {
+                for u in updated {
+                    println!("updated {}", u);
+                }
+            }
+            Ok(())
+        }
+        SubmoduleCmd::Status => {
+            let (root, _conn) = open_repo()?;
+            let statuses = crate::submodule::submodule_status(&root)?;
+            if json {
+                let parts: Vec<String> = statuses
+                    .iter()
+                    .map(|s| format!(
+                        "{{\"path\":\"{}\",\"commit\":\"{}\",\"pinned\":{},                        \"dirty\":{},                        \"missing\":{}}}",
+                        s.path,
+                        s.commit,
+                        s.pinned.as_ref().map(|p| format!("\"{}\"", p)).unwrap_or("null".to_string()),
+                        s.dirty,
+                        s.missing
+                    ))
+                    .collect();
+                println!("[{}]", parts.join(","));
+                return Ok(());
+            }
+            if statuses.is_empty() {
+                println!("no submodules");
+                return Ok(());
+            }
+            for s in &statuses {
+                let state = if s.missing {
+                    "missing"
+                } else if s.dirty {
+                    "dirty"
+                } else if !crate::submodule::matches_pin(s.pinned.as_deref(), &s.commit) {
+                    "behind"
+                } else {
+                    "clean"
+                };
+                let pin = s.pinned.as_deref().unwrap_or("unpinned");
+                println!("{}  {}  {}  {}", s.path, s.commit, pin, state);
+            }
+            Ok(())
+        }
+        SubmoduleCmd::Sync => {
+            let (root, _conn) = open_repo()?;
+            let subs = crate::submodule::read_gitmodules(&root)?;
+            for sub in subs.values() {
+                println!("{}  {}", sub.path, sub.url);
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Handle `gesta secret`.
 pub fn cmd_secret(sub: crate::SecretCmd) -> ZResult<()> {
     use crate::SecretCmd;

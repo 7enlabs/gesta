@@ -48,6 +48,7 @@ mod sign;
 mod sigv4;
 mod sparse;
 mod stash;
+mod submodule;
 mod subrepo;
 mod store;
 #[cfg(feature = "tls")]
@@ -548,7 +549,12 @@ enum Cmd {
     /// Report storage statistics
     Stats,
     /// Ignore patterns
-    Ignore {
+
+    /// Manage git submodules
+    Submodule {
+        #[command(subcommand)]
+        sub: SubmoduleCmd,
+    },    Ignore {
         #[command(subcommand)]
         sub: IgnoreCmd,
     },
@@ -643,6 +649,27 @@ enum SubCmd {
     Remove { path: String },
 }
 
+#[derive(Subcommand)]
+enum SubmoduleCmd {
+    /// Add a submodule from a remote URL
+    Add {
+        /// Path where the submodule will be checked out
+        path: String,
+        /// Remote URL to clone from
+        url: String,
+        /// Branch to track (optional)
+        #[arg(long)]
+        branch: Option<String>,
+    },
+    /// Initialize submodules: clone missing ones at their pinned commit
+    Init,
+    /// Update submodules to their pinned commit
+    Update,
+    /// Show status of submodules
+    Status,
+    /// Sync submodule URLs from .gitmodules to the local config
+    Sync,
+}
 #[derive(Subcommand)]
 enum StashCmd {
     /// Save the working tree aside and reset it to the head
@@ -1030,6 +1057,7 @@ fn run() -> ZResult<()> {
         Cmd::CherryPick { source, onto, author } => cli::cmd_cherry_pick(&source, onto.as_deref(), &author),
         Cmd::Bisect { sub } => cli::cmd_bisect(sub),
         Cmd::Sub { sub } => cli::cmd_sub(sub, json),
+        Cmd::Submodule { sub } => cli::cmd_submodule(sub, json),
         Cmd::Stash { sub } => cli::cmd_stash(sub, json),
         Cmd::Hook { sub } => cli::cmd_hook(sub, json),
         Cmd::Init { bare } => cli::cmd_init(bare),

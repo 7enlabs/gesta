@@ -77,7 +77,11 @@ pub fn scan_with_cache(
 
     // Subrepository checkouts are excluded before the walk, so their files are
     // never recorded in this repository's cache either.
-    let excluded = crate::subrepo::excluded_paths(conn);
+    // A submodule checkout holds another repository's files and must never be recorded as
+    // this repository's own. Both kinds of pointer are excluded here so the walk has one list.
+    let root_ref = root;
+    let mut excluded = crate::subrepo::excluded_paths(conn);
+    excluded.extend(crate::submodule::excluded_paths(root_ref));
     let walked = crate::worktree::scan_files_excluding(root, rules, &excluded)?;
     for (rel, meta) in walked {
         // Nanoseconds, not seconds. Two writes inside one second with the same

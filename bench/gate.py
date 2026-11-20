@@ -3242,6 +3242,20 @@ def main():
                     proc.kill()
                 _shv.rmtree(d, ignore_errors=True)
 
+    if want("submodule"):
+        # A submodule checkout holds another repository's files. If the parent walk records them,
+        # another project's content lands in this history, which is the failure nested
+        # repositories are dangerous for.
+        r = sh_out(
+            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'submodule.py')}",
+            cwd=ZF_DIR,
+        )
+        record(
+            "a submodule clones at its pin and the parent never records its files",
+            r[0] == 0 and "6/6 submodule checks pass" in r[1],
+            (r[1] or "")[-400:],
+        )
+
     if want("token-rotate"):
         # A rotation that changes the file but leaves the old credential usable is worse than none,
         # because the operator believes the leak is closed. This asks a running server.

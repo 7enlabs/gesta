@@ -115,7 +115,10 @@ pub fn diff_worktree(conn: &Connection, root: &Path, branch: &str) -> ZResult<Wo
     // which was a second stat per file, and it cloned and sorted all 100,000 keys to do it.
     // A subrepository whose checkout is missing is not a deletion either: reporting it as one would
     // let a single commit remove the pointer to the child.
-    let subs = crate::subrepo::excluded_paths(conn);
+    // Submodule checkouts are excluded for the same reason a subrepository checkout is:
+    // their files belong to another repository.
+    let mut subs = crate::subrepo::excluded_paths(conn);
+    subs.extend(crate::submodule::excluded_paths(root));
     for path in committed.keys() {
         if !scope.contains(path) {
             continue;

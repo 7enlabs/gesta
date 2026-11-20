@@ -78,6 +78,15 @@ no delta, no v2, no ref deletion.
 
 ## Unreleased
 
+### Submodules
+
+- `gesta submodule add <path> <url>` writes a `.gitmodules` entry; `init` clones missing ones at
+  their pin and `update` moves them to it. A pin may be the short id from `git log`.
+- `submodule status` reports clean, dirty, behind or missing for each one.
+- The parent's walk skips every submodule checkout. Without that, the child's files were recorded
+  as the parent's and a change in the child looked like a change here.
+- `bench/submodule.py` checks all of it, including that the child's files never reach the parent.
+
 ### Rotating a token
 
 - `gesta remote token rotate <name>` replaces the secret and keeps the role, path scope, branch scope
