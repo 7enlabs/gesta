@@ -117,6 +117,11 @@ jobs:
           if (Test-Path $dll) { Copy-Item -Force $dll "$($crate.FullName)\winfsp\bin\" }
           Get-ChildItem "$($crate.FullName)\winfsp" -Recurse -Name | Select-Object -First 8
 
+      - name: Fetch dependencies
+        shell: bash
+        run: |
+          cargo fetch --locked
+
       - name: Build
         shell: bash
         run: |
