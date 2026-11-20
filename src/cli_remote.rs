@@ -1470,9 +1470,11 @@ pub fn cmd_token_rotate(selector: &str, hashed: bool) -> ZResult<()> {
     let mut hit = None;
     for (i, line) in entries.iter().enumerate() {
         let f: Vec<&str> = line.split(':').collect();
-        let name = if f.first() == Some(&"sha256") { f.get(2) } else { f.get(2) };
-        let secret = if f.first() == Some(&"sha256") { f.get(1) } else { f.get(0) };
-        let matches = name.map(|n| *n == selector).unwrap_or(false)
+        // `sha256:<digest>:<role>:<name>...` puts the name at index 2 like the clear form does; the
+        // secret is the only field whose position differs.
+        let name = f.get(2).copied();
+        let secret = if f.first() == Some(&"sha256") { f.get(1).copied() } else { f.first().copied() };
+        let matches = name.map(|n| n == selector).unwrap_or(false)
             || secret.map(|s| s.ends_with(selector)).unwrap_or(false);
         if matches {
             hit = Some(i);
