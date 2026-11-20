@@ -471,13 +471,38 @@ build the committed tree              30 ms
 compare the two                        19 ms
 ```
 
-The walk is a floor rather than a bug: 68 ms of it is one `stat` per file, which is a syscall and the
-same one `git status` makes. Attempts that did not move it, each measured:
+The stat was the largest single item and it was serial, which is the difference from `git status`:
+git preloads the index across threads and this did not. The walk is now two phases. Readdir collects
+path and relative name; the stats then run over four threads in contiguous slices, with no lock on
+the hot path.
+
+Measured on this container, 100,003 files:
+
+```
+threads   stat phase
+      1       78 ms
+      2       43 ms
+      4       24 ms
+      8       34 ms
+```
+
+Four is where the curve flattens. Past it the cost is thread handoff on very short items, and a queue
+with a lock measured 31 ms against the 24 that a slice per thread gets.
+
+A whole `status` went from 205.6 ms to 183.4 ms, and the ratio against `git status` from 3.63x to
+3.19x. The remaining gap is two 100,003 row reads, which is row parsing rather than anything a thread
+can help with: a joined read answering both in one statement measured 105.9 ms against 106.1 for two
+separate ones.
+
+Attempts that did not move it, each measured:
 
 - `PRAGMA mmap_size` and a larger page cache: 49.1 ms against 50.5 ms for the same 100,003 row read.
   The cost is parsing rows and allocating strings, not reading pages.
 - Reserving the committed-tree map from the table's own count: 219.7 ms to 205.6 ms for a whole
   `status`. Real, and small.
+- `FxHash` instead of the default hasher on the path maps: 208.0 ms against 205.6, inside the spread
+  of the runs. Reverted. The keys are strings this program built and compared with itself, so the
+  collision resistance bought nothing, and replacing it bought nothing either.
 
 What is still open, and why it is a rewrite rather than a patch:
 
@@ -488,7 +513,7 @@ What is still open, and why it is a rewrite rather than a patch:
 - Avoid loading cache rows for paths the walk will not visit. The two passes are separate today, so a
   tree where most cached paths are gone pays for rows it never reads.
 
-The number above is what the tool does today: 3.63x `git status` on the same tree.
+The number above is what the tool does today: 3.19x `git status` on the same tree, down from 3.63x.
 
 ### Many writers in one checkout
 

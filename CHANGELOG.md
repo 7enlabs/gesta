@@ -78,6 +78,15 @@ no delta, no v2, no ref deletion.
 
 ## Unreleased
 
+### The tree scan stats in parallel
+
+- The walk collects paths, then stats them over four threads in contiguous slices. At 100,003
+  files the stat phase went from 78 ms to 24 ms and a whole `status` from 205.6 ms to 183.4 ms,
+  which against `git status` is 3.63x to 3.19x.
+- Below 512 files the walk keeps its serial loop: the thread spawn costs more than the stats.
+- `bench/stat_parallel.rs` is the measurement that chose four threads. Two left the filesystem
+  idle, eight spent more on handoff, and a locked queue measured 31 ms against 24.
+
 ### multi_ack_detailed
 
 - The server advertises `multi_ack_detailed` and answers it: an `ACK <sha> common` per commit
