@@ -3607,12 +3607,28 @@ def main():
                         pass
             return total
 
+        # What the store holds, which is what grouping is meant to reduce. The file size is a weak
+        # proxy: a schema, its indexes and a page floor dominate it, so a 40% reduction in stored
+        # bytes showed up as 2.7% of the file here and as 0.0% on the CI runner, whose SQLite had no
+        # page to reclaim. Measuring the bytes the store actually keeps is the claim under test.
+        def data_bytes(conn):
+            obj: int = conn.execute("SELECT COALESCE(SUM(LENGTH(content)), 0) FROM objects").fetchone()[0]
+            grp: int = conn.execute(
+                "SELECT COALESCE(SUM(LENGTH(packed)), 0) FROM object_groups"
+            ).fetchone()[0]
+            return obj + grp
+
         before = db_bytes()
+        conn0 = __import__("sqlite3").connect(os.path.join(d, ".gesta", "gesta.db"))
+        data_before = data_bytes(conn0)
+        conn0.close()
+
         sh(f"{ZF} gc", cwd=d)
         conn = __import__("sqlite3").connect(os.path.join(d, ".gesta", "gesta.db"))
         conn.execute("VACUUM")
         grouped = conn.execute("SELECT COUNT(*) FROM objects WHERE group_id IS NOT NULL").fetchone()[0]
         groups = conn.execute("SELECT COUNT(*) FROM object_groups").fetchone()[0]
+        data_after = data_bytes(conn)
         conn.close()
         after = db_bytes()
 
@@ -3622,9 +3638,17 @@ def main():
             f"{grouped} object(s) in {groups} group(s)",
         )
         record(
-            "and the store gets smaller",
-            after < before,
-            f"{before} bytes before, {after} after, {100 * (before - after) / max(before, 1):.1f}% smaller",
+            "and the store keeps fewer bytes",
+            data_after < data_before,
+            f"{data_before} stored bytes before, {data_after} after, "
+            f"{100 * (data_before - data_after) / max(data_before, 1):.1f}% less",
+        )
+        # The file itself must not get bigger. A pack that saves bytes in the table and grows the
+        # database would be a saving on paper only.
+        record(
+            "and the file did not grow",
+            after <= before,
+            f"{before} bytes before, {after} after",
         )
 
         # Every object has to read back exactly. A pack that saves space and loses a byte is a
