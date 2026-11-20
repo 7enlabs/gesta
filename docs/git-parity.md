@@ -355,6 +355,33 @@ added or deleted, silently. Four percent is not worth that, so the maps stay.
 Recording the arithmetic matters more than the decision. The next person to read this will wonder why a
 free `ORDER BY` was not used, and the answer is a measurement, not a preference.
 
+### Deleting a branch through the protocol
+
+The server advertised `report-status` and nothing else, with a comment saying `delete-refs` was not
+advertised because a deletion reported a result the code never produced. That comment described the
+state of the code and not a decision: a push carrying no objects answered `ok` for every command
+without doing anything, so git printed `- [deleted] throwaway` and `git ls-remote` still listed it.
+
+Two things were wrong and both were the same kind of wrong:
+
+- The empty-pack path answered `ok` for commands it never read.
+- With that fixed, deleting the last branch emptied the repository of branches, and every command that
+  needs one then reports `there are no branches yet`. A client is not in a position to judge that, so
+  the server refuses it the way it refuses deleting a checked-out branch locally.
+
+`delete-refs` is now advertised, a zero new id is a deletion, the `old` value is checked before
+anything is removed, a token scoped to other branches is refused, and the last branch survives. The
+gate runs a real git client through all of it:
+
+| step |
+|---|
+| a client sees every branch the server has |
+| deleting a branch through git is accepted |
+| and the branch is gone from the server, not just from the client |
+| and the other branches are untouched |
+| one branch is left after deleting the others |
+| and the only branch left cannot be deleted |
+
 What is genuinely left:
 
 - Avoid loading cache rows for paths the walk will not visit. The two passes are separate today, so a

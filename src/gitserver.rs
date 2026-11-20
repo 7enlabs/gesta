@@ -338,10 +338,93 @@ pub fn receive_pack_allowing(
         return Ok(flush());
     }
     if pack.is_empty() {
-        // A push with no objects is a ref deletion or a move to a commit already held. Nothing to
-        // unpack, and git's own reader would reject an empty file.
+        // A push with no objects is a ref deletion, or a move to a commit the server already holds.
+        // Nothing to unpack, and git's own reader would reject an empty file.
+        //
+        // This path used to answer `ok` for every command without doing anything, which is the worst
+        // answer a server can give: git printed `- [deleted] branch` and the branch was still there.
+        // A deletion is now performed here, and only refs the caller may write are touched.
+        let served = crate::http::open_repo_for_serve(root)?;
+        let before = served.refs;
         let mut out = pkt_line(b"unpack ok\n");
         for c in &commands {
+            let branch = c.name.strip_prefix("refs/heads/").unwrap_or(&c.name);
+            if refused.iter().any(|r| r == branch) {
+                out.extend_from_slice(
+                    pkt_line(
+                        format!("ng {} this token may not write that branch\n", c.name).as_bytes(),
+                    )
+                    .as_slice(),
+                );
+                continue;
+            }
+            let zero = "0".repeat(40);
+            if c.new == zero {
+                // The client believes the branch holds `old`. Deleting something that moved on
+                // would discard whatever arrived in between, so a mismatch is refused.
+                let was = before
+                    .iter()
+                    .find(|(b, _)| b == branch)
+                    .map(|(_, sha)| sha.clone());
+                match was {
+                    None => {
+                        out.extend_from_slice(
+                            pkt_line(
+                                format!("ng {} no such branch on the server\n", c.name).as_bytes(),
+                            )
+                            .as_slice(),
+                        );
+                    }
+                    Some(was) if c.old != zero && was != c.old => {
+                        out.extend_from_slice(
+                            pkt_line(
+                                format!(
+                                    "ng {} the branch moved on the server since the client last fetched\n",
+                                    c.name
+                                )
+                                .as_bytes(),
+                            )
+                            .as_slice(),
+                        );
+                    }
+                    Some(_) => {
+                        let conn = crate::store::open_db(root)?;
+                        // A repository with no branches holds history nothing points at. `status`
+                        // reports "there are no branches yet" and every command that needs a branch
+                        // refuses, which is a repository nobody can work in. Deleting the last
+                        // branch is refused here, the way deleting the checked-out branch is refused
+                        // locally.
+                        let count: i64 =
+                            conn.query_row("SELECT COUNT(*) FROM branches", [], |r| r.get(0))?;
+                        if count <= 1 {
+                            out.extend_from_slice(
+                                pkt_line(
+                                    format!(
+                                        "ng {} this is the last branch; deleting it would leave a repository with no branch to work on\n",
+                                        c.name
+                                    )
+                                    .as_bytes(),
+                                )
+                                .as_slice(),
+                            );
+                            continue;
+                        }
+                        conn.execute(
+                            "DELETE FROM branches WHERE name = ?1",
+                            rusqlite::params![branch],
+                        )?;
+                        conn.execute(
+                            "DELETE FROM branch_tree WHERE branch = ?1",
+                            rusqlite::params![branch],
+                        )?;
+                        crate::ops::record(&conn, "push delete", Some(&c.name), None)?;
+                        out.extend_from_slice(&pkt_line(format!("ok {}\n", c.name).as_bytes()));
+                    }
+                }
+                continue;
+            }
+            // Not a deletion and nothing to unpack: the new id is a commit the server already holds,
+            // which happens when a client re-pushes a branch that is already there.
             out.extend_from_slice(&pkt_line(format!("ok {}\n", c.name).as_bytes()));
         }
         out.extend_from_slice(&flush());
@@ -513,6 +596,74 @@ pub fn receive_pack_allowing(
             // since, applying the push would silently discard whatever arrived in between, which is
             // the one outcome a version control server must never produce. A new branch sends zeros.
             let zero = "0".repeat(40);
+
+            // A new id of all zeroes is a deletion. The `old` check below still runs first, so a
+            // client deleting a branch it has not fetched is refused rather than deleting whatever
+            // arrived in between.
+            if c.new == zero {
+                if c.old != zero {
+                    let was = before
+                        .iter()
+                        .find(|(b, _)| b == &branch)
+                        .and_then(|(_, sha)| sha.clone());
+                    if let Some(was) = was {
+                        if was != c.old {
+                            out.extend_from_slice(
+                                pkt_line(
+                                    format!(
+                                        "ng {} the branch moved on the server since the client last fetched\n",
+                                        c.name
+                                    )
+                                    .as_bytes(),
+                                )
+                                .as_slice(),
+                            );
+                            continue;
+                        }
+                    }
+                }
+                let known: Option<String> = conn
+                    .query_row(
+                        "SELECT name FROM branches WHERE name = ?1",
+                        rusqlite::params![branch],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                if known.is_none() {
+                    out.extend_from_slice(
+                        pkt_line(
+                            format!("ng {} no such branch on the server\n", c.name).as_bytes(),
+                        )
+                        .as_slice(),
+                    );
+                    continue;
+                }
+                let count: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM branches", [], |r| r.get(0))?;
+                if count <= 1 {
+                    out.extend_from_slice(
+                        pkt_line(
+                            format!(
+                                "ng {} this is the last branch; deleting it would leave a repository with no branch to work on\n",
+                                c.name
+                            )
+                            .as_bytes(),
+                        )
+                        .as_slice(),
+                    );
+                    continue;
+                }
+                conn.execute("DELETE FROM branches WHERE name = ?1", rusqlite::params![branch])?;
+                // The derived tree goes with the branch: leaving it would make a branch created
+                // later under the same name start from a tree nobody wrote.
+                conn.execute(
+                    "DELETE FROM branch_tree WHERE branch = ?1",
+                    rusqlite::params![branch],
+                )?;
+                crate::ops::record(&conn, "push delete", Some(&c.name), None)?;
+                out.extend_from_slice(&pkt_line(format!("ok {}\n", c.name).as_bytes()));
+                continue;
+            }
             if c.old != zero {
                 let was = before
                     .iter()
@@ -589,11 +740,13 @@ pub fn advertise_receive(root: &std::path::Path) -> ZResult<Vec<u8>> {
         let zero = "0".repeat(40);
         lines.push((zero.clone(), format!("{} capabilities^{{}}\0report-status", zero)));
     }
-    // `report-status` is the only capability this server honours. Advertising `delete-refs` would
-    // mean a push that deletes a branch reports a result this code never produces.
-    out.extend_from_slice(&ref_advertisement(&lines, &["report-status"]));
+    // `delete-refs` is advertised because a push whose new id is all zeroes is a deletion and this
+    // server now performs it. Advertising a capability the code does not honour is worse than not
+    // advertising it: a client would send a deletion and be told the push succeeded.
+    out.extend_from_slice(&ref_advertisement(&lines, &["report-status", "delete-refs"]));
     Ok(out)
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -679,5 +832,107 @@ mod tests {
         }
         assert_eq!(size, 300, "the size varint did not survive");
         assert_eq!(kind, 3, "the type is a blob");
+    }
+    #[test]
+    fn a_push_that_deletes_a_ref_is_a_deletion_not_a_success() {
+        // A push with no pack used to answer `ok` for every command without touching anything, so git
+        // printed `- [deleted] branch` and the branch was still on the server. This checks the empty
+        // pack path against a real repository rather than against the bytes.
+        let d = std::env::temp_dir().join(format!("gesta-delref-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join(".gesta")).unwrap();
+        let conn = crate::store::open_db(&d).unwrap();
+        crate::store::init_schema(&conn).unwrap();
+        // A branch has to point at a commit to appear in the served refs, which is the same shape a
+        // client sees after fetching. A branch with a NULL head is not advertised, and a commit needs
+        // the branch to exist first.
+        conn.execute(
+            "INSERT INTO branches(name, head, created_at, from_branch) VALUES('main', NULL, 0, NULL)",
+            [],
+        )
+        .unwrap();
+        std::fs::write(d.join("a.txt"), "one\n").unwrap();
+        let first = crate::repo::create_changeset(&conn, &d, "first", "t").unwrap().unwrap();
+        crate::repo::commit_one(&conn, &first.id).unwrap();
+        let head: String = conn
+            .query_row("SELECT head FROM branches WHERE name = 'main'", [], |r| r.get(0))
+            .unwrap();
+        for name in ["keep", "gone"] {
+            conn.execute(
+                "INSERT INTO branches(name, head, created_at, from_branch) VALUES(?1, ?2, 0, NULL)",
+                rusqlite::params![name, head],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        // The client believes `gone` is at a commit it never fetched, so pass zeros for `old`, which is
+        // what a client sends when it has not seen the ref.
+        let zero = "0".repeat(40);
+        let cmd = format!("{} {} refs/heads/gone\0 report-status delete-refs", zero, zero);
+        let mut body = Vec::new();
+        let payload = cmd.as_bytes();
+        body.extend_from_slice(format!("{:04x}", payload.len() + 4).as_bytes());
+        body.extend_from_slice(payload);
+        body.extend_from_slice(b"0000");
+
+        let reply = receive_pack_allowing(&d, &body, None).expect("a deletion needs no pack");
+        let text = String::from_utf8_lossy(&reply);
+        assert!(text.contains("ok refs/heads/gone"), "reply: {}", text);
+
+        let conn = crate::store::open_db(&d).unwrap();
+        let left: Vec<String> = conn
+            .prepare("SELECT name FROM branches ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(left, vec!["keep".to_string(), "main".to_string()], "gone must be deleted");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_last_branch_cannot_be_deleted() {
+        // A repository with no branch reports "there are no branches yet" for every command that
+        // needs one, which is a repository nobody can work in.
+        let d = std::env::temp_dir().join(format!("gesta-lastbr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join(".gesta")).unwrap();
+        let conn = crate::store::open_db(&d).unwrap();
+        crate::store::init_schema(&conn).unwrap();
+        // A commit needs a branch to land on, and `init_schema` does not create one: that is what
+        // `gesta init` does. The branch is renamed afterwards so this test owns the only one.
+        conn.execute(
+            "INSERT INTO branches(name, head, created_at, from_branch) VALUES('main', NULL, 0, NULL)",
+            [],
+        )
+        .unwrap();
+        std::fs::write(d.join("a.txt"), "one\n").unwrap();
+        let first = crate::repo::create_changeset(&conn, &d, "first", "t").unwrap().unwrap();
+        crate::repo::commit_one(&conn, &first.id).unwrap();
+        conn.execute("UPDATE branches SET name = 'only' WHERE name = 'main'", [])
+            .unwrap();
+        drop(conn);
+
+        let zero = "0".repeat(40);
+        let cmd = format!("{} {} refs/heads/only\0 report-status delete-refs", zero, zero);
+        let mut body = Vec::new();
+        let payload = cmd.as_bytes();
+        body.extend_from_slice(format!("{:04x}", payload.len() + 4).as_bytes());
+        body.extend_from_slice(payload);
+        body.extend_from_slice(b"0000");
+
+        let reply = receive_pack_allowing(&d, &body, None).unwrap();
+        let text = String::from_utf8_lossy(&reply);
+        assert!(text.contains("ng refs/heads/only"), "reply: {}", text);
+        assert!(text.contains("last branch"), "reply: {}", text);
+
+        let conn = crate::store::open_db(&d).unwrap();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM branches", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1, "the last branch must still be there");
+
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

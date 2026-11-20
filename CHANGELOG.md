@@ -20,6 +20,8 @@ version is current and freezes when the number changes, so `0.6.0` is a record a
 - `diff --to <branch>` without `--from` compares against that revision's parent instead of the empty
   tree. `--from ""` still asks for the whole tree.
 - `review --json` prints one parseable document instead of text.
+- A push that deletes a branch deletes it. The empty-pack path used to answer `ok` without doing
+  anything, so git printed `- [deleted]` for a branch the server still had.
 - `changeset create --path` limits a snapshot to named paths, so two agents in one checkout do not
   record each other's work under their own name.
 - Measured to 100,000 files: the write stays flat at 13 ms while `git add` plus commit goes from
@@ -74,6 +76,14 @@ no delta, no v2, no ref deletion.
 
 
 ## 0.6.0, 2026-11-18
+
+### Deleting a branch through the protocol
+
+- A push that deletes a branch deletes it. The empty-pack path answered `ok` for every command
+  without doing anything, so git printed `- [deleted] throwaway` for a branch the server still had.
+- `delete-refs` is advertised, a zero new id is a deletion, `old` is checked before anything is
+  removed, a token scoped to other branches is refused, and the last branch cannot be deleted
+  because a repository with no branch refuses every command that needs one.
 
 ### Pricing a task and not just its pass rate
 

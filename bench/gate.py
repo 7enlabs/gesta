@@ -3035,6 +3035,104 @@ def main():
         _sh_sr.rmtree(d, ignore_errors=True)
         _sh_sr.rmtree(gd, ignore_errors=True)
 
+    if want("git-delete-ref"):
+        # A push that deletes a branch must delete it. The empty-pack path once answered `ok` for every
+        # command without doing anything, so git printed `- [deleted]` and the branch was still there,
+        # which is the worst answer a server can give.
+        import tempfile as _tf_dr
+
+        d = _tf_dr.mkdtemp(prefix="gate-delref-")
+        sh(f"{ZF} init", cwd=d)
+        with open(os.path.join(d, "a.txt"), "w") as fh:
+            fh.write("one\n")
+        out = sh_out(f'{ZF} changeset create "first" --author t --json', cwd=d)[1]
+        first = _jsonw(out).get("changeset") if _jsonw(out) else None
+        if first:
+            sh(f"{ZF} changeset commit {first}", cwd=d)
+        sh(f"{ZF} branch create keep", cwd=d)
+        sh(f"{ZF} branch create gone", cwd=d)
+
+        import socket as _sock_dr
+        import time as _tm_dr
+
+        sk = _sock_dr.socket()
+        sk.bind(("127.0.0.1", 0))
+        port = sk.getsockname()[1]
+        sk.close()
+
+        srv = subprocess.Popen(
+            f"{ZF} serve --port {port}", shell=True, cwd=d,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            for _ in range(50):
+                try:
+                    with _sock_dr.create_connection(("127.0.0.1", port), timeout=0.2):
+                        break
+                except OSError:
+                    _tm_dr.sleep(0.1)
+            clone = os.path.join(d, "_clone")
+            sh(f"git clone -q http://127.0.0.1:{port}/git/repo {clone}")
+            before = sh("git ls-remote origin", cwd=clone)[1]
+            record(
+                "a client sees every branch the server has",
+                "refs/heads/keep" in before and "refs/heads/gone" in before,
+                before.replace("\n", " ")[:120],
+            )
+
+            pushed = subprocess.run(
+                "git push origin --delete gone", shell=True, cwd=clone,
+                capture_output=True, text=True,
+            )
+            record(
+                "deleting a branch through git is accepted",
+                "deleted" in (pushed.stdout + pushed.stderr),
+                (pushed.stdout + pushed.stderr).strip().splitlines()[-1][:100] if (pushed.stdout + pushed.stderr).strip() else "",
+            )
+
+            after = sh("git ls-remote origin", cwd=clone)[1]
+            record(
+                "and the branch is gone from the server, not only from the client",
+                "refs/heads/gone" not in after,
+                after.replace("\n", " ")[:120],
+            )
+            record(
+                "and the other branches are untouched",
+                "refs/heads/keep" in after and "refs/heads/main" in after,
+                after.replace("\n", " ")[:120],
+            )
+
+            # The last branch cannot go: a repository with no branch refuses every command that needs
+            # one, which is a repository nobody can work in. Deleting `keep` leaves `main` alone, so
+            # `main` is then the only one and its deletion has to be refused.
+            subprocess.run(
+                "git push origin --delete keep", shell=True, cwd=clone,
+                capture_output=True, text=True,
+            )
+            still = sh("git ls-remote origin", cwd=clone)[1]
+            record(
+                "one branch is left after deleting the others",
+                still.count("refs/heads/") == 1,
+                still.replace("\n", " ")[:120],
+            )
+            last = subprocess.run(
+                "git push origin --delete main", shell=True, cwd=clone,
+                capture_output=True, text=True,
+            )
+            after_last = sh("git ls-remote origin", cwd=clone)[1]
+            record(
+                "and the only branch left cannot be deleted",
+                "last branch" in (last.stdout + last.stderr)
+                and after_last.count("refs/heads/") == 1,
+                (last.stderr or last.stdout).strip().splitlines()[-1][:110] if (last.stdout + last.stderr).strip() else "",
+            )
+        finally:
+            srv.terminate()
+            srv.wait(timeout=10)
+            import shutil as _sh_dr
+
+            _sh_dr.rmtree(d, ignore_errors=True)
+
     if want("request-audit"):
         # A refusals-only log is the point: an audit that records only successes answers "was this
         # token used" and never "was it tried". The format also has to survive a reason that holds a
