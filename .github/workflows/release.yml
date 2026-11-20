@@ -84,6 +84,10 @@ jobs:
           choco install winfsp -y --no-progress
           "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
 
+          # The crate source has to exist before its directory can be written into, and a fresh runner
+          # has an empty registry. This also fronts the download so the build step does not have to.
+          cargo fetch --locked
+
           # winfsp-sys, built without its `system` feature, looks for winfsp/inc and winfsp/lib beside
           # its own crate source. A runtime install does not always carry them, which is what the local
           # build hit: the MSI installed bin/ and no inc/. So the developer files are taken from the
@@ -95,10 +99,12 @@ jobs:
           $dyn = "$extract\DYNAMIC"
           if (-not (Test-Path "$dyn\inc\winfsp\winfsp.h")) { throw "the MSI did not carry winfsp.h" }
 
-          $crate = Get-ChildItem "$env:USERPROFILE\.cargo\registry\src" -Directory |
+          $root = Join-Path $env:USERPROFILE ".cargo\registry\src"
+          if (-not (Test-Path $root)) { throw "no registry cache after cargo fetch: $root" }
+          $crate = Get-ChildItem $root -Directory |
             ForEach-Object { Get-ChildItem $_.FullName -Directory -Filter "winfsp-sys-*" } |
             Select-Object -First 1
-          if (-not $crate) { throw "winfsp-sys is not in the registry cache; run cargo fetch first" }
+          if (-not $crate) { throw "winfsp-sys is not in the registry cache after cargo fetch" }
           Write-Host "placing developer files into $($crate.FullName)\winfsp"
           New-Item -ItemType Directory -Force -Path "$($crate.FullName)\winfsp\inc" | Out-Null
           New-Item -ItemType Directory -Force -Path "$($crate.FullName)\winfsp\lib" | Out-Null
@@ -121,12 +127,14 @@ jobs:
         run: |
           # A release that compiles and cannot start is the failure this step exists for. On Windows
           # the first build needed a DLL beside the binary, which no build error showed.
-          BIN="target/${{ matrix.target }}/release/gesta"
+          BIN="$PWD/target/${{ matrix.target }}/release/gesta"
           if [ "${{ matrix.archive }}" = "zip" ]; then BIN="$BIN.exe"; fi
           "$BIN" --version
+          # `init` takes no path: it creates a repository in the working directory. Passing one is a
+          # usage error, which is what the first run of this step reported instead of a broken binary.
           mkdir -p smoke && cd smoke
-          "$OLDPWD/$BIN" init .
-          "$OLDPWD/$BIN" status
+          "$BIN" init
+          "$BIN" status
 
       - name: Package
         shell: bash
