@@ -78,6 +78,17 @@ no delta, no v2, no ref deletion.
 
 ## Unreleased
 
+### Large objects live beside the database
+
+- An object of 4 MB or more is written to `.gesta/objects/<aa>/<rest>` and its row keeps only
+  the name and size. An inline blob that size is copied by every backup, VACUUM and page read.
+- Both readers ask the sidecar first, so nothing above the store knows which shape an object
+  has. `fsck` reports a sidecar object whose file is missing, which is the one inconsistency
+  the change adds.
+- `gesta show` writes bytes rather than text. It went through the text reader, so showing any
+  binary file failed with a message about UTF-8, which the sidecar test found.
+- `bench/sidecar.py` checks the whole path with a 4.5 MB file.
+
 ### Rotating a signing key
 
 - `gesta key rotate` archives the key in use under a name that names it, then makes a new one.

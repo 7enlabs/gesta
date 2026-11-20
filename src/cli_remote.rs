@@ -685,6 +685,34 @@ pub fn cmd_fsck(prune: bool, worktree: bool) -> ZResult<()> {
         }
     }
 
+    // An object whose row says its body is beside the database, and whose file is not there, reads
+    // as an empty object rather than as missing. That is the one inconsistency the sidecar adds, and
+    // it has to be reported by name or the object is lost quietly.
+    {
+        let outside: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT hash FROM objects WHERE sidecar = 1")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut gone = 0usize;
+        for h in &outside {
+            if !crate::sidecar::holds(&root, h) {
+                if gone < 3 {
+                    println!("MISSING object {} is marked sidecar and has no file", h);
+                }
+                gone += 1;
+            }
+        }
+        if gone > 0 {
+            println!(
+                "MISSING {} of {} sidecar object(s) have no file beside the database",
+                gone,
+                outside.len()
+            );
+            problems += 1;
+        }
+    }
+
     // The maintained tree must equal a rebuild from history. This is the check
     // that makes the derived table safe: a writer that moved a head without
     // refreshing it would make `status` silently report committed files as
@@ -828,7 +856,7 @@ fn count_objects(conn: &rusqlite::Connection) -> ZResult<i64> {
 }
 
 pub fn cmd_stats() -> ZResult<()> {
-    let (_root, conn) = open_repo()?;
+    let (root, conn) = open_repo()?;
     let (raw, stored) = object_store_bytes(&conn)?;
     let objects = count_objects(&conn)?;
     let changesets: i64 = conn.query_row("SELECT COUNT(*) FROM changesets", [], |r| r.get(0))?;
@@ -868,6 +896,17 @@ pub fn cmd_stats() -> ZResult<()> {
         );
     } else {
         println!("deltas:      0");
+    }
+
+    // Objects past the inline threshold live beside the database. A figure that leaves them out
+    // understates the repository by however much of it is large, and a large file is exactly where a
+    // wrong total is noticed.
+    let (outside, outside_bytes) = crate::sidecar::stats(&root);
+    if outside > 0 {
+        println!(
+            "sidecar:     {} object(s), {} bytes beside the database",
+            outside, outside_bytes
+        );
     }
     Ok(())
 }

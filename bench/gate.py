@@ -3242,6 +3242,19 @@ def main():
                     proc.kill()
                 _shv.rmtree(d, ignore_errors=True)
 
+    if want("sidecar"):
+        # A large object in a SQLite row is copied by every operation that touches the page.
+        # Past the threshold it goes beside the database, and every reader has to keep working.
+        r = sh_out(
+            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sidecar.py')}",
+            cwd=ZF_DIR,
+        )
+        record(
+            "a large object leaves the database and still reads back byte for byte",
+            r[0] == 0 and "6/6 sidecar checks pass" in r[1],
+            (r[1] or "")[-400:],
+        )
+
     if want("audit-local"):
         # The record held refusals and served requests. A commit, a sign-off, a rotation and a
         # push were invisible, so an operator saw arrivals and nothing about the work.

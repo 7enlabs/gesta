@@ -26,6 +26,17 @@ pub fn open_db(root: &Path) -> ZResult<Connection> {
     Ok(conn)
 }
 
+/// The repository root, derived from the database file a connection was opened on.
+///
+/// The path is `<root>/.gesta/gesta.db`, so the grandparent of the file is the root. A connection that
+/// was never named a file, as in the unit tests' in-memory database, has no root and returns `None`,
+/// which callers treat as "keep the object inline".
+fn db_root(conn: &Connection) -> Option<std::path::PathBuf> {
+    let path = conn.path()?;
+    let dir = std::path::Path::new(path).parent()?; // .gesta
+    dir.parent().map(|p| p.to_path_buf())            // the repository
+}
+
 /// Is this error SQLite refusing a write because another connection holds the
 /// write lock?
 pub fn is_busy(e: &rusqlite::Error) -> bool {
@@ -95,7 +106,11 @@ pub fn init_schema(conn: &Connection) -> ZResult<()> {
             -- it is in `content`, which is every object in a repository that never ran `gc --pack`.
             group_id   INTEGER,
             offset     INTEGER,
-            length     INTEGER
+            length     INTEGER,
+            -- 1 when the body lives beside the database instead of in `content`. A large object in a
+            -- row is copied by every operation that touches the page, so past the threshold it is a
+            -- file with a row that names it.
+            sidecar    INTEGER NOT NULL DEFAULT 0
         );
         -- One compressed stream holding several objects, so the compressor can see across them.
         -- A zlib stream cannot, and the shared vocabulary in source files is most of what it costs.
@@ -376,6 +391,9 @@ pub fn migrate(conn: &Connection) -> ZResult<bool> {
 
     // The group columns are optional: an object that has none keeps its body in `content` and reads
     // exactly as before, so adding them empty is the whole migration and no data moves.
+    // A repository created before the sidecar existed needs the flag; adding it empty claims no
+    // object is outside, which is exactly right for every object already stored inline.
+    ensure_column(conn, "objects", "sidecar", "INTEGER NOT NULL DEFAULT 0")?;
     for col in [
         "ALTER TABLE objects ADD COLUMN group_id INTEGER",
         "ALTER TABLE objects ADD COLUMN offset INTEGER",
@@ -437,6 +455,22 @@ pub fn put_object_bytes(conn: &Connection, bytes: &[u8]) -> ZResult<String> {
         .optional()?;
     if exists.is_some() {
         return Ok(h);
+    }
+    // A large object goes beside the database and its row keeps only the name and size. An inline
+    // blob of tens of megabytes is copied by every operation that touches the page: a backup, a
+    // VACUUM, a read of one row. The sidecar column is the whole difference and every reader already
+    // goes through get_object_bytes, which asks the sidecar first.
+    if crate::sidecar::is_large(bytes.len()) {
+        if let Some(root) = db_root(conn) {
+            crate::sidecar::write(&root, &h, bytes)?;
+            conn.execute(
+                "INSERT OR IGNORE INTO objects(hash, content, size, compressed, created_at, sidecar)
+                 VALUES(?1, x'', ?2, 0, ?3, 1)",
+                params![h, bytes.len() as i64, now()],
+            )?;
+            return Ok(h);
+        }
+        // No root to place a file beside: fall through to the inline row, which is correct and slower.
     }
     conn.execute(
         "INSERT OR IGNORE INTO objects(hash, content, size, compressed, created_at)
@@ -684,6 +718,13 @@ pub fn get_object_bytes(conn: &Connection, hash: &str) -> ZResult<Vec<u8>> {
             return Ok(body);
         }
     }
+    // A sidecar object has no body in its row. Asked before the row, because the row is present with
+    // an empty body and reading it would answer "empty object" for a large one.
+    if let Some(root) = db_root(conn) {
+        if let Some(bytes) = crate::sidecar::read(&root, hash) {
+            return Ok(bytes);
+        }
+    }
     let row: Option<(Vec<u8>, i64)> = conn
         .query_row(
             "SELECT content, compressed FROM objects WHERE hash = ?1",
@@ -709,6 +750,14 @@ fn read_whole(conn: &Connection, hash: &str) -> ZResult<String> {
     {
         if let Some(body) = crate::pack::read(conn, group, offset, length)? {
             return String::from_utf8(body)
+                .map_err(|e| bad(format!("object {} is not valid UTF-8: {}", hash, e)));
+        }
+    }
+    // A sidecar object keeps its bytes outside. Both readers branch here, because only one of them
+    // knowing about a storage shape is how `show` failed on grouped objects.
+    if let Some(root) = db_root(conn) {
+        if let Some(bytes) = crate::sidecar::read(&root, hash) {
+            return String::from_utf8(bytes)
                 .map_err(|e| bad(format!("object {} is not valid UTF-8: {}", hash, e)));
         }
     }

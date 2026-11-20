@@ -45,6 +45,7 @@ mod rebase;
 mod repo;
 mod s3;
 mod secrets;
+mod sidecar;
 mod sign;
 mod sigv4;
 mod sparse;

@@ -1638,7 +1638,11 @@ pub fn cmd_show(spec: &str) -> ZResult<()> {
                 format!("{} does not exist at {}", path, rev),
             )
         })?;
-    print!("{}", get_object(&conn, &hash)?);
+    // Bytes, not text. `show` on a binary file failed with a message about UTF-8 because it went
+    // through the text reader, and a large binary is exactly the file somebody shows.
+    let bytes = crate::store::get_object_bytes(&conn, &hash)?;
+    use std::io::Write;
+    std::io::stdout().write_all(&bytes)?;
     Ok(())
 }
 
