@@ -481,17 +481,16 @@ pub fn scan_files_excluding(
             if SKIP_DIRS.contains(&name.as_ref()) {
                 continue;
             }
-            // One stat, not two. file_type() plus metadata() were two syscalls
-            // per entry; metadata() already answers whether this is a directory.
-            // DirEntry::metadata does not follow a symlink, which is what
-            // file_type() reported too, so the two agree.
-            // The stat comes first. Deciding from the name alone would be wrong
-            // for a directory whose name matches a file rule: `.DS_Store` as a
-            // directory still has to be pruned, and is_dir is only known after
-            // the stat. Skipping the stat here was a real regression in the first
-            // attempt and is not worth the risk for 6 ms on 8000 files.
-            let meta = match entry.metadata() {
-                Ok(m) => m,
+            // `file_type()` costs nothing: readdir already reported the type, and this just reads it
+            // out of the entry. `metadata()` is a stat per entry, which measured 122 ms over 100,000
+            // files against 21.7 ms for readdir alone. An earlier comment here said metadata cost
+            // nothing beyond readdir, which a measurement in this container contradicts.
+            //
+            // Directories are decided by file_type. A file still needs its metadata, because the
+            // scan compares size and mtime, and a symlink is treated as a file whose stat is taken
+            // without following it, which is what metadata() does.
+            let ftype = match entry.file_type() {
+                Ok(t) => t,
                 Err(_) => continue,
             };
             // One allocation: the prefix, a separator and the name. A `PathBuf` was built here before
@@ -502,8 +501,9 @@ pub fn scan_files_excluding(
                 rel.push('/');
             }
             rel.push_str(&name);
-            let ign = rules.is_ignored(&rel, meta.is_dir());
-            if meta.is_dir() {
+            let is_dir = ftype.is_dir();
+            let ign = rules.is_ignored(&rel, is_dir);
+            if is_dir {
                 if ign {
                     continue;
                 }
@@ -511,12 +511,19 @@ pub fn scan_files_excluding(
                     continue;
                 }
                 stack.push((entry.path(), rel));
-            } else if meta.is_file() {
-                if ign {
-                    continue;
-                }
-                out.push((rel, meta));
+                continue;
             }
+            // Not a directory: a file, a symlink, or a socket. The stat is taken for anything that is
+            // not a directory, and a symlink to a directory is deliberately not followed, which
+            // matches what the metadata call reported before.
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if is_dir || ign || !meta.is_file() {
+                continue;
+            }
+            out.push((rel, meta));
         }
     }
     // Sorted order is not used by any caller. The scan's result becomes a map keyed by relative

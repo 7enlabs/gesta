@@ -240,10 +240,23 @@ Measured A/B on the same tree, two binaries, seven runs each:
 23% faster, and the removed code was doing nothing.
 
 The walk fell to 164 ms, and the Python floor of 186.7 ms was taken to mean the stat calls were no
-longer the cost. That was wrong too: Python's `os.stat` per file carries interpreter overhead the
-tool does not. A floor measured in Rust, doing nothing but `read_dir` and one `stat` per entry over
-the same tree, is **128.5 ms**. So the walk was 1.24x its floor and the remaining 30 ms was the ignore
-rule and the relative path string, not the syscalls.
+longer the cost. That was wrong as well, and two more measurements were needed to get it right:
+
+| walk, same tree, best of three | ms |
+|---|---:|
+| `read_dir` only, no stat at all | 21.7 |
+| `read_dir` plus `file_type()` per entry, stat only files | 122.2 |
+| `read_dir` plus `metadata()` per entry | 118.0 to 223.3 |
+
+So 21.7 ms is not the floor: a scan has to know each file's size and mtime, which is a stat per file,
+and that is 122 ms. `file_type()` is free because readdir already reported the type, and calling
+`metadata()` on a directory is a stat the tool did not need. An earlier comment in the walk said
+`metadata()` "costs nothing beyond what read_dir returned", which the first row contradicts.
+
+Directories are now typed from the directory entry and only files are stat-ed. That saved 8 ms, not
+100, because this tree holds 501 directories among 100,505 entries, so there were only 501 stats to
+remove. The lesson is the one this file keeps recording: the cost of a change is what the measurement
+says it is, and the shape of the tree decides which of the two floors applies.
 
 That measurement also corrected an earlier one. `sorted()` on a list of Python strings costs 8.1 ms,
 and that number was taken to mean the sort was cheap. It was not: the Rust sort compares `PathBuf`
@@ -271,9 +284,10 @@ The first two together, measured against the published binary over 21 interleave
 
 9% faster, 3.88x to 3.52x against `git status`.
 
-Where the 274 ms now goes: 128.5 ms of unavoidable `read_dir` and `stat`, about 30 ms of ignore rule
-and path building, 29 ms loading 100,003 cache rows, 21 ms in the loop that builds the result, and
-under 1 ms pruning. The two largest items left are the floor itself and the cache load.
+Where the 274 ms goes: about 122 ms of stat-ing every file, which no scan can avoid, roughly 37 ms of
+ignore rule and path building, 29 ms loading 100,003 cache rows, 21 ms in the loop that builds the
+result, and under 1 ms pruning. The two largest items left are the stats themselves and the cache
+load.
 
 `HashMap::remove` costs more than `get` plus a clone of a forty byte string, which is the opposite of
 what the count of allocations suggests. That one was measured before it was believed.
