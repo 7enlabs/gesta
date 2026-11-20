@@ -1,0 +1,199 @@
+name: release
+
+# A release that carries only source is a release of a library, and this is a tool: somebody
+# downloading it wants a binary that runs on the machine they have.
+#
+# Every target here builds the same commit and uploads one archive. The matrix is chosen by where the
+# tool is used rather than by what is easy to cross-compile:
+#
+# - linux x86_64 in both gnu and musl. The musl build is static and runs on any distribution, which
+#   matters because a glibc binary from ubuntu-24.04 refuses to start on anything older.
+# - linux aarch64, on a native arm runner rather than under emulation.
+# - macos on both Intel and Apple silicon, because a binary built for one does not run on the other and
+#   Rosetta is not present by default on a fresh machine.
+# - windows x86_64, which needs WinFSP's developer files for the mount feature and LLVM for the bindings.
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      # One target failing must not cancel the others: a broken macOS build is worth knowing about
+      # even when Linux is fine, and cancelling hides which one broke.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+            musl: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            winfsp: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+          rustup default stable
+          rustc --version
+
+      - name: Install what the build needs (linux musl)
+        if: matrix.musl
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools
+          # The musl target links against musl, and the C parts of the tree (bundled sqlite) are
+          # compiled by cc for that target.
+          echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+
+      - name: Install what the build needs (windows)
+        if: matrix.winfsp
+        shell: pwsh
+        run: |
+          # WinFSP ships a runtime installer and the developer files in the same MSI, but the runtime
+          # that is already present on some images has no headers. Installing the official release
+          # gives inc/ and lib/ next to bin/.
+          choco install winfsp -y --no-progress
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+
+          # winfsp-sys, built without its `system` feature, looks for winfsp/inc and winfsp/lib beside
+          # its own crate source. A runtime install does not always carry them, which is what the local
+          # build hit: the MSI installed bin/ and no inc/. So the developer files are taken from the
+          # MSI either way and placed where the crate reads them, which is deterministic.
+          $msi = "$env:TEMP\winfsp.msi"
+          Invoke-WebRequest -Uri "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi" -OutFile $msi
+          $extract = "$env:TEMP\winfsp-extract"
+          Start-Process msiexec -ArgumentList "/a", "`"$msi`"", "/qn", "TARGETDIR=`"$extract`"" -Wait
+          $dyn = "$extract\DYNAMIC"
+          if (-not (Test-Path "$dyn\inc\winfsp\winfsp.h")) { throw "the MSI did not carry winfsp.h" }
+
+          $crate = Get-ChildItem "$env:USERPROFILE\.cargo\registry\src" -Directory |
+            ForEach-Object { Get-ChildItem $_.FullName -Directory -Filter "winfsp-sys-*" } |
+            Select-Object -First 1
+          if (-not $crate) { throw "winfsp-sys is not in the registry cache; run cargo fetch first" }
+          Write-Host "placing developer files into $($crate.FullName)\winfsp"
+          New-Item -ItemType Directory -Force -Path "$($crate.FullName)\winfsp\inc" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$($crate.FullName)\winfsp\lib" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$($crate.FullName)\winfsp\bin" | Out-Null
+          Copy-Item -Recurse -Force "$dyn\inc\*" "$($crate.FullName)\winfsp\inc\"
+          Copy-Item -Force "$dyn\lib\winfsp-x64.lib" "$($crate.FullName)\winfsp\lib\"
+          # The DLL is copied into the crate so winfsp-sys can place it beside the binary if asked;
+          # it is delay-loaded, so the binary runs without it too.
+          $dll = "C:\Program Files (x86)\WinFsp\bin\winfsp-x64.dll"
+          if (Test-Path $dll) { Copy-Item -Force $dll "$($crate.FullName)\winfsp\bin\" }
+          Get-ChildItem "$($crate.FullName)\winfsp" -Recurse -Name | Select-Object -First 8
+
+      - name: Build
+        shell: bash
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Check the binary runs
+        shell: bash
+        run: |
+          # A release that compiles and cannot start is the failure this step exists for. On Windows
+          # the first build needed a DLL beside the binary, which no build error showed.
+          BIN="target/${{ matrix.target }}/release/gesta"
+          if [ "${{ matrix.archive }}" = "zip" ]; then BIN="$BIN.exe"; fi
+          "$BIN" --version
+          mkdir -p smoke && cd smoke
+          "$OLDPWD/$BIN" init .
+          "$OLDPWD/$BIN" status
+
+      - name: Package
+        shell: bash
+        run: |
+          set -e
+          NAME="gesta-$(git describe --tags --always | sed 's/^v//')-${{ matrix.target }}"
+          mkdir -p "dist/$NAME"
+          BIN="target/${{ matrix.target }}/release/gesta"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            cp "$BIN.exe" "dist/$NAME/"
+            cp LICENSE README.md "dist/$NAME/" 2>/dev/null || true
+            (cd dist && 7z a -tzip "$NAME.zip" "$NAME" > /dev/null)
+          else
+            cp "$BIN" "dist/$NAME/"
+            cp LICENSE README.md "dist/$NAME/" 2>/dev/null || true
+            (cd dist && tar -czf "$NAME.tar.gz" "$NAME")
+          fi
+          ls -la dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gesta-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: build
+    # Only on a tag. A dispatch has no release to attach to, and a step that creates one from a
+    # branch name would publish a release nobody named.
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List what was built
+        run: find artifacts -type f | sort
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="${GITHUB_REF_NAME}"
+          # The release is created by hand before this runs, with the notes from CHANGELOG.md. This
+          # step only attaches binaries, so a release's prose stays where a person wrote it.
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "no release for $TAG yet; creating one without notes"
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "gesta ${TAG#v}" --notes ""
+          fi
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 |
+            xargs -0 gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Confirm they are there
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Self-reports are not evidence. The assets are read back from the API, and the step fails
+          # when fewer than six arrived.
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[].name' | sort
+          N=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')
+          echo "assets: $N"
+          test "$N" -ge 6
