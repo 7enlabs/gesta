@@ -1,5 +1,8 @@
 # Build output
 /target
+# A build directory under a scratch crate is still a build directory. The root-anchored rule
+# above let bench/_floor/target into a commit.
+**/target/
 **/*.rs.bk
 
 # Repository state lives in the project directory
