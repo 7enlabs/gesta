@@ -347,9 +347,12 @@ pub fn advertise(root: &std::path::Path) -> ZResult<Vec<u8>> {
         advert.push(("HEAD".to_string(), sha));
     }
     advert.extend(lines);
+    // `multi_ack_detailed` is advertised because the negotiation below now answers it. Advertising a
+    // capability the code did not honour is worse than not advertising it: a client would wait for
+    // ACK lines that never come and stall until its own timeout.
     out.extend_from_slice(&ref_advertisement(
         &advert,
-        &["ofs-delta", "side-band-64k", &symref],
+        &["ofs-delta", "side-band-64k", "multi_ack_detailed", &symref],
     ));
     Ok(out)
 }
@@ -393,6 +396,27 @@ pub fn upload_pack(root: &std::path::Path, body: &[u8]) -> ZResult<Vec<u8>> {
     // Subtracting what the client has is the difference between a fetch that sends the tree and one
     // that sends the change. A `have` the server does not recognise is not an error: git sends them
     // optimistically, and a client can name a commit this server has never seen.
+    //
+    // Under `multi_ack_detailed` the client expects an ACK for each `have` it sent and for the last
+    // common one, in three forms: ACK <sha> common, ACK <sha> ready, and a final ACK <sha>. Only the
+    // final ACK belongs before the pack. The others are what stop the client sending `have`s the
+    // server already has, so they are written here and discarded by a client that did not ask.
+    let mut negotiation_acks: Vec<u8> = Vec::new();
+    if !have.is_empty() {
+        let held = reachable_from(&entries, &have);
+        for h in &have {
+            if held.contains(h) {
+                // The last one in the list is the one the server is ready to serve from.
+                let ready = h == have.last().unwrap_or(h);
+                let line = if ready {
+                    format!("ACK {} ready\n", h)
+                } else {
+                    format!("ACK {} common\n", h)
+                };
+                negotiation_acks.extend_from_slice(&pkt_line(line.as_bytes()));
+            }
+        }
+    }
     let entries = if have.is_empty() {
         entries
     } else {
@@ -407,7 +431,14 @@ pub fn upload_pack(root: &std::path::Path, body: &[u8]) -> ZResult<Vec<u8>> {
         // "Already up to date."
         if kept.is_empty() {
             let mut out = Vec::new();
-            out.extend_from_slice(&pkt_line(b"NAK\n"));
+            if !negotiation_acks.is_empty() {
+                out.extend_from_slice(&negotiation_acks);
+                if let Some(last) = have.last() {
+                    out.extend_from_slice(&pkt_line(format!("ACK {}\n", last).as_bytes()));
+                }
+            } else {
+                out.extend_from_slice(&pkt_line(b"NAK\n"));
+            }
             out.extend_from_slice(&pkt_line(&[1u8]));
             out.extend_from_slice(&flush());
             return Ok(out);
@@ -426,7 +457,17 @@ pub fn upload_pack(root: &std::path::Path, body: &[u8]) -> ZResult<Vec<u8>> {
     // repeating the refs here made git store refs/remotes/origin/main and leave HEAD on master,
     // which is the "remote HEAD refers to nonexistent ref" warning and an empty working tree.
     let mut out = Vec::new();
-    out.extend_from_slice(&pkt_line(b"NAK\n"));
+    // The negotiation lines first, then the answer. A client that sent `have`s and negotiated
+    // multi_ack_detailed reads these to decide what is still missing; a client that did not asked for
+    // none of it and was sent none.
+    if !negotiation_acks.is_empty() {
+        out.extend_from_slice(&negotiation_acks);
+        if let Some(last) = have.last() {
+            out.extend_from_slice(&pkt_line(format!("ACK {}\n", last).as_bytes()));
+        }
+    } else {
+        out.extend_from_slice(&pkt_line(b"NAK\n"));
+    }
     for chunk in pack.chunks(65500) {
         let mut payload = Vec::with_capacity(chunk.len() + 1);
         payload.push(1u8);

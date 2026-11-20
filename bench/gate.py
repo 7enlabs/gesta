@@ -3242,6 +3242,19 @@ def main():
                     proc.kill()
                 _shv.rmtree(d, ignore_errors=True)
 
+    if want("multi-ack"):
+        # A capability the client does not understand fails as a stall or a hung-up connection,
+        # which reads like a broken pack. This drives a real client through clone and fetch.
+        r = sh_out(
+            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'multi_ack.py')}",
+            cwd=ZF_DIR,
+        )
+        record(
+            "a real git client negotiates multi_ack_detailed and still clones and fetches",
+            r[0] == 0 and "6/6 negotiation checks pass" in r[1],
+            (r[1] or "")[-400:],
+        )
+
     if want("sidecar"):
         # A large object in a SQLite row is copied by every operation that touches the page.
         # Past the threshold it goes beside the database, and every reader has to keep working.

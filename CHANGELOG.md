@@ -78,6 +78,14 @@ no delta, no v2, no ref deletion.
 
 ## Unreleased
 
+### multi_ack_detailed
+
+- The server advertises `multi_ack_detailed` and answers it: an `ACK <sha> common` per commit
+  the client has, `ACK <sha> ready` for the last one, then a final `ACK <sha>` before the pack.
+  A client that did not negotiate it gets the `NAK` it expects.
+- `bench/multi_ack.py` drives a real clone and two fetches and reads git's own packet trace to
+  confirm all three ACK forms arrived.
+
 ### Large objects live beside the database
 
 - An object of 4 MB or more is written to `.gesta/objects/<aa>/<rest>` and its row keeps only
