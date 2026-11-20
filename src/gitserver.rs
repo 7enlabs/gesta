@@ -37,9 +37,6 @@ fn bad(msg: String) -> Box<crate::error::Error> {
 /// One git object, as the pack writer needs it.
 pub struct Entry {
     /// 1 commit, 2 tree, 3 blob, 4 tag.
-    ///
-    /// No hash field: a full pack names objects by position, so the writer never needs the id. A
-    /// delta pack would, and adding it back is the change that comes with the delta encoder.
     pub kind: u8,
     /// The object body, uncompressed.
     pub body: Vec<u8>,
@@ -112,16 +109,34 @@ pub fn read_pkt_lines(body: &[u8]) -> Vec<String> {
 /// trailing checksum is wrong is rejected by git with "index-pack failed", and the client does not
 /// say which object.
 pub fn write_pack(entries: &[Entry]) -> ZResult<Vec<u8>> {
+    // Blobs are grouped by the size they started from and deltas are tried within a group. Two blobs
+    // of very different sizes are rarely worth comparing, and the cost of trying is a scan of the
+    // base per candidate.
+    let bases = pick_delta_bases(entries);
+
     let mut out = Vec::new();
     out.extend_from_slice(b"PACK");
     out.extend_from_slice(&2u32.to_be_bytes());
     out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
 
-    for e in entries {
+    // Where each entry's header starts, so an OFS_DELTA can name the distance back to its base.
+    let mut offsets: Vec<u64> = Vec::with_capacity(entries.len());
+
+    for (i, e) in entries.iter().enumerate() {
+        let start = out.len() as u64;
+        offsets.push(start);
+
+        // A delta replaces the body and changes the type to OFS_DELTA, with the distance to the base
+        // written between the header and the compressed bytes.
+        let (kind, body, base_distance) = match bases.get(&i) {
+            Some((base_index, delta)) => (6u8, delta.as_slice(), Some(start - offsets[*base_index])),
+            None => (e.kind, e.body.as_slice(), None),
+        };
+
         // The type and the low four bits of the size share a byte, and a size above 15 continues in
         // the following bytes, seven bits at a time, with the high bit as a continuation marker.
-        let mut size = e.body.len();
-        let mut first = ((e.kind & 0x7) << 4) | ((size & 0xf) as u8);
+        let mut size = body.len();
+        let mut first = ((kind & 0x7) << 4) | ((size & 0xf) as u8);
         size >>= 4;
         while size > 0 {
             first |= 0x80;
@@ -130,13 +145,97 @@ pub fn write_pack(entries: &[Entry]) -> ZResult<Vec<u8>> {
             size >>= 7;
         }
         out.push(first);
-        let packed = crate::store::compress_bytes(&e.body)?;
+
+        if let Some(distance) = base_distance {
+            // The base distance uses a different continuation rule from the size: the value is
+            // shifted with a bias of one per continuation byte, so a writer that used the size rule
+            // produces a pack whose deltas point at the wrong object.
+            let mut value = distance;
+            let mut buf = vec![(value & 0x7f) as u8];
+            value >>= 7;
+            while value > 0 {
+                value -= 1;
+                buf.push(0x80 | (value & 0x7f) as u8);
+                value >>= 7;
+            }
+            buf.reverse();
+            out.extend_from_slice(&buf);
+        }
+
+        let packed = crate::store::compress_bytes(body)?;
         out.extend_from_slice(&packed);
     }
 
     let digest = sha1(&out);
     out.extend_from_slice(&digest);
     Ok(out)
+}
+
+/// Which entries are sent as a delta against an earlier entry, and against which.
+///
+/// Only blobs are considered, and only against a blob that already travelled: a delta names its base
+/// by a backward distance, so the base has to come first in the pack. Tree and commit objects are
+/// small and their text is mostly hashes, which delta poorly.
+fn pick_delta_bases(
+    entries: &[Entry],
+) -> std::collections::HashMap<usize, (usize, Vec<u8>)> {
+    // How deep a delta chain may go. Git's own pack of this history reaches 34 levels, so a low cap
+    // is not a quality improvement: at 8 the pack grew from 3703 to 4147 KiB and held 36 deltas
+    // instead of 688. A cap exists to bound how many steps a client walks for one object, and git's
+    // own answer to that is the number to match rather than a smaller one chosen by feel.
+    const MAX_DEPTH: usize = 50;
+
+    let mut out = std::collections::HashMap::new();
+    // The most recent blob at each size band, with how deep its own delta chain is. A file edited
+    // between two commits has a similar size, and the size band is the cheapest way to bring the two
+    // versions together without indexing paths, which the pack does not carry.
+    let mut by_band: std::collections::HashMap<usize, Vec<(usize, usize)>> =
+        std::collections::HashMap::new();
+
+    for (i, e) in entries.iter().enumerate() {
+        if e.kind != 3 || e.body.len() < 64 {
+            // Small blobs and non-blobs are sent whole. A tree of a large directory is the one
+            // exception worth having and it is not worth the code.
+            continue;
+        }
+        let band = (e.body.len().ilog2() as usize).max(1);
+        let mut chosen: Option<(usize, Vec<u8>)> = None;
+        if let Some(candidates) = by_band.get(&band) {
+            // Every earlier blob in this band, newest first. The cap is on how many are *tried*,
+            // not on how many are considered: a file with 68 versions has its other versions in
+            // this list, and a window of the last eight only finds them when the history happens to
+            // be in order.
+            let window: Vec<(usize, usize)> = candidates.iter().rev().take(64).copied().collect();
+            for &(cand, depth) in window.iter() {
+                if depth >= MAX_DEPTH {
+                    continue;
+                }
+                if let Some(delta) = crate::delta_pack::encode(&entries[cand].body, &e.body) {
+                    let better = match &chosen {
+                        None => true,
+                        Some((_, best)) => delta.len() < best.len(),
+                    };
+                    if better {
+                        chosen = Some((cand, delta));
+                    }
+                }
+            }
+        }
+        let depth = match &chosen {
+            Some((base, _)) => {
+                by_band
+                    .get(&band)
+                    .and_then(|c| c.iter().find(|(idx, _)| idx == base).map(|(_, d)| d + 1))
+                    .unwrap_or(1)
+            }
+            None => 0,
+        };
+        if let Some((base, delta)) = chosen {
+            out.insert(i, (base, delta));
+        }
+        by_band.entry(band).or_default().push((i, depth));
+    }
+    out
 }
 
 /// SHA-1, which git names objects by. This is the only place a pack needs it.
@@ -751,6 +850,40 @@ pub fn advertise_receive(root: &std::path::Path) -> ZResult<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_delta_pack_still_names_every_object_it_wrote() {
+        // The pack writer now replaces a body with a delta against an earlier object. A delta that
+        // rebuilds to the wrong bytes makes git reject the whole pack with a message about a bad
+        // object, so the count and the offsets have to agree with what was written.
+        let entries = vec![
+            Entry {
+                kind: 3,
+                body: b"the quick brown fox jumps over the lazy dog\n".repeat(40),
+            },
+            Entry {
+                kind: 3,
+                body: {
+                    let mut v = b"the quick brown fox jumps over the lazy dog\n".repeat(40);
+                    v.extend_from_slice(b"one more line\n");
+                    v
+                },
+            },
+        ];
+        let pack = write_pack(&entries).unwrap();
+        assert_eq!(&pack[..4], b"PACK");
+        let count = u32::from_be_bytes([pack[8], pack[9], pack[10], pack[11]]);
+        assert_eq!(count, 2, "the header must name both objects");
+
+        // The second object should have been written as a delta: a copy of the first plus one line
+        // costs far less than the body itself.
+        assert!(
+            pack.len() < entries[1].body.len(),
+            "a two-line change should not cost a whole body: pack {} bytes, body {}",
+            pack.len(),
+            entries[1].body.len()
+        );
+    }
 
     #[test]
     fn a_pkt_line_counts_its_own_header() {

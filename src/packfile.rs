@@ -282,6 +282,16 @@ fn inflate_at(bytes: &[u8], at: usize) -> ZResult<Vec<u8>> {
 ///
 /// The delta is a base size, a result size, then copy and insert instructions. A copy names a
 /// range of the base; an insert carries literal bytes.
+/// `apply_delta`, reachable from the delta writer.
+///
+/// The writer verifies every delta by applying it before offering it, and the decoder is the one
+/// that has to be right about the format, so the two share this function instead of the writer
+/// carrying a second decoder that could disagree. Not test-only: the verification runs in the
+/// server, which is the only place a wrong delta would be sent.
+pub fn apply_delta_for_test(base: &[u8], delta: &[u8]) -> ZResult<Vec<u8>> {
+    apply_delta(base, delta)
+}
+
 fn apply_delta(base: &[u8], delta: &[u8]) -> ZResult<Vec<u8>> {
     let mut at = 0usize;
     let (base_size, used) = delta_size(delta, at)?;
