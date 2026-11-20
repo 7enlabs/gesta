@@ -1287,7 +1287,17 @@ pub fn committed_tree(
 ) -> ZResult<std::collections::HashMap<String, String>> {
     // Read the maintained table. Rebuilding from the whole history cost about
     // 2 ms on a 2000 file repository, on every `status` and every `diff`.
-    let mut out = std::collections::HashMap::new();
+    //
+    // Sized from the table's own count. Growing a hundred thousand entries by doubling rehashes every
+    // string it already holds, and this map is built on every status and every diff.
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM branch_tree WHERE branch = ?1",
+            params![branch],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    let mut out = std::collections::HashMap::with_capacity(n.max(0) as usize);
     let mut stmt = conn.prepare("SELECT path, hash FROM branch_tree WHERE branch = ?1")?;
     let rows = stmt.query_map(params![branch], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))

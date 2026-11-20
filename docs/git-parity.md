@@ -462,16 +462,33 @@ that broke.
 `bench/audit_e2e.py` runs the real server against a real collector: a refused request, a served one, the
 token on the wire, and the token absent from the URL.
 
-What is genuinely left:
+Where the 206 ms goes at 100,000 files, measured by timing each phase rather than inferred:
 
+```
+walk (readdir, stat, ignore rules)   102 ms      stat alone 68, readdir 17, rules 12
+load the stat cache                   25 ms
+build the committed tree              30 ms
+compare the two                        19 ms
+```
+
+The walk is a floor rather than a bug: 68 ms of it is one `stat` per file, which is a syscall and the
+same one `git status` makes. Attempts that did not move it, each measured:
+
+- `PRAGMA mmap_size` and a larger page cache: 49.1 ms against 50.5 ms for the same 100,003 row read.
+  The cost is parsing rows and allocating strings, not reading pages.
+- Reserving the committed-tree map from the table's own count: 219.7 ms to 205.6 ms for a whole
+  `status`. Real, and small.
+
+What is still open, and why it is a rewrite rather than a patch:
+
+- Compare a directory's listing against the cache without materialising 100,003 map entries at all.
+  That is the shape `git status` uses, with a binary index it can memory-map. Doing it here means a
+  second cache format kept in step with the table, which is a decision about the store rather than a
+  loop to tighten.
 - Avoid loading cache rows for paths the walk will not visit. The two passes are separate today, so a
   tree where most cached paths are gone pays for rows it never reads.
-- Skip the ignore rule for a path whose parent was already excluded by a directory rule. The rule
-  check is 14.8 ms of the 30 ms above.
-- Compare a directory's listing against the cache without building 100,003 `HashMap` entries at all,
-  which is the shape `git status` uses and why it is 78 ms.
 
-None of those is done. The number above is what the tool does today.
+The number above is what the tool does today: 3.63x `git status` on the same tree.
 
 ### Many writers in one checkout
 
