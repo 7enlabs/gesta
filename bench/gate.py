@@ -3242,6 +3242,20 @@ def main():
                     proc.kill()
                 _shv.rmtree(d, ignore_errors=True)
 
+    if want("fetch-negotiate"):
+        # A fetch after the first one names the commits it holds. A server that ignores that list
+        # sends the whole repository again and still looks correct, so this counts bytes on the wire
+        # for a full fetch and for one that carries a `have`.
+        r = sh_out(
+            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fetch_negotiate.py')}",
+            cwd=ZF_DIR,
+        )
+        record(
+            "a fetch after a have carries only the change",
+            r[0] == 0 and "5/5 negotiation checks pass" in r[1],
+            (r[1] or "")[-400:],
+        )
+
     if want("audit-forward"):
         # The record is a local file, which cannot answer "what happened across the fleet". A forwarder
         # posts each event to a collector, and this runs the real server against a real one: the

@@ -36,6 +36,9 @@ fn bad(msg: String) -> Box<crate::error::Error> {
 
 /// One git object, as the pack writer needs it.
 pub struct Entry {
+    /// The object's name. A pack does not carry it, but the server needs it to answer "does the
+    /// client already hold this", which is the whole of a fetch negotiation.
+    pub sha: String,
     /// 1 commit, 2 tree, 3 blob, 4 tag.
     pub kind: u8,
     /// The object body, uncompressed.
@@ -88,7 +91,14 @@ pub fn read_pkt_lines(body: &[u8]) -> Vec<String> {
             Err(_) => break,
         };
         let len = match usize::from_str_radix(hex, 16) {
-            Ok(0) => break,
+            Ok(0) => {
+                // A flush ends a section, not the request. A fetch sends `want`s, a flush, then its
+                // `have`s and `done`. Stopping at the first flush dropped every `have`, which made a
+                // negotiation that reads the list behave exactly like one that ignores it: 100% of a
+                // full pack, with nothing to say why.
+                i += 4;
+                continue;
+            }
             Ok(n) => n,
             Err(_) => break,
         };
@@ -100,6 +110,52 @@ pub fn read_pkt_lines(body: &[u8]) -> Vec<String> {
         i += len;
     }
     out
+}
+
+/// Every object the named commits reach, walking parents, trees and their entries.
+///
+/// The export holds objects without history, so reachability is computed here from the commit and
+/// tree bodies rather than asked of the store. A `have` that names something absent is skipped: the
+/// client is allowed to name a commit this server does not have.
+fn reachable_from(entries: &[Entry], have: &[String]) -> std::collections::HashSet<String> {
+    use std::collections::{HashMap, HashSet};
+
+    let mut by_sha: HashMap<&str, &Entry> = HashMap::with_capacity(entries.len());
+    for e in entries {
+        by_sha.insert(e.sha.as_str(), e);
+    }
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut stack: Vec<String> = have.to_vec();
+    while let Some(sha) = stack.pop() {
+        if !seen.insert(sha.clone()) {
+            continue;
+        }
+        let Some(e) = by_sha.get(sha.as_str()) else { continue };
+        match e.kind {
+            // A commit names its tree and its parents.
+            1 => {
+                if let Ok(c) = crate::gitobj::parse_commit(&e.body) {
+                    if !c.tree.is_empty() {
+                        stack.push(c.tree);
+                    }
+                    for p in c.parents {
+                        stack.push(p);
+                    }
+                }
+            }
+            // A tree names blobs and subtrees.
+            2 => {
+                if let Ok(parsed) = crate::gitobj::parse_tree(&e.body) {
+                    for ent in parsed {
+                        stack.push(ent.hash);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    seen
 }
 
 /// Write a pack file from a list of objects.
@@ -304,11 +360,9 @@ pub fn advertise(root: &std::path::Path) -> ZResult<Vec<u8>> {
 /// side. Writing the pack straight into the response without the side-band wrapper makes a client
 /// that negotiated `side-band-64k` read the pack bytes as channel headers and fail.
 pub fn upload_pack(root: &std::path::Path, body: &[u8]) -> ZResult<Vec<u8>> {
-    // Parsed to tell a fetch from a request that names nothing. The pack itself is a full copy: a
-    // negotiation that sent only what was asked for would need the client's `have` list, and
-    // sending more than it asked for is cheaper than sending something it cannot check out.
-    let wanted: Vec<String> = read_pkt_lines(body)
-        .into_iter()
+    let lines = read_pkt_lines(body);
+    let wanted: Vec<String> = lines
+        .iter()
         .filter_map(|line| {
             line.strip_prefix("want ")
                 .map(|rest| rest.split_whitespace().next().unwrap_or("").to_string())
@@ -316,15 +370,52 @@ pub fn upload_pack(root: &std::path::Path, body: &[u8]) -> ZResult<Vec<u8>> {
         .filter(|s| s.len() == 40)
         .collect();
 
-    // One export gives both the refs and every object they reach, so nothing is walked twice. The
-    // pack is a full copy of the repository: a client asking for one commit gets its history too,
-    // and asking for everything costs bytes rather than a negotiation this server does not do.
+    // What the client already holds. A fetch after the first one names the commits it has, and every
+    // object those commits reach is an object it does not need sent again. Ignoring this list is what
+    // made a second fetch cost as much as the first.
+    let have: Vec<String> = lines
+        .iter()
+        .filter_map(|line| {
+            line.strip_prefix("have ")
+                .map(|rest| rest.split_whitespace().next().unwrap_or("").to_string())
+        })
+        .filter(|s| s.len() == 40)
+        .collect();
+
+    // One export gives both the refs and every object they reach, so nothing is walked twice.
     let served = crate::http::open_repo_for_serve(root)?;
     let entries = served.objects;
 
     if wanted.is_empty() || entries.is_empty() {
         return Ok(flush());
     }
+
+    // Subtracting what the client has is the difference between a fetch that sends the tree and one
+    // that sends the change. A `have` the server does not recognise is not an error: git sends them
+    // optimistically, and a client can name a commit this server has never seen.
+    let entries = if have.is_empty() {
+        entries
+    } else {
+        let held = reachable_from(&entries, &have);
+        let before = entries.len();
+        let kept: Vec<Entry> = entries
+            .into_iter()
+            .filter(|e| !held.contains(&e.sha))
+            .collect();
+        // Nothing new to send is a valid answer: the client is up to date. It still has to be
+        // framed the way a client expects a fetch result, or it reports a protocol error instead of
+        // "Already up to date."
+        if kept.is_empty() {
+            let mut out = Vec::new();
+            out.extend_from_slice(&pkt_line(b"NAK\n"));
+            out.extend_from_slice(&pkt_line(&[1u8]));
+            out.extend_from_slice(&flush());
+            return Ok(out);
+        }
+        let _ = before;
+        kept
+    };
+
     let pack = write_pack(&entries)?;
 
     // Side-band 1 carries the pack. Each chunk is a pkt-line whose first byte is the band number,
@@ -858,10 +949,12 @@ mod tests {
         // object, so the count and the offsets have to agree with what was written.
         let entries = vec![
             Entry {
+                sha: "test-1".into(),
                 kind: 3,
                 body: b"the quick brown fox jumps over the lazy dog\n".repeat(40),
             },
             Entry {
+                sha: "test-1".into(),
                 kind: 3,
                 body: {
                     let mut v = b"the quick brown fox jumps over the lazy dog\n".repeat(40);
@@ -932,6 +1025,7 @@ mod tests {
     #[test]
     fn a_pack_starts_with_the_magic_version_and_count() {
         let entries = vec![Entry {
+            sha: "test-hello".into(),
             kind: 3,
             body: b"hello\n".to_vec(),
         }];
@@ -947,6 +1041,7 @@ mod tests {
     fn an_object_larger_than_fifteen_bytes_declares_its_size_across_bytes() {
         let body = vec![b'x'; 300];
         let entries = vec![Entry {
+            sha: "test-large".into(),
             kind: 3,
             body: body.clone(),
         }];

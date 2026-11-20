@@ -76,6 +76,18 @@ no delta, no v2, no ref deletion.
   stream. Raising the zlib level changes nothing (47.3 MB at level 6, 47.2 at level 9).
 
 
+## Unreleased
+
+### A fetch sends the change, not the tree
+
+- `git fetch` now honours the client's `have` list: every object those commits reach is left out of
+  the pack. On a sixty file tree with one file edited, a full fetch is 7662 bytes and a fetch carrying
+  a `have` is 1739.
+- `read_pkt_lines` stopped at the first flush, which dropped every `have` a fetch sends after its
+  `want`s. A server that read the list therefore behaved exactly like one that ignored it.
+- `bench/fetch_negotiate.py` measures both requests on the wire against a real server, and compares
+  the edit against what `git pack-objects` charges for the same change. The gate runs it.
+
 ## 0.8.1, 2026-11-20
 
 ### Forwarding the audit record

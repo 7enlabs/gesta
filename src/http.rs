@@ -1481,8 +1481,8 @@ pub fn open_repo_for_serve(root: &Path) -> ZResult<ServedRepository> {
                 }
             }
             if let Ok(all) = repo.all_objects() {
-                for (_sha, kind, body) in all {
-                    objects.push(crate::gitserver::Entry { kind, body });
+                for (sha, kind, body) in all {
+                    objects.push(crate::gitserver::Entry { sha, kind, body });
                 }
             }
         }

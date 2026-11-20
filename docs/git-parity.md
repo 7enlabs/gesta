@@ -136,10 +136,19 @@ Six details each produce a symptom that looks like a different bug:
 `index-pack` is not enough to unpack a push: it leaves the objects inside a pack, and the importer
 reads loose objects. `unpack-objects` writes them loose, which is the shape the next step needs.
 
-What is absent: the v2 protocol, `multi_ack_detailed`, ref deletion, and any delta in the packs this
-server writes. The pack it sends is a full copy, about 3x a delta pack on this project, and a
-negotiation that sent only what the client asked for would need its `have` list. Absent on purpose,
-and named here so the next person does not read the absence as a bug.
+A fetch after the first one sends the change rather than the tree. The client names the commits it
+holds as `have`, and every object those commits reach is left out of the pack. Measured on a sixty
+file tree with one file edited: a full fetch is 7662 bytes, the same fetch carrying a `have` is 1739.
+`bench/fetch_negotiate.py` posts both requests to a real server and counts what came back; the gate
+runs it.
+
+The parser had a bug that made this look unimplemented. `read_pkt_lines` stopped at the first flush,
+and a fetch sends its `want`s, a flush, then its `have`s and `done`. Every `have` was dropped, so a
+server that read the list behaved exactly like one that ignored it.
+
+What is still absent: the v2 protocol, and `multi_ack_detailed`. A v0 client and this server agree on a
+single `NAK` and a full pack of the difference, which is what git's own v0 exchange does when the
+histories share no commit. Ref deletion works and is tested (`bench/gate.py git-push`).
 
 ### 5. No SSH transport
 
