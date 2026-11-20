@@ -76,7 +76,7 @@ no delta, no v2, no ref deletion.
   stream. Raising the zlib level changes nothing (47.3 MB at level 6, 47.2 at level 9).
 
 
-## Unreleased
+## 0.8.0, 2026-11-20
 
 ### Forwarding the audit record
 
@@ -85,6 +85,15 @@ no delta, no v2, no ref deletion.
 - Delivery is queued and drained on a background thread: a dead collector cannot slow a request, and a
   full queue is counted rather than grown.
 - `bench/audit_e2e.py` runs the real server against a real collector.
+
+### A release with binaries
+
+- The release workflow builds six targets: linux x86_64 in glibc and musl, linux aarch64, macos on Intel
+  and Apple silicon, and windows x86_64. Each archive is attached to the release for its tag.
+- Every target runs its own binary before packaging: `--version`, `init`, `status`. A build that
+  compiles and cannot start is what that step catches, and the first Windows build needed a DLL beside
+  the binary with no compiler error to say so.
+- The publish job reads the asset list back from the API and fails when fewer than six arrived.
 
 ## 0.7.0, 2026-11-20
 
