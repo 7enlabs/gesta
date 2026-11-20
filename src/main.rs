@@ -16,6 +16,9 @@ mod cli_remote;
 mod conflict;
 mod content;
 mod delta;
+mod delta_pack;
+#[cfg(windows)]
+mod vfs;
 mod git_bridge;
 mod gitobj;
 mod gitserver;
@@ -500,6 +503,15 @@ enum Cmd {
         /// path. Ignored for `self-signed`.
         #[arg(long)]
         key: Option<String>,
+    },
+    /// Present a branch as a read-only drive, without checking it out
+    #[cfg(windows)]
+    Mount {
+        /// Drive letter or directory to mount on, for example X: or C:\\mnt\\gesta
+        target: String,
+        /// Branch to show; defaults to the current one
+        #[arg(long)]
+        branch: Option<String>,
     },
     /// Limit the working tree to a set of paths
     Sparse {
@@ -1130,6 +1142,8 @@ fn run() -> ZResult<()> {
             }
         }
         Cmd::Mcp => cli::cmd_mcp(),
+        #[cfg(windows)]
+        Cmd::Mount { target, branch } => cli::cmd_mount(&target, branch.as_deref()),
         Cmd::Serve { bind, port, tls, key } => {
             cli_remote::cmd_serve(&bind, port, tls.as_deref(), key.as_deref())
         }

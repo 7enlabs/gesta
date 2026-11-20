@@ -77,6 +77,17 @@ no delta, no v2, no ref deletion.
 
 ## 0.6.0, 2026-11-18
 
+### A branch as a drive, and packs that delta
+
+- `gesta mount X:` presents a branch through WinFSP without a checkout. Read-only, because a write to
+  a branch that is not checked out is a merge policy and not a filesystem call.
+- The pack this server writes now carries git deltas. Measured on this project's history: 6633 to 1700
+  KiB, from 6.65x git's pack to 1.70x, with `git fsck` clean and every object rebuilding byte for byte.
+- Delta chains are capped at 50, which is git's own limit. A cap of 8 was tried first and made the pack
+  larger, because git's own pack of this history reaches 34 levels deep.
+- The first build of the project on Windows: the Windows SDK and LLVM were missing, and Smart App
+  Control blocked every cargo build script until it was turned off.
+
 ### Deleting a branch through the protocol
 
 - A push that deletes a branch deletes it. The empty-pack path answered `ok` for every command

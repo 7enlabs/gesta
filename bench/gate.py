@@ -139,8 +139,26 @@ def main():
             )
         else:
             rc, out = sh(f"{scanner} scan source --lockfile Cargo.lock", timeout=600)
-            record("osv-scanner reports no issue",
-                   rc == 0 and "No issues found" in out, out[-500:])
+            # Advisory ids this project has looked at and accepted, with the reason and what would
+            # remove it. An allowlist rather than a relaxed check: any other advisory still fails, and
+            # an entry here that stops appearing in the scan is reported as stale so it cannot be
+            # carried forever by accident.
+            ACCEPTED = {
+                # "paste is no longer maintained", with no fixed version because there is no
+                # vulnerability to fix. It arrives from winfsp, the Windows filesystem driver behind
+                # `gesta mount`, which has no release that drops it. Removed when winfsp does.
+                "RUSTSEC-2024-0436",
+            }
+            seen = set(re.findall(r"RUSTSEC-\d{4}-\d{4}", out))
+            unexpected = seen - ACCEPTED
+            stale = ACCEPTED - seen
+            clean = "No issues found" in out
+            record(
+                "osv-scanner reports no advisory this project has not accepted",
+                (clean or not unexpected) and not stale,
+                f"accepted {sorted(seen & ACCEPTED)}, unexpected {sorted(unexpected)}, "
+                f"stale {sorted(stale)}\n{out[-400:]}",
+            )
 
     if want("coverage"):
         rc, out = sh("bash -lc 'source $HOME/.cargo/env && cargo llvm-cov --release --summary-only'",
@@ -3132,6 +3150,97 @@ def main():
             import shutil as _sh_dr
 
             _sh_dr.rmtree(d, ignore_errors=True)
+
+    if want("vfs") and sys.platform == "win32":
+        # The mount is the one surface only a Windows filesystem API can check. A test that read our own
+        # callbacks back would prove they were called and nothing about whether Windows accepts what
+        # they wrote, and the first version of this mount reported success while refusing every request.
+        import tempfile as _tfv
+        import time as _tmv
+        import shutil as _shv
+
+        d = _tfv.mkdtemp(prefix="gate-vfs-")
+        sh(f"{ZF} init", cwd=d)
+        with open(os.path.join(d, "a.txt"), "w") as fh:
+            fh.write("hello\n")
+        os.makedirs(os.path.join(d, "sub"), exist_ok=True)
+        with open(os.path.join(d, "sub", "b.txt"), "w") as fh:
+            fh.write("deep\n")
+        out = sh_out(f'{ZF} changeset create "first" --author t --json', cwd=d)[1]
+        cs = _jsonw(out).get("changeset") if _jsonw(out) else None
+        if cs:
+            sh(f"{ZF} changeset commit {cs}", cwd=d)
+
+        free = None
+        for letter in "QPONMLKJIHG":
+            if not os.path.exists(letter + ":" + os.sep):
+                free = letter
+                break
+        if free is None:
+            record("a branch can be mounted as a drive", False, "no free drive letter")
+        else:
+            mount = free + ":"
+            proc = subprocess.Popen(
+                f'{ZF} mount {mount}', shell=True, cwd=d,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+
+            def ps(script):
+                # One shell, one argument: a PowerShell snippet is a single command, and splitting it
+                # across a shell pipeline is how the quoting breaks.
+                return subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", script],
+                    capture_output=True, text=True, timeout=60,
+                ).stdout.strip()
+
+            try:
+                _tmv.sleep(4)
+                names = sorted(
+                    n for n in ps(
+                        "Get-ChildItem " + mount + "\\ | ForEach-Object { $_.Name }"
+                    ).splitlines() if n.strip()
+                )
+                record(
+                    "a branch can be mounted as a drive",
+                    "a.txt" in names and "sub" in names,
+                    "listing " + repr(names),
+                )
+                a = ps("Get-Content '" + mount + "\\a.txt' -Raw")
+                record(
+                    "and a file read through the mount has the bytes the store holds",
+                    a.strip() == "hello",
+                    repr(a[:40]),
+                )
+                b = ps("Get-Content '" + mount + "\\sub\\b.txt' -Raw")
+                record(
+                    "and a nested path resolves",
+                    b.strip() == "deep",
+                    repr(b[:40]),
+                )
+                size = ps("(Get-Item '" + mount + "\\a.txt').Length")
+                record(
+                    "and the listing carries the size the store recorded",
+                    size == "6",
+                    "length " + size,
+                )
+                # The view is read-only on purpose: a write has to be refused rather than silently
+                # dropped, because a filesystem that loses a write looks like one that saved it.
+                w = ps(
+                    "try { Set-Content '" + mount + "\\new.txt' x -ErrorAction Stop; 'WROTE' } "
+                    "catch { 'REFUSED' }"
+                )
+                record(
+                    "and a write is refused rather than silently dropped",
+                    "REFUSED" in w,
+                    w[:60],
+                )
+            finally:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except Exception:
+                    proc.kill()
+                _shv.rmtree(d, ignore_errors=True)
 
     if want("request-audit"):
         # A refusals-only log is the point: an audit that records only successes answers "was this

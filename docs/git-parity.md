@@ -382,6 +382,49 @@ gate runs a real git client through all of it:
 | one branch is left after deleting the others |
 | and the only branch left cannot be deleted |
 
+### A branch as a drive
+
+`gesta mount X:` presents a branch through WinFSP, so a tool that only knows how to open files can
+read a repository that has no checkout. Read-only on purpose: a writable view has to answer what a
+write means when the branch is not checked out, which is a merge policy, and a filesystem that
+silently discards a write is worse than one that refuses it.
+
+It took five wrong attempts, and every one of them produced a mount that reported success and served
+nothing. The trace that found it logged each callback to a file, which showed the driver calling
+`get_security_by_name` and then stopping:
+
+| symptom | cause |
+|---|---|
+| mount attaches, every request fails | `get_security_by_name` returned attributes 0, so nothing looked like a directory |
+| `open` called in a loop, no `read_directory` | `open` never filled the `FileInfo` the driver reads back |
+| the same, again | the normalised name was never set |
+| listing returns bytes, Windows says "Incorrect function" | every entry had zero timestamps, which is 1601 |
+| writes refused with "Incorrect function" | the trait's default `flush` returns `STATUS_INVALID_DEVICE_REQUEST` |
+
+The one that mattered most was the first: a zero attribute is not "unknown", it is "not a directory and
+not a file", and Windows stops there. `fsptool lsvol` showed the volume the whole time, which is why
+"mounted" and "working" are different claims.
+
+Two Windows quirks are worth recording because they cost time and are not in the crate's docs:
+
+- The crate types `FileInfo::file_attributes` as `u32` and does not re-export the `FILE_ATTRIBUTE_*`
+  constants, so they are named by value in `vfs.rs`.
+- `OpenFileInfo` exposes `FileInfo` through `AsMut`, not through a `file_info_mut` method.
+
+`cmd /c dir X:` still reports "Incorrect function" while `Get-ChildItem` works. That is `dir` asking
+for volume information a WinFSP volume does not answer, not the filesystem refusing. The gate checks
+through PowerShell for that reason.
+
+Five gate steps run against a real mount:
+
+| step |
+|---|
+| a branch can be mounted as a drive |
+| and a file read through the mount has the bytes the store holds |
+| and a nested path resolves |
+| and the listing carries the size the store recorded |
+| and a write is refused rather than silently dropped |
+
 What is genuinely left:
 
 - Avoid loading cache rows for paths the walk will not visit. The two passes are separate today, so a

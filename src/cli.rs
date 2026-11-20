@@ -271,6 +271,18 @@ pub fn cmd_anonymise(
     Ok(())
 }
 
+/// Mount a branch as a read-only drive. Windows only: the mount is WinFSP.
+#[cfg(windows)]
+pub fn cmd_mount(target: &str, branch: Option<&str>) -> ZResult<()> {
+    let (root, conn) = open_repo()?;
+    let branch = match branch {
+        Some(b) => b.to_string(),
+        None => current_branch(&conn)?,
+    };
+    drop(conn);
+    crate::vfs::mount(&root, &branch, target)
+}
+
 pub fn cmd_status() -> ZResult<()> {
     let (root, conn) = open_repo()?;
     let branch = current_branch(&conn)?;
