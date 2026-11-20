@@ -76,7 +76,7 @@ no delta, no v2, no ref deletion.
   stream. Raising the zlib level changes nothing (47.3 MB at level 6, 47.2 at level 9).
 
 
-## 0.8.0, 2026-11-20
+## 0.8.1, 2026-11-20
 
 ### Forwarding the audit record
 
