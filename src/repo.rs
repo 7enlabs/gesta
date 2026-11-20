@@ -72,7 +72,9 @@ pub fn diff_worktree(conn: &Connection, root: &Path, branch: &str) -> ZResult<Wo
         cached: 0,
         rehashed: 0,
     };
-    let mut seen = std::collections::HashSet::new();
+    // Paths seen on disk, borrowed from the scan result. Cloning each one was 100,000 allocations
+    // for a set that is read once, right here.
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
     // The committed tree is fetched once. Asking per file made this quadratic:
     // each lookup re-walked the whole parent chain.
@@ -88,7 +90,7 @@ pub fn diff_worktree(conn: &Connection, root: &Path, branch: &str) -> ZResult<Wo
         if !scope.contains(&f.rel) {
             continue;
         }
-        seen.insert(f.rel.clone());
+        seen.insert(f.rel.as_str());
         match committed.get(&f.rel) {
             None => d.added.push(f.rel.clone()),
             Some(old) if old != &f.hash => d.modified.push(f.rel.clone()),
@@ -104,23 +106,25 @@ pub fn diff_worktree(conn: &Connection, root: &Path, branch: &str) -> ZResult<Wo
     d.cached = scanned.cached;
     d.rehashed = scanned.rehashed;
 
-    // Files tracked on the branch but absent from disk. A path outside the
-    // sparse scope was never supposed to be on disk, so its absence is not a
-    // deletion: reporting it as one would let a commit wipe the whole repo.
-    let mut tracked: Vec<String> = committed.keys().cloned().collect();
-    tracked.sort();
-    // A subrepository whose checkout is missing is not a deletion. Reporting it
-    // as one would let a single commit remove the pointer to the child.
+    // Files tracked on the branch but absent from disk. A path outside the sparse scope was never
+    // supposed to be on disk, so its absence is not a deletion: reporting it as one would let a
+    // commit wipe the whole repo.
+    //
+    // The scan already stat-ed every path on disk, so a committed path is missing exactly when the
+    // scan did not report it. The older loop asked the filesystem again for every tracked path,
+    // which was a second stat per file, and it cloned and sorted all 100,000 keys to do it.
+    // A subrepository whose checkout is missing is not a deletion either: reporting it as one would
+    // let a single commit remove the pointer to the child.
     let subs = crate::subrepo::excluded_paths(conn);
-    for path in tracked {
-        if !scope.contains(&path) {
+    for path in committed.keys() {
+        if !scope.contains(path) {
             continue;
         }
-        if crate::subrepo::is_inside_sub(&path, &subs) {
+        if crate::subrepo::is_inside_sub(path, &subs) {
             continue;
         }
-        if !seen.contains(&path) && !root.join(&path).exists() {
-            d.deleted.push(path);
+        if !seen.contains(path.as_str()) {
+            d.deleted.push(path.clone());
         }
     }
 
@@ -2420,6 +2424,47 @@ pub(crate) mod tests {
         // The earlier changeset still sees both.
         let old = tree_at(&conn, "cs1").unwrap();
         assert_eq!(old.len(), 2, "history keeps the file it had");
+    }
+
+    #[test]
+    fn a_deleted_file_is_still_a_deletion_without_a_second_stat() {
+        // The deletion loop used to ask the filesystem whether each tracked path still existed, which
+        // was one stat per file on every status. It now trusts the scan: a path the scan did not
+        // report is missing. This pins that the answer is the same, including for a path that is
+        // missing because its directory was removed rather than the file alone.
+        let d = std::env::temp_dir().join(format!("gesta-del-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join(".gesta")).unwrap();
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        let conn = crate::store::open_db(&d).unwrap();
+        crate::store::init_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO branches(name, head, created_at, from_branch) VALUES('main', NULL, 0, NULL)",
+            [],
+        )
+        .unwrap();
+
+        for rel in ["keep.txt", "gone.txt", "sub/deep.txt"] {
+            std::fs::write(d.join(rel), "x\n").unwrap();
+        }
+        let cs = crate::repo::create_changeset(&conn, &d, "base", "a").unwrap().unwrap();
+        crate::repo::commit_one(&conn, &cs.id).unwrap();
+
+        std::fs::remove_file(d.join("gone.txt")).unwrap();
+        std::fs::remove_dir_all(d.join("sub")).unwrap();
+
+        let delta = crate::repo::diff_worktree(&conn, &d, "main").unwrap();
+        let mut deleted = delta.deleted.clone();
+        deleted.sort();
+        assert_eq!(
+            deleted,
+            vec!["gone.txt".to_string(), "sub/deep.txt".to_string()],
+            "both removals must be reported"
+        );
+        assert!(delta.added.is_empty() && delta.modified.is_empty(), "nothing was added or changed");
+        assert_eq!(delta.unchanged, 1, "keep.txt is unchanged");
+
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
