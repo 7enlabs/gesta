@@ -136,3 +136,22 @@ never do.
 
 The file is appended to and never truncated. Rotating it is the operator's job, the same way it is
 for any log.
+
+## Rotating a token
+
+`gesta remote token rotate <name>` prints a new secret and replaces the old one in place. The role,
+the path scope, the branch scope and the name stay exactly as they were.
+
+Rotating rather than removing and adding is not a convenience. A remove followed by an add leaves a
+window where the name has no credential at all, and a person doing it by hand has to copy the scope
+back from the old entry, which is the step that gets a scope wrong.
+
+The server re-reads the auth file on every request, so a rotation takes effect immediately and no
+restart is needed. The old secret is refused from that moment: `bench/token_rotate.py` checks this by
+presenting both secrets to a running server rather than comparing the file, because a file that
+changed says nothing about what the server accepts.
+
+```
+gesta remote token rotate buildbot
+gesta remote token rotate buildbot --hashed
+```

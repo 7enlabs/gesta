@@ -78,6 +78,15 @@ no delta, no v2, no ref deletion.
 
 ## Unreleased
 
+### Rotating a token
+
+- `gesta remote token rotate <name>` replaces the secret and keeps the role, path scope, branch scope
+  and name. The old secret is refused from the next request, because the server re-reads the auth file
+  on every request.
+- `token add` accepts the `approve` role.
+- `bench/token_rotate.py` presents both secrets to a running server instead of comparing the file, and
+  the gate runs it.
+
 ### Protected branches
 
 - `gesta branch protect <name>` makes a push to that branch need a sign-off, and

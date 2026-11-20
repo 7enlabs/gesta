@@ -865,6 +865,14 @@ enum TokenCmd {
         #[arg(long)]
         branches: Option<String>,
     },
+    /// Replace a token's secret, keeping its role, scope and name
+    Rotate {
+        /// Name of the token, or the last four characters `token list` shows
+        selector: String,
+        /// Store only the digest of the new secret
+        #[arg(long)]
+        hashed: bool,
+    },
     /// List configured tokens without revealing them
     List,
     /// Show what the server decided: allowed, refused, and why
@@ -1145,6 +1153,9 @@ fn run() -> ZResult<()> {
                     scope.as_deref(),
                     branches.as_deref(),
                 ),
+                TokenCmd::Rotate { selector, hashed } => {
+                    cli_remote::cmd_token_rotate(&selector, hashed)
+                }
                 TokenCmd::List => cli_remote::cmd_token_list(),
                 TokenCmd::Remove { selector } => cli_remote::cmd_token_remove(&selector),
                 TokenCmd::Audit { refused, limit } => {

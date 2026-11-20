@@ -1392,10 +1392,12 @@ pub fn cmd_token_add(
     let role = match role.to_ascii_lowercase().as_str() {
         "write" => "write",
         "read" => "read",
+        // A reviewer's credential reads and signs off and does not write.
+        "approve" => "approve",
         other => {
             return Err(Box::new(crate::error::Error::new(
                 crate::error::Code::Usage,
-                format!("unknown role {:?}: use read or write", other),
+                format!("unknown role {:?}: use read, approve or write", other),
             )))
         }
     };
@@ -1447,6 +1449,61 @@ pub fn cmd_token_add(
         println!("\nStored in clear in .gesta/auth, which is never tracked.");
     }
     println!("Give it to the client once. `token list` shows only the last four characters.");
+    Ok(())
+}
+
+/// Replace a token's secret while keeping its role, scope and name.
+///
+/// The alternative, remove then add, leaves a window where the name has no credential at all, and a
+/// person doing it by hand has to re-read the old entry to copy the scope back. Rotating keeps the
+/// grant and changes only the secret, which is the one thing that has to change.
+pub fn cmd_token_rotate(selector: &str, hashed: bool) -> ZResult<()> {
+    let (root, _conn) = open_repo()?;
+    let path = repo_dir(&root).join("auth");
+    let mut entries = read_auth_file(&root)?;
+    if entries.is_empty() {
+        return Err(bad("no tokens configured"));
+    }
+
+    // Matched the same way removal matches: by name, or by the last four characters a person has in
+    // front of them from `token list`.
+    let mut hit = None;
+    for (i, line) in entries.iter().enumerate() {
+        let f: Vec<&str> = line.split(':').collect();
+        let name = if f.first() == Some(&"sha256") { f.get(2) } else { f.get(2) };
+        let secret = if f.first() == Some(&"sha256") { f.get(1) } else { f.get(0) };
+        let matches = name.map(|n| *n == selector).unwrap_or(false)
+            || secret.map(|s| s.ends_with(selector)).unwrap_or(false);
+        if matches {
+            hit = Some(i);
+            break;
+        }
+    }
+    let idx = hit.ok_or_else(|| bad(format!("no token matches {:?}", selector)))?;
+
+    // The failing entry is parsed before anything is written, so a rotate on a malformed line refuses
+    // rather than replacing it with a well-formed but different grant.
+    let fields: Vec<String> = entries[idx].split(':').map(|s| s.to_string()).collect();
+    let offset = if entries[idx].starts_with("sha256:") { 1 } else { 0 };
+    if fields.len() < 3 + offset {
+        return Err(bad(format!("the entry for {:?} is malformed", selector)));
+    }
+    let role = fields[offset + 1].clone();
+    let name = fields[offset + 2].clone();
+    let rest: Vec<String> = fields[offset + 3..].to_vec();
+
+    let token = auth::generate_token(32)?;
+    let secret = if hashed { format!("sha256:{}", auth::digest(&token)) } else { token.clone() };
+    let mut parts = vec![secret, role.clone(), name.clone()];
+    parts.extend(rest);
+    entries[idx] = parts.join(":");
+    fs::write(&path, entries.join("\n") + "\n")?;
+
+    println!("rotated the {} token for {:?}", role, name);
+    println!("{}", token);
+    println!();
+    println!("The old secret stops working as soon as the server reads the file, which it does on every request.");
+    println!("Update the client now: a credential left in a config somewhere is the one that gets used.");
     Ok(())
 }
 

@@ -3242,6 +3242,19 @@ def main():
                     proc.kill()
                 _shv.rmtree(d, ignore_errors=True)
 
+    if want("token-rotate"):
+        # A rotation that changes the file but leaves the old credential usable is worse than none,
+        # because the operator believes the leak is closed. This asks a running server.
+        r = sh_out(
+            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'token_rotate.py')}",
+            cwd=ZF_DIR,
+        )
+        record(
+            "rotating a token kills the old secret and keeps the grant",
+            r[0] == 0 and "5/5 rotation checks pass" in r[1],
+            (r[1] or "")[-400:],
+        )
+
     if want("branch-protect"):
         # A review gate either holds over a real push or it is decoration. This drives a real git
         # client against a real server: refused with no approval, refused when the pusher approved its
