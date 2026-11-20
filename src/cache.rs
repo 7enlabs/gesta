@@ -79,7 +79,7 @@ pub fn scan_with_cache(
     // never recorded in this repository's cache either.
     let excluded = crate::subrepo::excluded_paths(conn);
     let walked = crate::worktree::scan_files_excluding(root, rules, &excluded)?;
-    for (path, rel, meta) in walked {
+    for (rel, meta) in walked {
         // Nanoseconds, not seconds. Two writes inside one second with the same
         // size are indistinguishable at second resolution, and the cache would
         // then serve the first write's hash for the second write's content.
@@ -91,20 +91,21 @@ pub fn scan_with_cache(
             .unwrap_or(0);
         let size = meta.len() as i64;
 
-
+        // Borrowed, not taken. Removing the row to hand its hash over measured 5 ms slower over 15
+        // interleaved runs, because `remove` costs more than `get` plus a clone of forty bytes. The
+        // clone stays.
         if let Some((cm, cs, ch)) = known.get(&rel) {
             if *cm == mtime && *cs == size {
-                // Racy case, the same one git guards against. A file written
-                // moments ago can be written again without the stat changing in a
-                // way the next scan would see, if both writes land inside the
-                // filesystem's timestamp resolution. Such a file is re-read
-                // instead of trusted. Once it is a couple of seconds old the stat
-                // is stable and the fast path applies.
+                // Racy case, the same one git guards against. A file written moments ago can be
+                // written again without the stat changing in a way the next scan would see, if both
+                // writes land inside the filesystem's timestamp resolution. Such a file is re-read
+                // instead of trusted. Once it is a couple of seconds old the stat is stable and the
+                // fast path applies.
                 let young = now_ns.saturating_sub(mtime) < RACY_WINDOW_NS;
                 if !young {
-                    // The stat matches, so the recorded hash is the answer and the
-                    // file is never opened. Reading it anyway made the cache
-                    // worthless: a 2000 file status read all 2000 files.
+                    // The stat matches, so the recorded hash is the answer and the file is never
+                    // opened. Reading it anyway made the cache worthless: a 2000 file status read all
+                    // 2000 files.
                     cached += 1;
                     files.push(ScannedFile {
                         rel,
@@ -121,6 +122,9 @@ pub fn scan_with_cache(
         // object will hold, or a checkout with CRLF endings records a hash that no object matches.
         let plan = crate::attributes::plan_for(attrs, &rel);
 
+        // Only a file that has to be read needs an absolute path. Building one per entry cost an
+        // allocation for every cache hit, which is the common case.
+        let path = root.join(&rel);
         match read_file(&path) {
             ReadOutcome::Text(content) => {
                 let content = if plan.normalise {
@@ -182,7 +186,13 @@ pub fn scan_with_cache(
 }
 
 fn load_cache(conn: &Connection) -> ZResult<HashMap<String, (i64, i64, String)>> {
-    let mut out = HashMap::new();
+    // Reserving matters here: the map holds one entry per file and growing it by doubling rehashes
+    // every string it already holds. The count is a cheap query on a table that is already in page
+    // cache by the time this runs.
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM worktree_cache", [], |r| r.get(0))
+        .unwrap_or(0);
+    let mut out = HashMap::with_capacity(n.max(0) as usize);
     let mut stmt = conn.prepare("SELECT path, mtime, size, hash FROM worktree_cache")?;
     let rows = stmt.query_map([], |r| {
         Ok((

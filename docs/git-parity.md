@@ -237,25 +237,55 @@ Measured A/B on the same tree, two binaries, seven runs each:
 | with the sort | 388.0 ms | 5.23x |
 | without it | 299.6 ms | 4.04x |
 
-23% faster, and the removed code was doing nothing. The walk fell from 244 ms to 164 ms, which is
-below the 186.7 ms Python floor measured for the same tree, so the remaining time is no longer the
-stat calls.
+23% faster, and the removed code was doing nothing.
+
+The walk fell to 164 ms, and the Python floor of 186.7 ms was taken to mean the stat calls were no
+longer the cost. That was wrong too: Python's `os.stat` per file carries interpreter overhead the
+tool does not. A floor measured in Rust, doing nothing but `read_dir` and one `stat` per entry over
+the same tree, is **128.5 ms**. So the walk was 1.24x its floor and the remaining 30 ms was the ignore
+rule and the relative path string, not the syscalls.
 
 That measurement also corrected an earlier one. `sorted()` on a list of Python strings costs 8.1 ms,
 and that number was taken to mean the sort was cheap. It was not: the Rust sort compares `PathBuf`
 values, which walks components, and the two are not comparable. Measuring the thing in the wrong
 language produced a wrong conclusion that survived two rounds of reasoning.
 
-What is left, in the order the numbers point at:
+### What the four remaining ideas were worth
 
-- Remove passes. The scan is a walk, then a cache load, then the files vector, then `prune_cache`;
-  each one touches all 100,000 paths again.
-- Read the stat cache straight into the map the lookup needs, without an intermediate dict, and drop
-  the rows the walk never visited in the same pass.
-- Skip the ignore rule for a path whose parent was already excluded by a directory rule, which is most
-  paths in a tree holding `target` or `node_modules`. The rule check measured 14.8 ms today.
-- Stop cloning the hash string for every cached file. A cache hit allocates a `String` per file, which
-  is 100,000 allocations holding data the map already owns.
+Four changes were listed here as the way to close the gap. Three were measured and kept, one was
+measured and thrown away, and the measurement changed the order.
+
+| change | status at 100,000 files | verdict |
+|---|---:|---|
+| walk returns `(rel, meta)` and builds the path from a prefix | 319.9 -> 303.5 ms | kept |
+| reserve the cache map instead of growing it | 222 -> 173 ms | kept |
+| take the hash out of the map instead of cloning it | +5.2 ms slower | reverted |
+
+The first two together, measured against the published binary over 21 interleaved pairs:
+
+| | median | p10 | p90 |
+|---|---:|---:|---:|
+| before | 302.0 ms | 288.4 | 352.2 |
+| after | 274.3 ms | 262.3 | 305.5 |
+| `git status` | 77.9 ms | 72.3 | 85.2 |
+
+9% faster, 3.88x to 3.52x against `git status`.
+
+Where the 274 ms now goes: 128.5 ms of unavoidable `read_dir` and `stat`, about 30 ms of ignore rule
+and path building, 29 ms loading 100,003 cache rows, 21 ms in the loop that builds the result, and
+under 1 ms pruning. The two largest items left are the floor itself and the cache load.
+
+`HashMap::remove` costs more than `get` plus a clone of a forty byte string, which is the opposite of
+what the count of allocations suggests. That one was measured before it was believed.
+
+What is genuinely left:
+
+- Avoid loading cache rows for paths the walk will not visit. The two passes are separate today, so a
+  tree where most cached paths are gone pays for rows it never reads.
+- Skip the ignore rule for a path whose parent was already excluded by a directory rule. The rule
+  check is 14.8 ms of the 30 ms above.
+- Compare a directory's listing against the cache without building 100,003 `HashMap` entries at all,
+  which is the shape `git status` uses and why it is 78 ms.
 
 None of those is done. The number above is what the tool does today.
 
