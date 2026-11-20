@@ -333,6 +333,28 @@ Two runs of it, an hour apart:
 
 Those agree, which the numbers assembled by hand did not.
 
+### Why the maps are still there
+
+Both tables have a unique index on `path`, so `ORDER BY path` is free: measured 3.2 ms extra over the
+natural order for `worktree_cache` and 0.5 ms *less* for `branch_tree`, because the index answers the
+query. A merge of two ordered streams would therefore need no map at all.
+
+The arithmetic, measured rather than guessed:
+
+| | cost |
+|---|---:|
+| map build, `worktree_cache` | 14.6 ms more than streaming the rows |
+| map build, `branch_tree` | 12.4 ms more than streaming the rows |
+| sorting 100,000 relative paths | about 7 ms |
+| merging two sorted lists | about 3 ms in Rust |
+
+That is about 9 ms saved out of 214, which is 4%, in exchange for replacing two lookups with a merge
+whose failure mode is a wrong `status`: a merged scan that drifts by one entry reports the wrong file as
+added or deleted, silently. Four percent is not worth that, so the maps stay.
+
+Recording the arithmetic matters more than the decision. The next person to read this will wonder why a
+free `ORDER BY` was not used, and the answer is a measurement, not a preference.
+
 What is genuinely left:
 
 - Avoid loading cache rows for paths the walk will not visit. The two passes are separate today, so a
