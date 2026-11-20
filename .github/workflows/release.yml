@@ -86,7 +86,7 @@ jobs:
 
           # The crate source has to exist before its directory can be written into, and a fresh runner
           # has an empty registry. This also fronts the download so the build step does not have to.
-          cargo fetch --locked
+          cargo fetch
 
           # winfsp-sys, built without its `system` feature, looks for winfsp/inc and winfsp/lib beside
           # its own crate source. A runtime install does not always carry them, which is what the local
@@ -120,7 +120,9 @@ jobs:
       - name: Fetch dependencies
         shell: bash
         run: |
-          cargo fetch --locked
+          # Fetch without --locked so Cargo.lock can be updated for the target platform.
+          # The subsequent build --locked will use the updated lock file.
+          cargo fetch
 
       - name: Build
         shell: bash
