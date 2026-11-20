@@ -124,6 +124,107 @@ pub fn record_with(
     }
 }
 
+/// Actions this tool performs that are worth a line even though no request carried them.
+///
+/// The HTTP record answers "what did the server decide". A commit, a push out, a sign-off and a
+/// rotation are the same kind of fact and were invisible: an operator reading the log saw the
+/// requests that arrived and nothing about what the machine did with what it held.
+pub mod local {
+    use super::{record_with, Decision, Event};
+
+    /// A commit landed on a branch.
+    pub fn commit(root: &std::path::Path, branch: &str, changeset: &str, author: &str, files: usize) {
+        record_with(
+            root,
+            &Event {
+                who: author,
+                decision: Decision::Allowed,
+                action: "commit",
+                target: branch,
+                reason: &format!("{} {} file(s)", changeset, files),
+                remote: None,
+            },
+            forwarder(root).as_ref(),
+        );
+    }
+
+    /// A branch moved because a push arrived.
+    pub fn push(root: &std::path::Path, branch: &str, who: &str, detail: &str) {
+        record_with(
+            root,
+            &Event {
+                who,
+                decision: Decision::Allowed,
+                action: "push",
+                target: branch,
+                reason: detail,
+                remote: None,
+            },
+            forwarder(root).as_ref(),
+        );
+    }
+
+    /// A push was refused, and why.
+    pub fn push_refused(root: &std::path::Path, branch: &str, who: &str, reason: &str) {
+        record_with(
+            root,
+            &Event {
+                who,
+                decision: Decision::Failed,
+                action: "push",
+                target: branch,
+                reason,
+                remote: None,
+            },
+            forwarder(root).as_ref(),
+        );
+    }
+
+    /// Somebody signed off a change.
+    pub fn approve(root: &std::path::Path, changeset: &str, by: &str, branch: &str) {
+        record_with(
+            root,
+            &Event {
+                who: by,
+                decision: Decision::Allowed,
+                action: "approve",
+                target: branch,
+                reason: changeset,
+                remote: None,
+            },
+            forwarder(root).as_ref(),
+        );
+    }
+
+    /// A signing key was replaced.
+    pub fn key_rotated(root: &std::path::Path, who: &str, new_public: &str, archived: Option<&str>) {
+        let reason = match archived {
+            Some(a) => format!("archived {}", a),
+            None => "no previous key".to_string(),
+        };
+        record_with(
+            root,
+            &Event {
+                who,
+                decision: Decision::Allowed,
+                action: "key-rotate",
+                target: &new_public[..16.min(new_public.len())],
+                reason: &reason,
+                remote: None,
+            },
+            forwarder(root).as_ref(),
+        );
+    }
+
+    /// The forwarder this repository is configured with, rebuilt per call.
+    ///
+    /// Rebuilding reads two small files, and holding one in a static would mean a thread that outlives
+    /// the process it was configured for. A local event happens a few times a minute at most.
+    fn forwarder(root: &std::path::Path) -> Option<crate::audit_forward::Forwarder> {
+        crate::audit_forward::Forwarder::from_repo(root).ok().flatten()
+    }
+}
+
 /// A parsed line, for `gesta remote audit`.
 #[allow(dead_code)]
 pub struct Entry {

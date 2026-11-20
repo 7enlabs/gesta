@@ -685,6 +685,10 @@ pub fn cmd_changeset_commit(id: &str) -> ZResult<()> {
         // operation's own snapshot and a commit has no earlier hook here. The important
         // part is that `undo` and this agree on the meaning; see `ops::record`.
         ops::record(&conn, "commit", Some(id), None)?;
+        // The audit record held only what the server decided about requests. A commit is the same
+        // kind of fact, and an operator reading the log saw arrivals and nothing about what this
+        // machine did with them.
+        crate::audit::local::commit(&root, &branch, id, "local", n);
     }
     Ok(())
 }
@@ -1235,6 +1239,12 @@ pub fn cmd_key_rotate(path: Option<&str>, dry_run: bool) -> ZResult<()> {
     let key = crate::sign::SigningKey::generate(&target)?;
     crate::keyring::record_active(&root, &key.public_hex(), &key.path, crate::now())?;
 
+    crate::audit::local::key_rotated(
+        &root,
+        "local",
+        &key.public_hex(),
+        archived.as_ref().map(|p| p.display().to_string()).as_deref(),
+    );
     if let Some(a) = archived {
         println!("archived the old key to {}", a.display());
     }
@@ -1943,7 +1953,7 @@ pub fn cmd_branch_protect(name: &str, unset: bool) -> ZResult<()> {
 
 /// Sign off a changeset.
 pub fn cmd_approve(id: &str, by: &str) -> ZResult<()> {
-    let (_root, conn) = open_repo()?;
+    let (root, conn) = open_repo()?;
     let branch: String = conn
         .query_row(
             "SELECT COALESCE(branch, 'main') FROM changesets WHERE id = ?1",
@@ -1952,6 +1962,9 @@ pub fn cmd_approve(id: &str, by: &str) -> ZResult<()> {
         )
         .map_err(|_| bad(format!("no such changeset: {}", id)))?;
     crate::approval::approve(&conn, id, &branch, by)?;
+    // A sign-off is the event a protected branch turns on, so it is exactly as worth a line as a
+    // refused request.
+    crate::audit::local::approve(&root, id, by, &branch);
     let signers = crate::approval::approvers(&conn, id)?;
     println!("{} approved by {} (approvals: {})", id, by, signers.join(", "));
     if crate::approval::is_protected(&conn, &branch)? && signers.len() == 1 {

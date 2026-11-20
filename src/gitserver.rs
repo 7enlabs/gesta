@@ -819,6 +819,7 @@ pub fn receive_pack_allowing(
                     out.extend_from_slice(
                         pkt_line(format!("ng {} {}\n", c.name, e).as_bytes()).as_slice(),
                     );
+                    crate::audit::local::push_refused(root, &branch, pusher, &e.to_string());
                     continue;
                 }
             }
@@ -934,6 +935,9 @@ pub fn receive_pack_allowing(
                     }
                     crate::store::set_branch_head(&conn, &branch, &id)?;
                     crate::store::refresh_branch_tree(&conn, &branch)?;
+                    // A push is where a branch moves for somebody else's work, which is the event
+                    // an operator most wants in one place.
+                    crate::audit::local::push(root, &branch, pusher, &format!("{} -> {}", c.old, c.new));
                     out.extend_from_slice(&pkt_line(format!("ok {}\n", c.name).as_bytes()));
                 }
                 None => {

@@ -3242,6 +3242,19 @@ def main():
                     proc.kill()
                 _shv.rmtree(d, ignore_errors=True)
 
+    if want("audit-local"):
+        # The record held refusals and served requests. A commit, a sign-off, a rotation and a
+        # push were invisible, so an operator saw arrivals and nothing about the work.
+        r = sh_out(
+            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'audit_local.py')}",
+            cwd=ZF_DIR,
+        )
+        record(
+            "the audit record holds what the machine did, not only what was asked",
+            r[0] == 0 and "6/6 local audit checks pass" in r[1],
+            (r[1] or "")[-400:],
+        )
+
     if want("key-rotate"):
         # A rotation that invalidates history is worse than no rotation: the person rotating
         # believes they improved things. This signs, rotates, and verifies the old signature.

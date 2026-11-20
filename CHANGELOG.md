@@ -78,6 +78,22 @@ no delta, no v2, no ref deletion.
 
 ## Unreleased
 
+### Rotating a signing key
+
+- `gesta key rotate` archives the key in use under a name that names it, then makes a new one.
+  Nothing is re-signed: a signature names the public key it was made with.
+- `gesta key generate` records the key as active, so a repository that never rotates still
+  answers which keys were ours.
+- `gesta key list` shows every key and which one is active.
+- `gesta verify` names a public key this repository has never recorded.
+- `bench/key_rotate.py` checks that an old signature still verifies after a rotation.
+
+### The record holds what the machine did
+
+- `audit.log` now holds commits, sign-offs, key rotations and pushes, not only what the server
+  decided about a request. The same lines go to a configured collector.
+- `bench/audit_local.py` does each action over a real socket and reads the line back.
+
 ### Submodules
 
 - `gesta submodule add <path> <url>` writes a `.gitmodules` entry; `init` clones missing ones at

@@ -74,6 +74,27 @@ impl Forwarder {
         Forwarder { tx, counters }
     }
 
+    /// Build a forwarder from what this repository is configured with, if anything.
+    ///
+    /// Two files rather than flags, so a collector that moves is a file edit: `.gesta/audit-url`
+    /// holds the URL and `.gesta/audit-token` the bearer token. They are separate because a URL is
+    /// logged by every proxy on the way and a credential in a log has to be rotated.
+    ///
+    /// Returns `Ok(None)` when no URL is configured, which is the ordinary case for a local
+    /// repository and is not an error.
+    pub fn from_repo(root: &std::path::Path) -> crate::ZResult<Option<Forwarder>> {
+        let dir = crate::repo_dir(root);
+        let url = match std::fs::read_to_string(dir.join("audit-url")) {
+            Ok(u) if !u.trim().is_empty() => u.trim().to_string(),
+            _ => return Ok(None),
+        };
+        let token = std::fs::read_to_string(dir.join("audit-token"))
+            .ok()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        Ok(Some(Forwarder::start(url, token)))
+    }
+
     /// Hand one line to the forwarder.
     ///
     /// Returns false when the queue was full, so the caller can count it. Nothing blocks: a request
