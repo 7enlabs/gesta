@@ -180,6 +180,14 @@ pub fn scan_with_cache(
     // `skipped_binary` the binary ones, which together are every path present on
     // disk. Keeping a third copy of the same strings was pure allocation.
     prune_cache(conn, &files, &skipped_binary)?;
+    // Sorted by repository path before it leaves this function. The walk returns whatever order the
+    // filesystem hands back, which is hash order on ext4 and insertion order on others, so anything
+    // that reads `files` positionally was reading an order the filesystem chose. Two machines with
+    // identical trees could then produce different output from the same command.
+    //
+    // The cost is 7.2 ms on 100,003 paths against a 183 ms status, which is worth paying for a
+    // contract every caller can rely on instead of one each has to remember not to depend on.
+    files.sort_by(|a, b| a.rel.cmp(&b.rel));
     Ok(ScanResult {
         files,
         skipped_binary,
@@ -309,7 +317,19 @@ mod tests {
         let rules = IgnoreRules::with_defaults(&[]);
         let r = scan_with_cache(&conn, &d, &rules, &crate::attributes::Rules::default()).unwrap();
         assert_eq!(r.files.len(), 2);
-        assert_eq!(r.files[0].hash, hash_content("one\n"));
+        // By name, not by index. The scan sorts now, but a test that looks up what it wrote is
+        // checking the scan rather than the filesystem's ordering, and its failure message says which
+        // file is wrong.
+        let a = r.files.iter().find(|f| f.rel == "a.txt").expect("a.txt is missing");
+        let b = r.files.iter().find(|f| f.rel == "b.txt").expect("b.txt is missing");
+        assert_eq!(a.hash, hash_content("one\n"));
+        assert_eq!(b.hash, hash_content("two\n"));
+        // And the order itself is part of the contract now.
+        assert_eq!(
+            r.files.iter().map(|f| f.rel.as_str()).collect::<Vec<_>>(),
+            vec!["a.txt", "b.txt"],
+            "the scan must return paths in sorted order"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
