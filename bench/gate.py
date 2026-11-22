@@ -4828,6 +4828,21 @@ def main():
             (r[1] or "")[-600:],
         )
 
+    if want("shallow"):
+        # `--depth` was accepted and then dropped on the HTTP clone path, so a shallow clone was exactly
+        # as large as a full one while the flag looked honoured. The only way to see that is to clone
+        # twice and compare, which is what this does.
+        r = sh(
+            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'shallow_clone.py')}",
+            cwd=ZF_DIR,
+            timeout=240,
+        )
+        record(
+            "a shallow clone fetches less and is still usable",
+            r[0] == 0 and "shallow clone checks pass" in r[1],
+            (r[1] or "")[-600:],
+        )
+
     if want("lfs"):
         # The lock calls are the part of git-lfs a server keeps state for, and each of the three has a
         # way to answer 200 while doing nothing: a filter that reads the wrong column, an owner that is

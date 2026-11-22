@@ -450,6 +450,24 @@ fn stored_delta(
 }
 
 pub fn build_bundle(conn: &Connection, branch: &str, have: &HashSet<String>) -> ZResult<Bundle> {
+    build_bundle_with_depth(conn, branch, have, None)
+}
+
+/// The same bundle, cut to `depth` changesets.
+///
+/// A shallow bundle carries the newest N changesets and records the oldest one it sent as
+/// `shallow_root`, so a receiver knows whose parent it does not have. Without that marker the receiver
+/// stores a changeset pointing at a parent that is not there, and the first operation that walks the
+/// history fails on a row nobody can explain.
+///
+/// The cut is by distance from the head, counted along the ancestry, which is what `git clone --depth`
+/// means. Depth 0 means "just the head", and `None` means everything.
+pub fn build_bundle_with_depth(
+    conn: &Connection,
+    branch: &str,
+    have: &HashSet<String>,
+    depth: Option<usize>,
+) -> ZResult<Bundle> {
     let head = branch_head(conn, branch)?;
     let mut b = Bundle {
         branch: branch.to_string(),
@@ -467,6 +485,20 @@ pub fn build_bundle(conn: &Connection, branch: &str, have: &HashSet<String>) -> 
     let Some(head) = head else { return Ok(b) };
 
     let chain = crate::store::ancestors_bfs(conn, &head)?;
+
+    // `ancestors_bfs` returns the head first and then its parents level by level, so the first N
+    // entries are the N newest along the ancestry. Anything past that is history the caller asked not
+    // to receive; dropping it is the whole point of a shallow clone, and the oldest one kept becomes
+    // the marker that says so.
+    let (chain, shallow_root) = match depth {
+        Some(d) => {
+            let kept: Vec<String> = chain.into_iter().take(d.saturating_add(1)).collect();
+            let root = kept.last().cloned();
+            (kept, root)
+        }
+        None => (chain, None),
+    };
+
     let wanted: HashSet<String> = chain
         .iter()
         .filter(|id| !have.contains(*id))
@@ -578,6 +610,9 @@ pub fn build_bundle(conn: &Connection, branch: &str, have: &HashSet<String>) -> 
             }
         }
     }
+    // The marker a receiver needs so it knows whose parent it is missing. Set here rather than in the
+    // struct literal because `b` is built before the depth is known.
+    b.shallow_root = shallow_root.filter(|r| !have.contains(r));
     Ok(b)
 }
 

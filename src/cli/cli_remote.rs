@@ -500,7 +500,7 @@ pub fn cmd_clone(
     }
 
     if http::is_http_url(url) {
-        return clone_http(url, target, token, pin);
+        return clone_http(url, target, token, pin, depth);
     }
 
     let remote_path = remote::resolve_remote(url);
@@ -1396,7 +1396,13 @@ fn pull_http(
 }
 
 /// Clone over HTTP: ask for the branch list, fetch the first branch.
-fn clone_http(url: &str, target: &Path, token: Option<&str>, pin: Option<&str>) -> ZResult<()> {
+fn clone_http(
+    url: &str,
+    target: &Path,
+    token: Option<&str>,
+    pin: Option<&str>,
+    depth: Option<usize>,
+) -> ZResult<()> {
     let base = url.trim_end_matches('/');
 
     let (status, body) =
@@ -1422,7 +1428,7 @@ fn clone_http(url: &str, target: &Path, token: Option<&str>, pin: Option<&str>) 
 
     let (status, body) = http::request_with_pin(
         "GET",
-        &http::bundle_url(base, &branch, &[]),
+        &http::bundle_url_depth(base, &branch, &[], depth),
         None,
         token,
         pin,
@@ -1451,12 +1457,16 @@ fn clone_http(url: &str, target: &Path, token: Option<&str>, pin: Option<&str>) 
     )?;
     let (written, _removed) = repo::restore_worktree(&conn, target, &branch)?;
     println!(
-        "cloned {} into {} (branch {}, {} changeset(s), {} file(s))",
+        "cloned {} into {} (branch {}, {} changeset(s), {} file(s){})",
         base,
         target.display(),
         branch,
         bundle.changesets.len(),
-        written
+        written,
+        match depth {
+            Some(d) => format!(", shallow depth {}", d),
+            None => String::new(),
+        }
     );
     Ok(())
 }

@@ -897,7 +897,12 @@ pub fn route(
                         .collect()
                 })
                 .unwrap_or_default();
-            match fetch_bundle(root, branch, &have) {
+            // `depth=0` means the head alone, and a missing parameter means everything. Both have to
+            // be told apart from `depth=0` being falsy.
+            let depth = req
+                .param("depth")
+                .and_then(|d| d.trim().parse::<usize>().ok());
+            match fetch_bundle_with_depth(root, branch, &have, depth) {
                 Ok(Some(bytes)) => {
                     log_access(
                         root,
@@ -1609,13 +1614,23 @@ fn list_branches(root: &Path) -> ZResult<String> {
     Ok(out)
 }
 
-fn fetch_bundle(root: &Path, branch: &str, have: &HashSet<String>) -> ZResult<Option<Vec<u8>>> {
+/// The same bundle, cut to a depth the caller asked for.
+///
+/// `--depth` was accepted by `clone` and then dropped on this path: the client sent a plain bundle URL
+/// and the server always built the whole history, so a shallow clone was as large as a full one and
+/// the flag did nothing. It is honoured here.
+fn fetch_bundle_with_depth(
+    root: &Path,
+    branch: &str,
+    have: &HashSet<String>,
+    depth: Option<usize>,
+) -> ZResult<Option<Vec<u8>>> {
     let conn = open_db(root)?;
     init_schema(&conn)?;
     if branch_head(&conn, branch).is_err() {
         return Ok(None);
     }
-    let bundle = remote::build_bundle(&conn, branch, have)?;
+    let bundle = remote::build_bundle_with_depth(&conn, branch, have, depth)?;
     Ok(Some(bundle.encode()?))
 }
 
@@ -1701,6 +1716,11 @@ pub fn log_access(root: &Path, who: &str, action: &str, branch: &str, detail: &s
 
 /// URL a client should hit for a given repository base and branch.
 pub fn bundle_url(base: &str, branch: &str, have: &[String]) -> String {
+    bundle_url_depth(base, branch, have, None)
+}
+
+/// The bundle URL, optionally asking the server to cut the history to `depth` changesets.
+pub fn bundle_url_depth(base: &str, branch: &str, have: &[String], depth: Option<usize>) -> String {
     let mut url = format!(
         "{}/v1/bundle?branch={}",
         base.trim_end_matches('/'),
@@ -1709,6 +1729,9 @@ pub fn bundle_url(base: &str, branch: &str, have: &[String]) -> String {
     if !have.is_empty() {
         url.push_str("&have=");
         url.push_str(&have.join("%2C"));
+    }
+    if let Some(d) = depth {
+        url.push_str(&format!("&depth={}", d));
     }
     url
 }
