@@ -187,6 +187,17 @@ pub fn init_schema(conn: &Connection) -> ZResult<()> {
             mode         TEXT,
             PRIMARY KEY (changeset_id, path)
         );
+        -- A git-lfs lock: one path held by one owner until it is released. git-lfs uses these so two
+        -- people do not edit the same binary at once, and the format is a table rather than a file so
+        -- that a lock survives a backup and a restore, which is what the drill in bench/backup_remote.py
+        -- checks.
+        CREATE TABLE IF NOT EXISTS lfs_locks (
+            id         TEXT PRIMARY KEY,
+            path       TEXT NOT NULL UNIQUE,
+            owner      TEXT NOT NULL,
+            refname    TEXT,
+            locked_at  INTEGER NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS file_versions (
             path         TEXT NOT NULL,
             version      INTEGER NOT NULL,

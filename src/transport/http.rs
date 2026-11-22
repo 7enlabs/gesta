@@ -81,6 +81,17 @@ impl Response {
         }
     }
 
+    /// An error whose body is JSON, which is what the git-lfs calls expect: a client parses the body
+    /// of a failed lock to learn who holds it, and a plain text body loses that.
+    pub fn error_with_type(status: u16, reason: &'static str, body: Vec<u8>) -> Response {
+        Response {
+            status,
+            reason,
+            content_type: "application/vnd.git-lfs+json",
+            body,
+        }
+    }
+
     /// A binary answer with the content type its consumer requires. A git client refuses a
     /// response whose type is not the one it asked for, and reports it as a protocol error.
     pub fn ok_with_type(b: Vec<u8>, content_type: &'static str) -> Response {
@@ -595,6 +606,26 @@ fn lfs_prefix(path: &str) -> String {
     }
 }
 
+/// The user name in an `Authorization` header, without verifying anything.
+///
+/// Used for attribution only, on routes that do not gate on a credential. A caller must never treat
+/// this as an identity; `auth::authenticate_now` is the one that decides access.
+///
+/// The name is the part **before** the colon. `decode_basic_token` returns the part after it, because
+/// every other caller wants the token; using it here made a lock held by `alice:x` report its owner as
+/// `x`, and two different users who happened to send the same password looked like one person.
+fn presented_name(header: &str) -> Option<String> {
+    use crate::transport::remote::decode_base64_str;
+    let rest = header.strip_prefix("Basic ")?;
+    let raw = decode_base64_str(rest)?;
+    let text = String::from_utf8(raw).ok()?;
+    let (user, _token) = text.split_once(':')?;
+    if user.is_empty() {
+        return None;
+    }
+    Some(user.to_string())
+}
+
 fn handle_connection(
     mut stream: TcpStream,
     root: &Path,
@@ -731,6 +762,13 @@ pub fn route(
     };
 
     let mut who = "anonymous".to_string();
+    // A name for attribution, whether or not this route requires a credential. Locks are the reason:
+    // the answer to "who is holding the 200 MB asset" is the whole point of a lock, and a server with
+    // auth turned off still has to say something better than `anonymous` when a credential was sent.
+    // The value is taken from the same header the auth path reads and is never used to grant access.
+    if let Some(name) = req.authorization.as_deref().and_then(presented_name) {
+        who = name;
+    }
     let mut grant: Option<crate::transport::auth::Grant> = None;
     // Recorded once the decision is made. A request with no credential requirement is not an event
     // worth a line, but one that was authenticated is.
@@ -884,6 +922,126 @@ pub fn route(
         // inventing one from the path would produce a link that is wrong behind any proxy. A client
         // resolves a relative href against the endpoint it called, which is the correct answer by
         // construction.
+        // ---- git-lfs locks ----
+        //
+        // The three calls git-lfs makes to hold a path: list, claim, release. They sit under the same
+        // prefix as the objects so one auth decision covers the repository, and each one writes an
+        // access row, because "who took the lock on the 200 MB asset" is the question these exist to
+        // answer afterwards.
+        ("GET", p) if p.ends_with("/info/lfs/locks") => {
+            let conn = match open_db(root) {
+                Ok(c) => c,
+                Err(e) => return Response::error(500, "Internal Server Error", e.to_string()),
+            };
+            // `path` and `id` are the two filters the spec defines for this call, and they are
+            // different columns. Passing the path filter as an owner is how this returned every lock
+            // while reporting success; the filters stay separate here.
+            //
+            // `req.query` is the parsed query string, and it is the only place these filters exist:
+            // `p` is the path with the query already trimmed, so reading `?path=` off it yields `None`
+            // and the list comes back unfiltered while the response says 200. That is the third time
+            // this endpoint produced a filter that silently did nothing.
+            let param = |k: &str| -> Option<String> {
+                req.query
+                    .iter()
+                    .find(|(name, _)| name == k)
+                    .map(|(_, v)| v.clone())
+            };
+            let want_path = param("path");
+            let want_id = param("id");
+            let locks =
+                crate::transport::lfs::list(&conn, None, want_path.as_deref(), want_id.as_deref());
+            log_access(
+                root,
+                &who,
+                "git-lfs-locks",
+                p,
+                &format!("{} listed", locks.len()),
+            );
+            let body = crate::transport::lfs::locks_json(&locks);
+            Response::ok_with_type(body.into_bytes(), "application/vnd.git-lfs+json")
+        }
+        ("POST", p) if p.ends_with("/info/lfs/locks") => {
+            let conn = match open_db(root) {
+                Ok(c) => c,
+                Err(e) => return Response::error(500, "Internal Server Error", e.to_string()),
+            };
+            let (path, refname) = match crate::transport::lfs::parse_lock_request(&req.body) {
+                Some(v) => v,
+                None => {
+                    return Response::error(
+                        422,
+                        "Unprocessable Entity",
+                        "a lock body must name a path".to_string(),
+                    )
+                }
+            };
+            let at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            match crate::transport::lfs::lock(&conn, &path, &who, refname.as_deref(), at) {
+                Ok(l) => {
+                    log_access(root, &who, "git-lfs-lock", &path, "taken");
+                    let body = format!("{{\"lock\":{}}}", crate::transport::lfs::one_json(&l));
+                    Response::ok_with_type(body.into_bytes(), "application/vnd.git-lfs+json")
+                }
+                Err(msg) => {
+                    // 409 with the holder named, which is what git-lfs reads to show the user who to
+                    // ask. A plain 403 would lose that.
+                    let holder = crate::transport::lfs::list(&conn, None, Some(&path), None)
+                        .into_iter()
+                        .find(|l| l.path == path);
+                    let body = match holder {
+                        Some(l) => format!(
+                            "{{\"lock\":{},\"message\":{}}}",
+                            crate::transport::lfs::one_json(&l),
+                            crate::transport::lfs::quote(&msg)
+                        ),
+                        None => format!("{{\"message\":{}}}", crate::transport::lfs::quote(&msg)),
+                    };
+                    log_access(root, &who, "git-lfs-lock", &path, "refused");
+                    Response::error_with_type(409, "Conflict", body.into_bytes())
+                }
+            }
+        }
+        ("POST", p) if p.ends_with("/info/lfs/locks/verify") => {
+            let conn = match open_db(root) {
+                Ok(c) => c,
+                Err(e) => return Response::error(500, "Internal Server Error", e.to_string()),
+            };
+            // `verify` answers "which of these paths can I lock", and git-lfs calls it before a push
+            // so it can refuse early. Our answer is the locks that exist, split the same way the spec
+            // splits them: ours, and theirs.
+            let locks = crate::transport::lfs::list(&conn, None, None, None);
+            let (mine, theirs): (Vec<_>, Vec<_>) = locks.into_iter().partition(|l| l.owner == who);
+            let body = crate::transport::lfs::verify_json(&mine, &theirs);
+            Response::ok_with_type(body.into_bytes(), "application/vnd.git-lfs+json")
+        }
+        ("POST", p) if p.ends_with("/info/lfs/locks/unlock") || p.contains("/locks/unlock") => {
+            let conn = match open_db(root) {
+                Ok(c) => c,
+                Err(e) => return Response::error(500, "Internal Server Error", e.to_string()),
+            };
+            let (id, force) = match crate::transport::lfs::parse_unlock(&req.body) {
+                Some(v) => v,
+                None => {
+                    return Response::error(
+                        422,
+                        "Unprocessable Entity",
+                        "an unlock body must name a lock id".to_string(),
+                    )
+                }
+            };
+            match crate::transport::lfs::unlock(&conn, &id, &who, force) {
+                Ok(l) => {
+                    log_access(root, &who, "git-lfs-unlock", &l.path, "released");
+                    let body = format!("{{\"lock\":{}}}", crate::transport::lfs::one_json(&l));
+                    Response::ok_with_type(body.into_bytes(), "application/vnd.git-lfs+json")
+                }
+                Err(msg) => Response::error(403, "Forbidden", msg),
+            }
+        }
         ("POST", p) if p.ends_with("/info/lfs/objects/batch") => {
             let (op, wanted) = match crate::transport::lfs::parse_batch(&req.body) {
                 Some(v) => v,

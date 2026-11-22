@@ -74,8 +74,15 @@ lossless and leaves the missing object visible; inventing bytes for it would be 
 
 - **No `lfs` subcommand.** A client that speaks git-lfs uses the two routes above. There is no
   command that stages a file as a pointer on the client side, because the export does that.
-- **No locking API.** `POST locks/verify` and the lock routes are absent. A team that relies on
-  git-lfs locking to keep two people off one binary does not have that here.
+- **Locking exists, with limits.** `GET /locks`, `POST /locks`, `POST /locks/verify` and
+  `POST /locks/unlock` are implemented, and `bench/lfs_locks.py` checks twelve properties of them
+  against a live server. What a lock is here: a row in `lfs_locks`, one per path, holding an owner, an
+  optional ref and a timestamp. Releasing a path somebody else holds needs `force`, which is the
+  server-side override git-lfs defines. What is **not** here: the owner is whoever the request named
+  in an `Authorization` header, so on a server with auth turned off every client is `anonymous` and a
+  lock cannot tell two people apart; there is no `locking` declaration in `.gitattributes` handling, so
+  a client is never told which paths need a lock before it edits them; and a lock does not block a
+  push, because nothing in the push path reads the table.
 - **`expires_at` is not enforced on read.** The value is emitted because a strict client rejects a
   response without it, and the object route does not check it afterwards. A leaked href works until
   the process stops, which is the same lifetime as a plain clone URL.

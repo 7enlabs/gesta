@@ -4828,6 +4828,22 @@ def main():
             (r[1] or "")[-600:],
         )
 
+    if want("lfs"):
+        # The lock calls are the part of git-lfs a server keeps state for, and each of the three has a
+        # way to answer 200 while doing nothing: a filter that reads the wrong column, an owner that is
+        # always `anonymous`, a release by a non-holder that succeeds. Every one of those was present
+        # and every one is now a check.
+        r = sh(
+            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lfs_locks.py')}",
+            cwd=ZF_DIR,
+            timeout=240,
+        )
+        record(
+            "the git-lfs lock calls refuse, attribute and filter correctly",
+            r[0] == 0 and "lock checks pass" in r[1],
+            (r[1] or "")[-600:],
+        )
+
     if want("forge"):
         # Two branches in one request. The single-ref push was already covered; what was not is that a
         # report is read per command, so a client that names only the first ref turns a partial push
