@@ -614,6 +614,16 @@ is a difference from git that a person will notice.
 
 ### 9. What git has that nothing here replaces
 
+- **File modes are recorded, not derived.** A file's mode (`100644`, `100755` for an executable,
+  `120000` for a symlink) is stored with the path and survives a round trip through git, checked by
+  `bench/differential.py` against a real git binary: an export of a repository holding an executable
+  script and the same bytes without the bit lists `100755` and `100644` respectively, as git does.
+  Before this was recorded the store had no column for a mode, so importing a repository that marked a
+  script executable and exporting it back gave git a script it would not run while every byte matched.
+  What is not covered: the mode is read when a file enters the store (from git on import, from the
+  filesystem on a scan) and carried as data after that. A checkout on Windows has no executable bit to
+  read, so a file added there records `100644` whatever git would have said, and changing a mode
+  without changing the content is not a change this store notices on its own.
 - **Submodules** in git's sense, partly. `submodule` reads and writes `.gitmodules` and records a
   pointer rather than a copy. Import now keeps a gitlink (mode 160000) as a subrepository record, and
   export writes it back as a gitlink, so a repository with a submodule survives a round trip through

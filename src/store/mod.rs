@@ -180,6 +180,11 @@ pub fn init_schema(conn: &Connection) -> ZResult<()> {
             path         TEXT NOT NULL,
             old_hash     TEXT,
             new_hash     TEXT,
+            -- The git mode this path carried: 100644, 100755 for a file with the executable bit, or
+            -- 120000 for a symlink. Null means 100644, which is what every row written before the
+            -- column existed is. Without it a round trip through git turns every executable into a
+            -- plain file while all the bytes still match.
+            mode         TEXT,
             PRIMARY KEY (changeset_id, path)
         );
         CREATE TABLE IF NOT EXISTS file_versions (
@@ -451,6 +456,11 @@ pub fn migrate(conn: &Connection) -> ZResult<bool> {
     }
     // A branch is unprotected by default, which is what every repository created before this is.
     ensure_column(conn, "branches", "protected", "INTEGER NOT NULL DEFAULT 0")?;
+    // The mode a file carried when it was written: 100644, 100755 for an executable, 120000 for a
+    // symlink. Without this column every file is a `100644` blob, so importing a repository that marks
+    // a script executable and exporting it back gives git a script it will not run. The column is null
+    // for every row written before it existed, and null means `100644`, which is what those rows are.
+    ensure_column(conn, "changeset_files", "mode", "TEXT")?;
     init_schema(conn)?;
     // Migration ran, so the caller has to re-read the schema it cached. The value was always true
     // here; `changed` tracked columns added along the way and nothing read it.
@@ -1683,6 +1693,22 @@ pub fn gc(conn: &Connection) -> ZResult<u64> {
 /// which made `store` call up into `repo` while `repo` called down into `store`. That cycle is
 /// invisible to the compiler, because this is one crate.
 pub fn tree_at(conn: &Connection, changeset: &str) -> ZResult<Vec<(String, String)>> {
+    Ok(tree_at_with_mode(conn, changeset)?
+        .into_iter()
+        .map(|(p, h, _)| (p, h))
+        .collect())
+}
+
+/// The tree at a changeset, with the mode each file carried.
+///
+/// A mode is not content. A script marked executable and the same script without the bit are the same
+/// bytes and different trees to git, and a reader that only sees paths and hashes cannot tell them
+/// apart. `100644` is the default for a row written before the column existed, which is what those
+/// rows are.
+pub fn tree_at_with_mode(
+    conn: &Connection,
+    changeset: &str,
+) -> ZResult<Vec<(String, String, String)>> {
     let reachable = ancestors_bfs(conn, changeset)?;
     if reachable.is_empty() {
         return Ok(Vec::new());
@@ -1705,8 +1731,8 @@ pub fn tree_at(conn: &Connection, changeset: &str) -> ZResult<Vec<(String, Strin
 
     let placeholders = in_placeholders(reachable.len());
     let sql = format!(
-        "SELECT cf.changeset_id, cf.path, cf.new_hash FROM changeset_files cf
-         WHERE cf.changeset_id IN ({})",
+        "SELECT cf.changeset_id, cf.path, cf.new_hash, COALESCE(cf.mode, '100644')
+         FROM changeset_files cf WHERE cf.changeset_id IN ({})",
         placeholders
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -1720,30 +1746,31 @@ pub fn tree_at(conn: &Connection, changeset: &str) -> ZResult<Vec<(String, Strin
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, Option<String>>(2)?,
+                r.get::<_, String>(3)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     // Nearest to the head wins. A null hash is a deletion, which also wins over
     // anything older for that path.
-    let mut seen: std::collections::HashMap<String, (usize, Option<String>)> =
+    let mut seen: std::collections::HashMap<String, (usize, Option<String>, String)> =
         std::collections::HashMap::new();
-    for (cs, path, hash) in rows {
+    for (cs, path, hash, mode) in rows {
         let d = match rank.get(cs.as_str()) {
             Some(d) => *d,
             None => continue,
         };
         match seen.get(&path) {
-            Some((best, _)) if *best <= d => {}
+            Some((best, _, _)) if *best <= d => {}
             _ => {
-                seen.insert(path, (d, hash));
+                seen.insert(path, (d, hash, mode));
             }
         }
     }
 
-    let mut files: Vec<(String, String)> = seen
+    let mut files: Vec<(String, String, String)> = seen
         .into_iter()
-        .filter_map(|(p, (_, h))| h.map(|hash| (p, hash)))
+        .filter_map(|(p, (_, h, m))| h.map(|hash| (p, hash, m)))
         .collect();
     files.sort();
     Ok(files)

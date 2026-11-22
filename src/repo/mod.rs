@@ -197,7 +197,7 @@ pub fn create_changeset_scoped(
     let rules = load_ignore_rules(root, conn)?;
     let scope = crate::store::sparse::SparseScope::load(conn)?;
 
-    let mut changes: Vec<(String, Option<String>, String, String)> = Vec::new();
+    let mut changes: Vec<(String, Option<String>, String, String, String)> = Vec::new();
     let mut deleted: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -263,7 +263,7 @@ pub fn create_changeset_scoped(
             } else {
                 f.content
             };
-            changes.push((f.rel, old_hash, f.hash, content));
+            changes.push((f.rel, old_hash, f.hash, content, f.mode));
         }
     }
     let skipped = scanned.skipped_binary;
@@ -294,15 +294,15 @@ pub fn create_changeset_scoped(
     )?;
 
     let mut files = Vec::new();
-    for (rel, old, new, content) in &changes {
+    for (rel, old, new, content, mode) in &changes {
         // A delta against the previous version of this path is what keeps a
         // long editing history small. `old` is that previous version's hash.
         // The path is here and the rules are here, so a text file the rules call large goes out too.
         put_object_for(&tx, content, Some(rel), Some(&attrs), old.as_deref())?;
         tx.execute(
-            "INSERT INTO changeset_files(changeset_id, path, old_hash, new_hash)
-             VALUES(?1, ?2, ?3, ?4)",
-            params![id, rel, old, new],
+            "INSERT INTO changeset_files(changeset_id, path, old_hash, new_hash, mode)
+             VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![id, rel, old, new, mode],
         )?;
         files.push((rel.clone(), old.clone(), new.clone()));
     }

@@ -27,6 +27,29 @@ pub struct ScannedFile {
     pub rel: String,
     pub hash: String,
     pub content: String,
+    /// The git mode this file carries: `100644`, `100755` for a file with the executable bit set.
+    ///
+    /// A mode is not content. A script that is executable and the same script without the bit are the
+    /// same bytes and different trees, and a store that only records content silently turns every
+    /// executable into a plain file on the way out.
+    pub mode: String,
+}
+
+/// The git mode for a path, from its own metadata.
+///
+/// Windows has no executable bit, so a checkout there reports `100644` for everything and the bit is
+/// whatever git recorded. That is why the mode is read where the format knows about it (import) and
+/// carried as data everywhere else, rather than recomputed from the filesystem on the way out.
+fn mode_of(meta: &fs::Metadata) -> String {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 != 0 {
+            return "100755".into();
+        }
+    }
+    let _ = meta;
+    "100644".into()
 }
 
 pub struct ScanResult {
@@ -113,6 +136,7 @@ pub fn scan_with_cache(
                         rel,
                         hash: ch.clone(),
                         content: String::new(),
+                        mode: mode_of(&meta),
                     });
                     continue;
                 }
@@ -143,7 +167,12 @@ pub fn scan_with_cache(
                 let hash = hash_content(&content);
                 rehashed += 1;
                 pending_writes.push((rel.clone(), mtime, size, hash.clone()));
-                files.push(ScannedFile { rel, hash, content });
+                files.push(ScannedFile {
+                    rel,
+                    hash,
+                    content,
+                    mode: mode_of(&meta),
+                });
             }
             ReadOutcome::Binary => {
                 // Binary files are stored as raw bytes, no compression, no delta.
@@ -156,6 +185,7 @@ pub fn scan_with_cache(
                     rel,
                     hash,
                     content: String::new(),
+                    mode: mode_of(&meta),
                 });
             }
             ReadOutcome::Unreadable(e) => unreadable.push(format!("{}: {}", rel, e)),

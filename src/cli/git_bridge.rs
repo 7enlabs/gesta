@@ -145,7 +145,7 @@ pub fn import(conn: &Connection, git_root: &Path, prefix: Option<&str>) -> ZResu
         // The store's own name is written, and the git name is recovered on export by hashing
         // the body again.
         let mut old_now: HashMap<String, String> = HashMap::new();
-        for (path, (git_hash, _mode)) in &here {
+        for (path, (git_hash, mode)) in &here {
             let body = repo.read_object(git_hash)?;
             // A pointer file names its oid, and the bytes it stands for are not in this pack. The
             // store already holds them when the import runs on the machine that made the export, so
@@ -168,8 +168,8 @@ pub fn import(conn: &Connection, git_root: &Path, prefix: Option<&str>) -> ZResu
                 continue;
             }
             conn.execute(
-                "INSERT INTO changeset_files(changeset_id,path,old_hash,new_hash) VALUES(?1,?2,?3,?4)",
-                rusqlite::params![id, path, parent_tree.get(path), our_hash],
+                "INSERT INTO changeset_files(changeset_id,path,old_hash,new_hash,mode) VALUES(?1,?2,?3,?4,?5)",
+                rusqlite::params![id, path, parent_tree.get(path), our_hash, mode],
             )?;
             // `file_versions` is what answers "what did this path hold, and when". An import that
             // wrote only `changeset_files` left the content reachable from the tree but invisible to
@@ -435,7 +435,9 @@ fn export_into(conn: &Connection, repo: &Repo, branch: Option<&str>) -> ZResult<
 /// this order wrong writes a root tree with only the files at the top level, which is what git
 /// then shows as "path does not exist" while every object is present.
 fn write_tree_for(conn: &Connection, repo: &Repo, changeset: &str) -> ZResult<String> {
-    let files = crate::store::tree_at(conn, changeset)?;
+    // Modes come back with the paths. Writing `100644` for everything was how a script marked
+    // executable arrived in git as a file git would not run: the bytes matched and the mode did not.
+    let files = crate::store::tree_at_with_mode(conn, changeset)?;
     if files.is_empty() {
         return Err(bad(format!(
             "changeset {} has no files, so there is no tree to write",
@@ -445,7 +447,7 @@ fn write_tree_for(conn: &Connection, repo: &Repo, changeset: &str) -> ZResult<St
 
     // Group the paths by their directory, and write each file's blob once.
     let mut by_dir: BTreeMap<String, Vec<Entry>> = BTreeMap::new();
-    for (path, hash) in &files {
+    for (path, hash, mode) in &files {
         // A large object leaves the tree as a pointer rather than as its bytes. git has no way to
         // learn a blob is large on its own, so the exporter writes what git-lfs expects: a three line
         // text file naming the oid and the size. The bytes stay in the sidecar and are served by
@@ -471,8 +473,16 @@ fn write_tree_for(conn: &Connection, repo: &Repo, changeset: &str) -> ZResult<St
             Some((d, n)) => (d.to_string(), n.to_string()),
             None => (String::new(), path.clone()),
         };
+        let entry_mode = match mode.as_str() {
+            // A symlink is stored by this tree as an ordinary file whose content is the target, which
+            // is the same thing git stores; writing it back as `120000` is what makes it a link again.
+            "120000" => "120000",
+            // Anything else is a regular file, and the only distinction git records is the bit.
+            "100755" => "100755",
+            _ => "100644",
+        };
         by_dir.entry(dir).or_default().push(Entry {
-            mode: "100644".into(),
+            mode: entry_mode.into(),
             name,
             hash: blob,
         });
@@ -968,6 +978,103 @@ mod tests {
             "the export gave the commit a different name"
         );
         let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// A one commit repository whose tree holds a script with the executable bit and the same bytes
+    /// as a plain file. The two blobs are identical on purpose: only the mode tells them apart.
+    fn make_git_repo_with_a_mode(root: &std::path::Path) -> String {
+        let git = root.join(".git");
+        std::fs::create_dir_all(git.join("objects")).unwrap();
+        std::fs::create_dir_all(git.join("refs/heads")).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let repo = Repo::open(root).unwrap();
+
+        let body = b"#!/bin/sh\necho hi\n".to_vec();
+        let blob = repo.write_object(Kind::Blob, &body).unwrap();
+        let tree = repo
+            .write_object(
+                Kind::Tree,
+                &gitobj::build_tree_with(
+                    vec![
+                        Entry {
+                            mode: "100755".into(),
+                            name: "run.sh".into(),
+                            hash: blob.clone(),
+                        },
+                        Entry {
+                            mode: "100644".into(),
+                            name: "run-copy.sh".into(),
+                            hash: blob,
+                        },
+                    ],
+                    HashKind::Sha1,
+                ),
+            )
+            .unwrap();
+        let commit = repo
+            .write_object(
+                Kind::Commit,
+                &gitobj::build_commit(&tree, &[], "a", "a@b", 1700000000, "+0000", "with modes\n"),
+            )
+            .unwrap();
+        std::fs::write(git.join("refs/heads/main"), format!("{}\n", commit)).unwrap();
+        commit
+    }
+
+    #[test]
+    fn the_executable_bit_survives_a_round_trip() {
+        let src = temp("mode-src");
+        make_git_repo_with_a_mode(&src);
+        let conn = crate::store::tests::mem_db();
+        import(&conn, &src, None).unwrap();
+
+        // The store has to have kept the distinction, not just the bytes.
+        let head: String = conn
+            .query_row("SELECT head FROM branches WHERE name = 'main'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let tree = crate::store::tree_at_with_mode(&conn, &head).unwrap();
+        let mode_of = |want: &str| {
+            tree.iter()
+                .find(|(p, _, _)| p == want)
+                .map(|(_, _, m)| m.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            mode_of("run.sh"),
+            "100755",
+            "import lost the executable bit"
+        );
+        assert_eq!(
+            mode_of("run-copy.sh"),
+            "100644",
+            "a plain file became executable"
+        );
+
+        // And the export has to write it back as git mode, which is the only form that matters.
+        let out = temp("mode-out");
+        export(&conn, &out, None).unwrap();
+        let repo = Repo::open(&out).unwrap();
+        let head_git = head_of(&repo, "main");
+        let commit = gitobj::parse_commit(&repo.read_object(&head_git).unwrap().body).unwrap();
+        let entries = gitobj::parse_tree(&repo.read_object(&commit.tree).unwrap().body).unwrap();
+        let git_mode = |want: &str| {
+            entries
+                .iter()
+                .find(|e| e.name == want)
+                .map(|e| e.mode.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            git_mode("run.sh"),
+            "100755",
+            "export dropped the executable bit"
+        );
+        assert_eq!(git_mode("run-copy.sh"), "100644");
+
+        let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&out);
     }
 
