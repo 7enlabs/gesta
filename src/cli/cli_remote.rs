@@ -2421,3 +2421,71 @@ pub fn cmd_forge_push(
     }
     Ok(())
 }
+
+/// Push every branch in one request.
+///
+/// The single-ref push exists and works; what it cannot do is move a `main` and a `release` without
+/// two invocations and two packs, and without the second push re-sending objects the first already
+/// delivered. This is the same request with several commands in it, which is what `git push --all`
+/// sends.
+pub fn cmd_forge_push_all(url: &str, token: Option<&str>, user: &str, json: bool) -> ZResult<()> {
+    let push_root = crate::repo_root()?;
+    repo::hooks::run(&push_root, "pre-push", &[url, "*"])?;
+    let (root, conn) = open_repo()?;
+
+    let tok = token
+        .map(|t| t.to_string())
+        .or_else(|| std::env::var("GESTA_FORGE_TOKEN").ok());
+    if tok.is_none() {
+        return Err(Box::new(crate::support::error::Error::new(
+            crate::support::error::Code::Usage,
+            "no token: pass --token or set GESTA_FORGE_TOKEN. A public repository still needs one to \
+             push, and reading it from the environment keeps it out of the shell history"
+                .to_string(),
+        )));
+    }
+
+    let mut ep = crate::transport::forge::Endpoint::new(url).with_user(user);
+    if let Some(t) = tok {
+        ep = ep.with_token(t);
+    }
+
+    let results = crate::transport::forge::push_all(&conn, &root, &ep)?;
+
+    if json {
+        let esc = |s: &str| -> String {
+            let mut o = String::with_capacity(s.len());
+            for c in s.chars() {
+                match c {
+                    '"' => o.push_str("\\\""),
+                    '\\' => o.push_str("\\\\"),
+                    '\n' => o.push_str("\\n"),
+                    '\r' => o.push_str("\\r"),
+                    '\t' => o.push_str("\\t"),
+                    c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+                    c => o.push(c),
+                }
+            }
+            o
+        };
+        let items: Vec<String> = results
+            .iter()
+            .map(|r| format!("{{\"ref\":\"{}\",\"ok\":{}}}", esc(&r.name), r.ok))
+            .collect();
+        println!("[{}]", items.join(","));
+    } else if results.is_empty() {
+        // Every branch is already at the id the remote holds. Saying nothing was pushed is honest and
+        // different from failing; a caller that cannot tell the two apart will retry a no-op forever.
+        println!("every branch is already at the commit {} holds", url);
+    } else {
+        println!(
+            "pushed {} branch(es) to {} in one request",
+            results.len(),
+            url
+        );
+        for r in &results {
+            println!("  {} now at the commit the remote accepted", r.name);
+        }
+    }
+    Ok(())
+}

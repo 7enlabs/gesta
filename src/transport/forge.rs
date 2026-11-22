@@ -348,6 +348,7 @@ pub fn objects_to_send(all: Vec<Entry>, have_remote: &HashSet<String>) -> Vec<En
 ///
 /// Returns what the remote said about the ref. A refusal is an error, and the message is the remote's
 /// own words rather than a rewrite of them.
+/// Move one local branch to one ref on the remote.
 pub fn push_branch(
     conn: &Connection,
     root: &std::path::Path,
@@ -355,41 +356,97 @@ pub fn push_branch(
     branch: &str,
     remote_ref: &str,
 ) -> ZResult<UpdateResult> {
+    push_refs(
+        conn,
+        root,
+        endpoint,
+        &[(branch.to_string(), remote_ref.to_string())],
+    )
+}
+
+/// Move every local branch to a ref of the same name on the remote.
+///
+/// A push that can only send one branch means a repository with a `main` and a `release` needs two
+/// invocations and two packs, and the second one re-sends every object the first already sent because
+/// the client has no memory of what it pushed. One request carrying every ref is what `git push --all`
+/// does, and it is the shape this was missing.
+///
+/// Branches the remote already has at the same id are skipped: sending a command that moves a ref to
+/// where it already is costs the server work and costs this client a round trip, and some servers
+/// refuse it outright.
+pub fn push_all(
+    conn: &Connection,
+    root: &std::path::Path,
+    endpoint: &Endpoint,
+) -> ZResult<Vec<UpdateResult>> {
     let adv = advertise(endpoint)?;
 
-    if crate::store::branch_head(conn, branch)?.is_none() {
-        return Err(bad(format!("no branch named {} to push", branch)));
-    }
-
-    // One export gives both the ref names and every object, which is what a push needs: the id to set
-    // the ref to, and the pack that has to arrive with it.
+    // The comparison has to be between two git commit ids. `branches.head` holds this store's own
+    // changeset id (`cs...`), not the git commit that export writes for it, so comparing a branch head
+    // to an advertised sha is comparing two different namespaces and is never equal. The first version
+    // of this did exactly that and pushed every branch every time.
+    //
+    // The exported refs are the right side of the comparison, and they are what the push sends anyway.
     let exported = crate::transport::http::open_repo_for_serve(root)?;
-    let want = exported
-        .refs
-        .iter()
-        .find(|(n, _)| n == branch)
-        .map(|(_, s)| s.clone())
-        .ok_or_else(|| bad(format!("branch {} exported to nothing", branch)))?;
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for (name, sha) in &exported.refs {
+        let remote_name = format!("refs/heads/{}", name);
+        let already = adv.id_of(&remote_name).map(|s| s == *sha).unwrap_or(false);
+        if already {
+            continue;
+        }
+        pairs.push((name.clone(), remote_name));
+    }
+    if pairs.is_empty() {
+        return Ok(Vec::new());
+    }
+    push_refs(conn, root, endpoint, &pairs).map(|one| vec![one])
+}
 
-    // The id the remote advertised, or zeroes when it has never had this ref. A command whose old id is
-    // not what the remote holds is refused, which is the mechanism that stops a push overwriting work
-    // someone else landed.
-    let old = match adv.id_of(remote_ref) {
-        Some(sha) if sha.len() >= 40 => sha.to_string(),
-        _ => "0".repeat(40),
-    };
+/// The push itself: every (local branch, remote ref) pair in one request, one pack.
+fn push_refs(
+    conn: &Connection,
+    root: &std::path::Path,
+    endpoint: &Endpoint,
+    pairs: &[(String, String)],
+) -> ZResult<UpdateResult> {
+    let adv = advertise(endpoint)?;
+
+    // One export gives both the ref names and every object, which is what a push needs: the ids to set
+    // the refs to, and the pack that has to arrive with them.
+    let exported = crate::transport::http::open_repo_for_serve(root)?;
+
+    let mut updates: Vec<Update> = Vec::new();
+    for (branch, remote_ref) in pairs {
+        if crate::store::branch_head(conn, branch)?.is_none() {
+            return Err(bad(format!("no branch named {} to push", branch)));
+        }
+        let want = exported
+            .refs
+            .iter()
+            .find(|(n, _)| n == branch)
+            .map(|(_, s)| s.clone())
+            .ok_or_else(|| bad(format!("branch {} exported to nothing", branch)))?;
+
+        // The id the remote advertised, or zeroes when it has never had this ref. A command whose old
+        // id is not what the remote holds is refused, which is the mechanism that stops a push
+        // overwriting work someone else landed.
+        let old = match adv.id_of(remote_ref) {
+            Some(sha) if sha.len() >= 40 => sha.to_string(),
+            _ => "0".repeat(40),
+        };
+        updates.push(Update {
+            name: remote_ref.clone(),
+            old,
+            new: want,
+        });
+    }
 
     let mut have: HashSet<String> = HashSet::new();
     for r in &adv.refs {
         have.insert(r.sha.clone());
     }
     let entries = objects_to_send(exported.objects, &have);
-
-    let update = Update {
-        name: remote_ref.to_string(),
-        old: old.clone(),
-        new: want.clone(),
-    };
     // Only ask for what the remote said it can do. `report-status` is what makes a rejection visible;
     // asking for it from a server that never advertised it is asking for an answer that never comes,
     // and then a refused push reads as a silent success. A remote without it gets no claim of success
@@ -401,7 +458,7 @@ pub fn push_branch(
     if adv.can("delete-refs") {
         caps.push("delete-refs");
     }
-    let body = push_body(&[update], &entries, &caps)?;
+    let body = push_body(&updates, &entries, &caps)?;
 
     let url = endpoint.url("/git-receive-pack");
     let auth = endpoint
@@ -430,23 +487,41 @@ pub fn push_branch(
     // A smart server wraps the report in side-band frames when it negotiated side-band, which this
     // client does not ask for, so the report is the body. Strip the v0 framing if one arrived anyway.
     let report = parse_report(&crate::transport::http::strip_side_band(&resp));
+    let want_ref = &updates[0].name;
     let mine = report
         .iter()
-        .find(|r| r.name == remote_ref)
+        .find(|r| &r.name == want_ref)
         .or_else(|| report.first())
         .cloned()
         .unwrap_or(UpdateResult {
-            name: remote_ref.to_string(),
+            name: want_ref.clone(),
             ok: false,
             message: "the remote sent no report".to_string(),
         });
 
+    // Every command has to be acknowledged. A push of three refs where one was refused is a failed
+    // push, and reporting the first name as if it spoke for all of them is how a partial push reads
+    // as a complete one.
+    if let Some(bad_one) = report.iter().find(|r| !r.ok) {
+        return Err(Box::new(Error::new(
+            Code::Remote,
+            format!(
+                "the forge rejected {}: {}",
+                bad_one.name,
+                if bad_one.message.is_empty() {
+                    "no reason given"
+                } else {
+                    &bad_one.message
+                }
+            ),
+        )));
+    }
     if !mine.ok {
         return Err(Box::new(Error::new(
             Code::Remote,
             format!(
                 "the forge rejected {}: {}",
-                remote_ref,
+                want_ref,
                 if mine.message.is_empty() {
                     "no reason given"
                 } else {

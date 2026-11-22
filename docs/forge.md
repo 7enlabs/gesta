@@ -25,6 +25,19 @@ Flags:
   the shell history and in `ps`.
 - `--user` sets the username paired with the token. GitHub and Gitea ignore it. GitLab wants `oauth2`.
 - `--json` prints the ref and whether the remote took it.
+- `--all` pushes every branch, each to a ref of the same name, in **one** request and one pack. A
+  branch the remote already holds at the same commit is skipped rather than sent again, and a push with
+  nothing to send says so instead of printing a success message. Two branches need two invocations
+  without this, and the second one re-sends every object the first already delivered.
+
+```
+GESTA_FORGE_TOKEN=... gesta forge push https://github.com/owner/repo --all
+```
+
+Every command in a push is acknowledged separately, and one refused ref fails the whole push naming
+that ref. A client that reported the first name as if it spoke for all of them would turn a partial
+push into a success message; `bench/forge_push_all.py` is what checks this, by pushing two branches and
+cloning both back with git.
 
 ## What it sends, in order
 

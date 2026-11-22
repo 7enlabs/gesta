@@ -965,6 +965,12 @@ enum ForgeCmd {
         /// The ref name on the remote
         #[arg(long, default_value = "refs/heads/main")]
         remote_ref: String,
+        /// Push every branch, each to a ref of the same name, in one request
+        ///
+        /// One command carrying several refs is what `git push --all` sends, and it is one pack. A
+        /// branch the remote already has at the same commit is skipped rather than sent again.
+        #[arg(long)]
+        all: bool,
         /// A token with write access. Falls back to GESTA_FORGE_TOKEN.
         #[arg(long)]
         token: Option<String>,
@@ -1411,10 +1417,17 @@ fn run() -> ZResult<()> {
                 url,
                 branch,
                 remote_ref,
+                all,
                 token,
                 user,
                 json,
-            } => cli::cmd_forge_push(&url, &branch, &remote_ref, token.as_deref(), &user, json),
+            } => {
+                if all {
+                    cli::cmd_forge_push_all(&url, token.as_deref(), &user, json)
+                } else {
+                    cli::cmd_forge_push(&url, &branch, &remote_ref, token.as_deref(), &user, json)
+                }
+            }
         },
         Cmd::Remote { sub } => match sub {
             RemoteCmd::Add {

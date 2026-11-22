@@ -29,6 +29,7 @@ pub use backup::*;
 pub use branch::*;
 pub use changeset::*;
 pub use cli_remote::cmd_forge_push;
+pub use cli_remote::cmd_forge_push_all;
 pub use cmd_history::*;
 pub use cmd_ops::*;
 pub use cmd_repo::*;

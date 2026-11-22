@@ -4828,6 +4828,22 @@ def main():
             (r[1] or "")[-600:],
         )
 
+    if want("forge"):
+        # Two branches in one request. The single-ref push was already covered; what was not is that a
+        # report is read per command, so a client that names only the first ref turns a partial push
+        # into a success message. Both refs are read back with git, because the objects have to arrive
+        # and not just the refs.
+        r = sh(
+            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'forge_push_all.py')}",
+            cwd=ZF_DIR,
+            timeout=240,
+        )
+        record(
+            "two branches arrive in one push request, and a repeat says so",
+            r[0] == 0 and "both branches arrived" in r[1],
+            (r[1] or "")[-600:],
+        )
+
     if want("differential"):
         # The only check here that takes the answer away from this tool: a scenario is played with both
         # tools and both results are read back with the git binary. Every other benchmark asks whether
