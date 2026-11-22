@@ -6,9 +6,13 @@ compaction: this tool vacuumed, git packed.
 
 | Tree, 1000 files, distinct contents | gesta | git | ratio |
 |---|---|---|---|
-| every file different, nothing shared | 1,142,922 | 284,431 | **4.02x** |
-| every file has the same 200-line prologue | 1,618,058 | 198,843 | **8.14x** |
-| small JSON, same shape, different values | 1,122,442 | 260,183 | **4.31x** |
+| every file different, nothing shared | 1,163,402 | 284,431 | **4.09x** |
+| every file has the same 200-line prologue | 1,638,538 | 198,844 | **8.24x** |
+| small JSON, same shape, different values | 1,142,922 | 260,183 | **4.39x** |
+
+Re-measured on the current build; the figures move by a few percent between runs because `gc` and
+git's packing both depend on how much the files happen to share. Earlier runs of this same bench read
+4.02x, 8.14x and 4.31x, and that is measurement noise rather than a change in behaviour.
 
 The shared-prologue case is the worst, and it is worth understanding why rather than treating it as
 noise. git finds the 200 shared lines once and stores a delta for each file against the previous one.
@@ -108,6 +112,38 @@ A real fix is fewer rows, not smaller ones. Two candidates, neither implemented:
 Both are schema changes and both lose a capability. Neither has been done. The ratio in this
 section was measured on small files before the blame table was rewritten as ranges; see the next
 section, and `docs/git-parity.md` for the figure on a real tree (2.3x against a packed git).
+
+## The one place a cross-file delta would pay, measured
+
+The section above says packing small bodies into shared segments lost, and it does. It does not follow
+that sharing across paths is never worth it, and `bench/delta_share.py` separates the two questions:
+how much do 200 files of one shape share, and would a delta against the previous one be smaller than
+storing each whole?
+
+| Shape, 200 files | Stored whole | Delta chain | Saving |
+|---|---:|---:|---:|
+| distinct bodies | 5,545 | 5,545 | 1.00x |
+| 200-line shared prologue | 1,591,464 | 168,836 | **9.43x** |
+| small JSON, same shape | 11,852 | 11,852 | 1.00x |
+
+The first run of that bench reported 1.04x on the shared shape, and the number was wrong for a reason
+worth writing down: the prologue was regular text, so zlib collapsed it **within each file** and a
+cross-file delta had nothing left to remove. The answer changed from 1.04x to 9.43x when the prologue
+became text zlib cannot compress on its own, which is what a real shared prologue is: imports, a
+licence header, a list of translations, all distinct text that happens to be identical between two
+files. A benchmark whose control case accidentally does the optimisation under test measures nothing.
+
+So the position is narrower than "packing failed":
+
+- **tiny bodies, nothing shared** - the pointer costs more than the body. Measured, twice.
+- **large bodies sharing a prologue** - a chain is nine times smaller. Measured here, not implemented.
+
+What stands between that number and a change: a base has to be chosen for a path the store has never
+seen, which means an index over object sizes and a similarity guess, and the base has to be reachable
+so `gc` does not remove it. That is a real design, not a line of code, and it is not in this tree.
+The number is recorded so the next person starts from evidence rather than from the argument that
+"git does it, so it must help" - which is exactly the argument that produced the packing attempt that
+made the file larger.
 
 ## Blame was 90% of the database
 
