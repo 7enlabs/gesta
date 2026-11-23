@@ -1169,6 +1169,9 @@ pub fn get_object(conn: &Connection, hash: &str) -> ZResult<String> {
             .ok_or_else(|| bad(format!("delta for {} is malformed", link)))?;
         body = crate::store::delta::apply(&body, &ops)
             .ok_or_else(|| bad(format!("delta for {} does not apply to its base", link)))?;
+        // Checked per link, not once at the end: a walk that only checks the last hash can say the
+        // store is corrupt but not which link broke, and repairing a chain means knowing where it
+        // broke. The cost is one hash per link, and a link is only walked when the object is read.
         if hash_content(&body) != *link {
             return Err(Box::new(crate::support::error::Error::new(
                 crate::support::error::Code::Corrupt,
