@@ -343,7 +343,12 @@ def main(argv: list[str]) -> int:
     selftest = "--selftest" in argv
     k = 1
     seed = 0
-    runs_dir = os.environ.get("GESTA_HARNESS_RUNS", "runs")
+    # Resolved against this file, not the working directory: a run started from the repository
+    # root wrote its record to `<repo>/runs/`, which the ignore file does not cover, so the output
+    # of a test run showed up as an untracked directory.
+    runs_dir = os.environ.get(
+        "GESTA_HARNESS_RUNS", str(Path(__file__).resolve().parent / "runs")
+    )
     gesta_bin = os.environ.get("GESTA_BIN", shutil.which("gesta") or "")
 
     i = 1

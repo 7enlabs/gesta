@@ -423,19 +423,50 @@ pub fn cmd_show(spec: &str, json: bool) -> ZResult<()> {
             // else is a name that matches nothing, and the message says which forms exist.
             Err(e) => return Err(e),
             Ok(None) => {
-                return Err(crate::support::error::Error::not_found(format!(
-                    "no such branch, tag or changeset: {}. A revision may be HEAD, a branch, a tag, a changeset id, an unambiguous prefix of one, or vN with a path.",
-                    rev
-                ))
-                .into())
+                // Three different questions land here and each needs its own sentence.
+                //
+                // With a colon the reader named a revision and it does not resolve, so the message
+                // is about the revision. Without a colon the name was read as a path against the
+                // current branch, so the message is about the file - and a repository with no
+                // changesets has no tree to look in, which is a third case again. Naming the wrong
+                // one sends the reader to look at the thing that was never in question.
+                let branch = current_branch(&conn)?;
+                let empty = crate::store::branch_head(&conn, &branch)?.is_none();
+                let hint = if named_path {
+                    format!(
+                        "no such branch, tag or changeset: {}. A revision may be HEAD, a branch, a tag, a changeset id, or an unambiguous prefix of one",
+                        rev
+                    )
+                } else if empty {
+                    format!(
+                        "branch {} has no changesets yet, so there is nothing to show; make one with `gesta changeset create` and `gesta changeset commit`",
+                        branch
+                    )
+                } else {
+                    format!(
+                        "{} was read as a file, and no file by that name is at {}; to read a path from another revision, write `gesta show <revision>:{}`",
+                        rev, branch, rev
+                    )
+                };
+                return Err(crate::support::error::Error::not_found(hint).into());
             }
         },
     };
     let hash = hash_at_point(&conn, &path, &cs)?.ok_or_else(|| {
-        crate::support::error::Error::new(
-            crate::support::error::Code::PathNotFound,
-            format!("{} does not exist at {}", path, rev),
-        )
+        // Without a colon, the name the reader typed went in as a path against the current branch.
+        // Saying so here is what separates "this file is not in the tree" from "this branch does
+        // not exist", which the bare `does not exist at main` leaves the reader to guess between.
+        let message = if named_path {
+            format!("{} does not exist at {}", path, rev)
+        } else {
+            // A hint that contains `<file>` is a template, and a reader who pastes it gets a shell
+            // redirect. Both forms are spelled out instead, with the name they actually typed.
+            format!(
+                "{} was read as a file, and no file by that name is at {}; to read a path from another revision, write `gesta show <revision>:{}`",
+                path, rev, path
+            )
+        };
+        crate::support::error::Error::new(crate::support::error::Code::PathNotFound, message)
     })?;
     // Bytes, not text. `show` on a binary file failed with a message about UTF-8 because it went
     // through the text reader, and a large binary is exactly the file somebody shows.
@@ -468,8 +499,12 @@ pub fn cmd_show(spec: &str, json: bool) -> ZResult<()> {
     Ok(())
 }
 
-pub fn cmd_checkout(file: &str, changeset: Option<&str>) -> ZResult<()> {
+pub fn cmd_checkout(file: Option<&str>, changeset: Option<&str>) -> ZResult<()> {
     let (root, conn) = open_repo()?;
+    // `checkout` writes the branch out, so the whole-tree form is what the command means and it
+    // cannot lose uncommitted work - the branch already holds every file it writes. A named file
+    // stays available for the narrower question.
+    let file = file.unwrap_or(".");
     if file == "." {
         let branch = current_branch(&conn)?;
         let (written, removed) = repo::restore_worktree(&conn, &root, &branch)?;
@@ -522,8 +557,14 @@ pub fn cmd_restore_repo(file: &str, yes: bool) -> ZResult<()> {
     Ok(())
 }
 
-pub fn cmd_restore(file: &str) -> ZResult<()> {
+pub fn cmd_restore(file: Option<&str>) -> ZResult<()> {
     let (root, conn) = open_repo()?;
+    // No argument stays an error here, unlike `checkout`: this command throws away work that was
+    // never committed, and a default that discards the whole tree would fire on a typo. The
+    // refusal names the form instead of leaving the reader to find it in `--help`.
+    let file = file.ok_or_else(|| {
+        bad("restore needs a file, or `.` for the whole working tree: `gesta restore .` discards every uncommitted change".to_string())
+    })?;
     let branch = current_branch(&conn)?;
     if file == "." {
         let (written, removed) = repo::restore_worktree(&conn, &root, &branch)?;

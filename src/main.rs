@@ -358,15 +358,19 @@ enum Cmd {
     },
     /// Write files back to disk from a changeset
     Checkout {
-        /// File or `.` for everything on the branch
-        file: String,
+        /// A file to write back, or `.` for everything on the branch. Defaults to `.`, because
+        /// writing the branch out is the reason the command exists and it cannot lose work that
+        /// was never committed - the branch already holds it
+        file: Option<String>,
         #[arg(long)]
         changeset: Option<String>,
     },
     /// Discard uncommitted changes (like git restore)
     Restore {
-        /// File or `.` to restore the whole working tree
-        file: String,
+        /// File to put back, or `.` for the whole working tree. Required on purpose: with no
+        /// argument this command would discard everything uncommitted, and a safety net that
+        /// fires on a typo is not a safety net
+        file: Option<String>,
     },
     /// Write the whole repository to one file: every branch, tag and blame range
     Backup {
@@ -632,7 +636,9 @@ enum ChangesetCmd {
         intent: Option<String>,
     },
     /// Commit a pending changeset onto the current branch
-    Commit { id: String },
+    /// Commit a pending changeset onto the current branch. With no id, commits the only pending
+    /// one, and lists them when there are several.
+    Commit { id: Option<String> },
     /// Commit all pending changesets up to and including this one
     Apply { id: String },
     /// Commit every pending changeset in creation order
@@ -1339,7 +1345,7 @@ fn run() -> ZResult<()> {
                     &paths,
                 )
             }
-            ChangesetCmd::Commit { id } => cli::cmd_changeset_commit(&id),
+            ChangesetCmd::Commit { id } => cli::cmd_changeset_commit(id.as_deref()),
             ChangesetCmd::Apply { id } => cli::cmd_changeset_apply(&id),
             ChangesetCmd::CommitAll => cli::cmd_changeset_commit_all(),
             ChangesetCmd::Diff { id } => cli::cmd_changeset_diff(&id),
@@ -1402,8 +1408,10 @@ fn run() -> ZResult<()> {
                 cli::cmd_grep(search)
             }
         }
-        Cmd::Checkout { file, changeset } => cli::cmd_checkout(&file, changeset.as_deref()),
-        Cmd::Restore { file } => cli::cmd_restore(&file),
+        Cmd::Checkout { file, changeset } => {
+            cli::cmd_checkout(file.as_deref(), changeset.as_deref())
+        }
+        Cmd::Restore { file } => cli::cmd_restore(file.as_deref()),
         Cmd::Backup { dest, json_backup } => cli::cmd_backup(&dest, json_backup),
         Cmd::BackupRemote { sub } => cli::cmd_backup_remote(sub),
         Cmd::VerifyBackup { file } => cli::cmd_verify_backup(&file),

@@ -67,8 +67,39 @@ pub fn cmd_changeset_create_paths(
     }
 }
 
-pub fn cmd_changeset_commit(id: &str) -> ZResult<()> {
+/// The changeset a commit names, or the only pending one when the caller named none.
+///
+/// A session usually has exactly one pending changeset, and requiring its id there costs a round
+/// trip whose whole content is a value the program already knows. With several pending, the id
+/// stays required: picking one silently would commit work the caller did not name.
+fn resolve_commit_id(conn: &rusqlite::Connection, id: Option<&str>) -> ZResult<String> {
+    if let Some(id) = id {
+        return Ok(id.to_string());
+    }
+    let pending: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM changesets WHERE status = 'pending' ORDER BY created_at, rowid",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    match pending.len() {
+        0 => Err(bad(
+            "no pending changeset to commit: make one with `gesta changeset create`".to_string(),
+        )),
+        1 => Ok(pending[0].clone()),
+        n => Err(bad(format!(
+            "{} pending changesets, so the id is required: {}",
+            n,
+            pending.join(", ")
+        ))),
+    }
+}
+
+pub fn cmd_changeset_commit(id: Option<&str>) -> ZResult<()> {
     let (root, conn) = open_repo()?;
+    let id = resolve_commit_id(&conn, id)?;
+    let id = id.as_str();
     // Before the hook and before anything is written: a refusal here leaves the repository exactly
     // as it was, which is the whole point of checking at this moment.
     refuse_secrets(&conn, &root, id)?;
@@ -283,7 +314,7 @@ pub fn cmd_changeset_json(sub: crate::ChangesetCmd) -> YResultAlias {
             intent.as_deref(),
             &paths,
         ),
-        crate::ChangesetCmd::Commit { id } => cmd_changeset_commit_json(&id),
+        crate::ChangesetCmd::Commit { id } => cmd_changeset_commit_json(id.as_deref()),
         // A caller that asked for JSON and got text has a silent failure: it parses nothing and
         // branches on nothing, and the run looks successful. Refuse rather than print prose.
         _other => Err(Box::new(crate::support::error::Error::new(
@@ -357,8 +388,10 @@ fn cmd_changeset_create_json(
 }
 
 /// `changeset commit --json`: how many files moved, and the branch it landed on.
-fn cmd_changeset_commit_json(id: &str) -> YResultAlias {
+fn cmd_changeset_commit_json(id: Option<&str>) -> YResultAlias {
     let (_root, conn) = open_repo()?;
+    let id = resolve_commit_id(&conn, id)?;
+    let id = id.as_str();
     let written = store::with_retry(|| repo::commit_one(&conn, id))?;
     emit(Json::obj(vec![
         ("id", Json::str(id)),

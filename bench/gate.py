@@ -4967,6 +4967,21 @@ def main():
             (r[1] or "")[-500:],
         )
 
+    if want("refusals"):
+        # A refusal that names the wrong thing costs a round trip and teaches the reader a wrong
+        # model of the command. Each check here runs a plausible wrong argument and reads the
+        # message, because a message is only testable through the path a person takes to see it.
+        r = sh(
+            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'refusals.py')}",
+            cwd=ZF_DIR,
+            timeout=300,
+        )
+        record(
+            "a refusal names what the caller got wrong, and the next command",
+            r[0] == 0 and "refusal checks pass" in r[1],
+            (r[1] or "")[-500:],
+        )
+
     if want("remote-derive"):
         # A bundle moves history, not the index this store derives over it. Every receiving path has
         # to derive its own rows, and three paths did not: clone over HTTP, clone from a bundle, and

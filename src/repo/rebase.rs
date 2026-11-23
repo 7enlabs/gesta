@@ -212,7 +212,26 @@ pub fn start(
     }
 
     let onto_id = crate::store::resolve_rev(conn, onto)?.ok_or_else(|| {
-        crate::support::error::Error::not_found(format!("no such changeset: {}", onto))
+        // `onto` accepts a branch, a tag or a changeset id, so a name that resolves to nothing has
+        // to be reported against all three, and against the branches that do exist: a typo is the
+        // common case, and the list is what turns the refusal into the next attempt.
+        let mut branches: Vec<String> = conn
+            .prepare("SELECT name FROM branches ORDER BY name")
+            .and_then(|mut s| {
+                s.query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap_or_default();
+        branches.sort();
+        let known = if branches.is_empty() {
+            String::new()
+        } else {
+            format!("; known branches: {}", branches.join(", "))
+        };
+        crate::support::error::Error::not_found(format!(
+            "no such branch, tag or changeset to rebase onto: {}{known}",
+            onto
+        ))
     })?;
     let original = crate::store::branch_head(conn, branch)?;
     let pending = to_replay(conn, branch, &onto_id)?;
