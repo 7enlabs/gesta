@@ -74,23 +74,31 @@ A commit that touches one line of a 2000 line file pays for a diff of 2000 lines
 place this design is quadratic where git is not, and it is worth knowing before committing a generated
 file.
 
-That shape also decides what `bench/long_history.py` can measure. It appends one line per commit, so
-the file grows with the history and the blame diff grows with it: the gate reads a commit getting
-more expensive over a longer history even though the repository holds one file.
+Two properties are easy to confuse here, and the benches keep them apart.
 
-Four things were rising with the history for reasons that had nothing to do with blame, and they are
+**The cost follows the file.** `bench/file_growth.py` holds the history at one commit and varies the
+file: 20 to 8000 lines, 400x, costs 1.40x. The diff is linear in the file and that is the design.
+
+**The cost does not follow the history.** `bench/long_history.py` holds the file at twenty lines and
+varies the history: 100 to 1000 commits, 10x, costs 0.97x. A commit on a small file costs what it
+costs whether the repository holds a hundred changesets or a thousand.
+
+That bench used to append one line per commit, which moved both at once: the history grew and so did
+the file, and the ratio it printed could not be attributed to either. It read 5.9x on CI and the
+number was real, but it was the file growing, not the history. Splitting the measurement is what made
+that visible.
+
+Four things did rise with the history for reasons that had nothing to do with blame, and they are
 fixed: the delta base comparison walked the whole of both bodies (now a 4096 byte window), the chain
 depth was asked before the cheap prefix probe rejected a candidate, the size band covered 495 objects
 at 1000 commits against 50 at 100 (now a narrow band ordered by `created_at`), and the index that
 serves that query orders by `(size, created_at)` rather than size alone.
 
-What is left is not the line diff, and saying it was would be wrong. A file of 400 lines and one of
-4000 lines, each committed with a one line change in a repository of the same size, cost 45 ms and
-49 ms: ten times the lines bought 4 ms, so the per-line work is not what the gate is reading.
-
-The number of changesets that touched the path is not it either: the same path committed once cost
-44 ms, and committed a hundred and one times cost 55 ms, so a hundredfold history on one path bought
-11 ms.
+What is left after those four is `recompute_blame` reading the blame ranges of the previous version
+and expanding them to one entry per line before matching. That is linear in the file, which is the
+property above rather than a slope in the history, so it does not need a bound - it needs the range
+match to run over ranges instead of expanded lines, and that is a change to the algorithm rather than
+a limit on it.
 
 So the growth is real, is measured on a clean runner (6.2 to 36.8 ms over a tenfold history), and is
 not explained by the size of the file or the length of the path's history. What is known is that it

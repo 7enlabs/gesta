@@ -36,9 +36,9 @@ def run(args, cwd=None, timeout=900):
     return subprocess.run(args, shell=True, cwd=cwd, capture_output=True, text=True, timeout=timeout)
 
 
-def commit_one(root, i):
+def commit_one(root, i, path_name="f.txt"):
     """One commit touching one file, timed in its two phases."""
-    path = os.path.join(root, "f.txt")
+    path = os.path.join(root, path_name)
     with open(path, "a") as fh:
         fh.write(f"line {i}\n")
 
@@ -64,18 +64,30 @@ def commit_one(root, i):
     return (t_write if out2.returncode == 0 else None), t_scan, out2.stdout[-300:] + out2.stderr[-300:]
 
 
-def measure(root, reps=5):
-    """Fastest write and scan over `reps` commits at the current history size.
+PROBE = "probe.txt"
+PROBE_LINES = 20
 
-    The minimum, not the median. Interference on a shared machine only ever adds time, so the
-    fastest of five runs is the closest reading of the work itself; a median carries half the noise
-    into the answer. Three runs of the same binary on an idle container gave 0.60x, 1.77x and 1.70x
-    with medians, which is a spread wide enough that the ratio said more about the machine than the
-    code. The minimum is the instrument that measures the thing the gate is named after.
+
+def measure(root, reps=9):
+    """Fastest commit of a fixed-size file at the current history size.
+
+    Two properties are easy to confuse here and the gate needs them separate:
+
+    * cost depends on the history, which is what "flat as the history grows" is about;
+    * cost depends on the size of the file being committed, which `docs/speed.md` records as the one
+      place this design is quadratic where git is not.
+
+    Appending one line per commit changes both at once - the history grows and so does the file -
+    so a slope in that measurement cannot be attributed to either. This writes a fixed twenty line
+    file every time, so only the history changes. The append-shaped measurement is still worth
+    having and lives in `bench/file_growth.py`.
     """
     writes, scans, errs = [], [], []
     for i in range(reps):
-        w, s, err = commit_one(root, f"m{i}_{time.time_ns()}")
+        with open(os.path.join(root, PROBE), "w") as fh:
+            for line in range(PROBE_LINES):
+                fh.write(f"probe {i} line {line}\n")
+        w, s, err = commit_one(root, f"m{i}_{time.time_ns()}", PROBE)
         scans.append(s)
         if w is None:
             errs.append(err)
@@ -86,6 +98,25 @@ def measure(root, reps=5):
         min(scans) if scans else None,
         errs,
     )
+
+
+def startup_ms(root, reps=9):
+    """Cost of a command that opens the store and does almost nothing.
+
+    `log --limit 1` reads the schema, migrates, and prints one row: it pays process start, the
+    connection, and whatever `migrate` decides to do, and it pays nothing for the commit path. That
+    is exactly the fixed cost a commit also pays, so subtracting it is what separates the work from
+    the process. Without the subtraction the ratio is dominated by startup at small history sizes,
+    where the work is a few milliseconds and the process is thirty.
+    """
+    best = None
+    for _ in range(reps):
+        t0 = time.perf_counter()
+        r = run(f"{ZF} log --limit 1", cwd=root)
+        dt = (time.perf_counter() - t0) * 1000
+        if r.returncode == 0 and (best is None or dt < best):
+            best = dt
+    return best
 
 
 def main():
@@ -105,8 +136,8 @@ def main():
 
     results = []
     made = 0
-    print(f"{'commits':>8}  {'write ms':>9}  {'scan ms':>8}  {'db MB':>7}")
-    print("-" * 40)
+    print(f"{'commits':>8}  {'write ms':>9}  {'scan ms':>8}  {'startup':>8}  {'db MB':>7}")
+    print("-" * 48)
 
     for target in SAMPLES:
         if target > max_n:
@@ -123,11 +154,12 @@ def main():
                 print(f"  built {made}/{target}", flush=True)
 
         w, s, errs = measure(ROOT)
+        base = startup_ms(ROOT)
         db = os.path.getsize(os.path.join(ROOT, ".gesta", "gesta.db"))
-        results.append((target, w, s, db))
+        results.append((target, w, s, db, base))
         print(
             f"{target:>8}  {w if w is not None else -1:>9.1f}  {s if s is not None else -1:>8.1f}  "
-            f"{db / 1048576:>7.1f}"
+            f"{(base if base is not None else -1):>8.1f}  {db / 1048576:>7.1f}"
         )
         if errs:
             print(f"  a commit failed: {errs[0][:200]}")
@@ -139,15 +171,26 @@ def main():
 
     first, last = results[0], results[-1]
     if first[1] and last[1]:
-        ratio = last[1] / first[1]
+        # A `startup` column is printed but is not subtracted, and that is deliberate. Subtracting a
+        # baseline only helps when the baseline is smaller and steadier than the signal; here startup
+        # ranged 25 to 88 ms while the work at the small end was a few milliseconds, so the
+        # subtraction produced work times that were negative in one run and 27x in another. A
+        # correction that its own noise can invert is worse than no correction.
+        #
+        # What does help is the minimum of several runs: a shared machine only ever adds time, so the
+        # fastest run is the closest reading of the work. See `measure`.
         grew = last[0] / first[0]
+        ratio = last[1] / first[1]
         print(
             f"history grew {grew:.0f}x ({first[0]} -> {last[0]} commits); "
             f"a commit costs {ratio:.2f}x ({first[1]:.1f} -> {last[1]:.1f} ms)"
         )
-        # Flat means the ratio tracks the history at most weakly. Doubling the cost over a hundredfold
-        # history is a slope worth naming; staying inside 3x is what "flat" has to mean in practice.
-        if ratio <= 3.0:
+        # Flat means the ratio tracks the history at most weakly. The threshold was 3.0x measured with
+        # medians, which read 0.60x, 1.77x and 1.70x on three runs of one binary: a band wide enough
+        # that 3.0x accepted anything. With the minimum of nine runs the same binary reads 1.39x to
+        # 1.56x, a spread of 0.17, so 2.0x is now a bound the instrument can actually defend and a
+        # real regression lands outside it.
+        if ratio <= 2.0:
             print("the cost is flat over this range")
         else:
             print(f"the cost is NOT flat: {ratio:.2f}x over {grew:.0f}x history")

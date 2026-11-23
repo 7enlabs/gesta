@@ -4925,6 +4925,21 @@ def main():
             r[0] == 0 and "flat over this range" in r[1],
             (r[1] or "")[-500:],
         )
+        # The companion measurement. `long_history` holds the file at twenty lines so that only the
+        # history varies, which is what its name claims to test. This one holds the history at one
+        # commit and varies the file, which is the other property `docs/speed.md` records. Keeping
+        # them apart is the point: appending a line per commit, as the history bench used to, moved
+        # both at once and a slope could not be attributed to either.
+        r = sh(
+            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'file_growth.py')}",
+            cwd=ZF_DIR,
+            timeout=400,
+        )
+        record(
+            "the cost of a commit follows the file, and is named rather than bounded",
+            r[0] == 0 and "the file-size property" in r[1],
+            (r[1] or "")[-400:],
+        )
         r = sh(
             f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'many_writers.py')}",
             cwd=ZF_DIR,
