@@ -389,6 +389,12 @@ pub fn init_schema(conn: &Connection) -> ZResult<()> {
             value TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_cf_changeset ON changeset_files(changeset_id);
+        -- Which changesets touched a path. `rename_history` asks this to find the changeset that
+        -- moved a file, and the table has one row per file per changeset, so without an index the
+        -- question scans every file of every commit ever made. `EXPLAIN QUERY PLAN` said exactly
+        -- that: `SCAN changeset_files`. The table's primary key is (changeset_id, path), so a
+        -- lookup by path alone cannot use it.
+        CREATE INDEX IF NOT EXISTS idx_cf_path ON changeset_files(path);
         -- The committed tree of each branch, kept up to date as changesets land.
         -- Rebuilding it from the whole history costs about 2 ms on a 2000 file
         -- repository and `status` needs it on every run. `fsck` compares this
@@ -1380,6 +1386,43 @@ fn parent_map(conn: &Connection) -> ZResult<ParentMap> {
     Ok(map)
 }
 
+/// Whether `desc` is `anc` or comes after it.
+///
+/// The cheap direction first: generations are recorded at commit time and a child is always exactly
+/// one more than its highest parent, so a descendant with a generation at or below its candidate
+/// ancestor's cannot be descended from it. That check settles the common "no" without reading a row,
+/// which is the case a caller asks about most - a client asking whether its head is behind, a push
+/// checking that the remote moved forward.
+///
+/// A generation number is recorded, not derived, so a row that predates the column has NULL. NULL
+/// breaks the shortcut, not the answer: the walk handles it, and the walk is the correctness path
+/// either way. This is why the function is not called `is_ancestor_by_generation` - it is the answer,
+/// with a shortcut where the number allows one.
+pub fn is_ancestor(conn: &Connection, anc: &str, desc: &str) -> ZResult<bool> {
+    if anc == desc {
+        return Ok(true);
+    }
+    // Read both generations and every parent in one round trip each; the walk below needs the map
+    // regardless, so the only thing the generations buy is an early exit.
+    let gen_of = |id: &str| -> i64 {
+        conn.query_row(
+            "SELECT COALESCE(generation, 0) FROM changesets WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+    };
+    let (g_anc, g_desc) = (gen_of(anc), gen_of(desc));
+    // Zero means the column was NULL, which is also what a missing row returns. A missing row cannot
+    // be an ancestor, and a NULL generation cannot be trusted, so only a non-zero pair is a shortcut.
+    if g_anc > 0 && g_desc > 0 && g_desc <= g_anc {
+        return Ok(false);
+    }
+
+    let parents = parent_map(conn)?;
+    Ok(walk_ancestors(&parents, desc).iter().any(|id| id == anc))
+}
+
 /// Best common ancestor of two changesets: the common ancestor that every other
 /// common ancestor also reaches. This is what a three-way merge diffs against.
 /// Every best common ancestor of `a` and `b`, sorted newest first.
@@ -1392,6 +1435,29 @@ fn parent_map(conn: &Connection) -> ZResult<ParentMap> {
 /// Returning the set is the honest shape. `merge_base` is the single-answer form, for callers that can
 /// only use one, and it says which it picked by being a different function.
 pub fn merge_bases(conn: &Connection, a: &str, b: &str) -> ZResult<Vec<String>> {
+    // The common case is one side already containing the other: a push that fast-forwards, a
+    // branch that has not moved. The answer is the ancestor itself, and generations settle it
+    // without building a map. Answered here because the map below is the expensive part.
+    if a != b {
+        let gen = |id: &str| -> i64 {
+            conn.query_row(
+                "SELECT COALESCE(generation, 0) FROM changesets WHERE id = ?1",
+                params![id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+        };
+        let (ga, gb) = (gen(a), gen(b));
+        // A candidate can only be the ancestor of the other if its generation is lower. That rules
+        // out half of the two cases before any walk, and the walk settles which.
+        if ga > 0 && gb > 0 && ga != gb {
+            let (older, newer) = if ga < gb { (a, b) } else { (b, a) };
+            if is_ancestor(conn, older, newer)? {
+                return Ok(vec![older.to_string()]);
+            }
+        }
+    }
+
     // One parent map for the whole answer. The N+1 shape this replaces read the map once per
     // `ancestors` call: twice for the inputs, then once per common ancestor, which on a history
     // that forked and re-merged is the largest part of the cost.
@@ -2409,6 +2475,86 @@ pub(crate) mod tests {
         add_cs(&conn, "cs3", Some("cs1"), None);
         assert_eq!(
             merge_bases(&conn, "cs2", "cs3").unwrap(),
+            vec!["cs1".to_string()]
+        );
+    }
+
+    #[test]
+    fn is_ancestor_answers_both_directions() {
+        let conn = mem_db();
+        add_cs(&conn, "cs1", None, None);
+        add_cs(&conn, "cs2", Some("cs1"), None);
+        add_cs(&conn, "cs3", Some("cs2"), None);
+
+        assert!(
+            is_ancestor(&conn, "cs1", "cs3").unwrap(),
+            "root reaches the tip"
+        );
+        assert!(
+            !is_ancestor(&conn, "cs3", "cs1").unwrap(),
+            "the tip is not before the root"
+        );
+        assert!(
+            is_ancestor(&conn, "cs3", "cs3").unwrap(),
+            "a point is its own ancestor"
+        );
+    }
+
+    #[test]
+    fn is_ancestor_says_no_for_two_siblings() {
+        // A sibling has a lower generation than nothing and is not on the other's chain. The
+        // generation shortcut must not turn this into a false "yes".
+        let conn = mem_db();
+        add_cs(&conn, "cs1", None, None);
+        add_cs(&conn, "cs2", Some("cs1"), None);
+        add_cs(&conn, "cs3", Some("cs1"), None);
+        assert!(!is_ancestor(&conn, "cs2", "cs3").unwrap());
+        assert!(!is_ancestor(&conn, "cs3", "cs2").unwrap());
+    }
+
+    #[test]
+    fn is_ancestor_follows_the_second_parent_of_a_merge() {
+        let conn = mem_db();
+        add_cs(&conn, "cs1", None, None);
+        add_cs(&conn, "cs2", Some("cs1"), None);
+        add_cs(&conn, "cs3", Some("cs1"), None);
+        add_cs(&conn, "cs4", Some("cs2"), Some("cs3"));
+        // cs3 is only reachable through the merge's second parent, which is the parent a
+        // first-parent walk would miss.
+        assert!(is_ancestor(&conn, "cs3", "cs4").unwrap());
+    }
+
+    #[test]
+    fn a_null_generation_still_answers_correctly() {
+        // A repository migrated before the column was filled has no numbers. The shortcut cannot
+        // fire, so the answer has to come from the walk, and the walk has to still be right.
+        let conn = mem_db();
+        add_cs(&conn, "cs1", None, None);
+        add_cs(&conn, "cs2", Some("cs1"), None);
+        assert!(is_ancestor(&conn, "cs1", "cs2").unwrap());
+        assert!(!is_ancestor(&conn, "cs2", "cs1").unwrap());
+    }
+
+    #[test]
+    fn merge_bases_of_a_fast_forward_is_the_older_point() {
+        // One side already contains the other. The answer is the ancestor itself, and it has to be
+        // reached without building the reachability map of every common ancestor.
+        let conn = mem_db();
+        add_cs(&conn, "cs1", None, None);
+        add_cs(&conn, "cs2", Some("cs1"), None);
+        add_cs(&conn, "cs3", Some("cs2"), None);
+        conn.execute("UPDATE changesets SET generation = 1 WHERE id = 'cs1'", [])
+            .unwrap();
+        conn.execute("UPDATE changesets SET generation = 2 WHERE id = 'cs2'", [])
+            .unwrap();
+        conn.execute("UPDATE changesets SET generation = 3 WHERE id = 'cs3'", [])
+            .unwrap();
+        assert_eq!(
+            merge_bases(&conn, "cs1", "cs3").unwrap(),
+            vec!["cs1".to_string()]
+        );
+        assert_eq!(
+            merge_bases(&conn, "cs3", "cs1").unwrap(),
             vec!["cs1".to_string()]
         );
     }

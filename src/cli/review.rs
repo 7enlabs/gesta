@@ -460,6 +460,76 @@ pub fn cmd_review(from: Option<&str>, to: Option<&str>, min_risk: Option<&str>) 
 /// Without the check, two people landing at the same time both read the same head, both
 /// merge against it, and the second overwrites the first with no error anywhere. A
 /// compare-and-swap turns that into a refusal, which is the whole point of a queue.
+/// `gesta landed <changeset> [--branch main] [--json]`: where a changeset arrived on a branch.
+///
+/// "Not landed" exits 0 and says so, because it is an answer and not a failure: a caller pipelines
+/// this into a check, and exit 2 for "not there yet" makes every caller distinguish two kinds of
+/// success from a shell.
+pub fn cmd_landed(changeset: &str, branch: &str, json: bool) -> ZResult<()> {
+    let (_root, conn) = open_repo()?;
+    let found = crate::repo::landed::find(&conn, changeset, branch)?;
+
+    if json {
+        let doc = match &found {
+            None => crate::support::json::Json::obj(vec![
+                ("schema", crate::support::json::Json::str("gesta.landed/1")),
+                (
+                    "changeset",
+                    crate::support::json::Json::str(changeset.to_string()),
+                ),
+                (
+                    "branch",
+                    crate::support::json::Json::str(branch.to_string()),
+                ),
+                ("landed", crate::support::json::Json::Bool(false)),
+            ]),
+            Some(l) => crate::support::json::Json::obj(vec![
+                ("schema", crate::support::json::Json::str("gesta.landed/1")),
+                (
+                    "changeset",
+                    crate::support::json::Json::str(changeset.to_string()),
+                ),
+                (
+                    "branch",
+                    crate::support::json::Json::str(branch.to_string()),
+                ),
+                ("landed", crate::support::json::Json::Bool(true)),
+                (
+                    "landing",
+                    crate::support::json::Json::str(l.landing.clone()),
+                ),
+                (
+                    "message",
+                    crate::support::json::Json::str(l.landing_message.clone()),
+                ),
+                ("landed_at", crate::support::json::Json::int(l.landed_at)),
+                ("steps", crate::support::json::Json::int(l.steps as i64)),
+            ]),
+        };
+        println!("{}", doc.render());
+        return Ok(());
+    }
+
+    match found {
+        None => println!("{} is not on {}", changeset, branch),
+        Some(l) => {
+            let when = fmt_ts(l.landed_at);
+            if l.landing == changeset {
+                println!("{} landed on {} directly at {}", changeset, branch, when);
+                println!("  {}", l.target_message);
+            } else {
+                println!(
+                    "{} landed on {} in {} ({} steps from the head) at {}",
+                    changeset, branch, l.landing, l.steps, when
+                );
+                println!("  {}", l.target_message);
+                println!("  arrived in: {}", l.landing_message);
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn cmd_land(source: &str, onto: &str, expect: Option<&str>, author: &str) -> ZResult<()> {
     let (root, conn) = open_repo()?;
     let before = store::branch_head(&conn, onto)?;

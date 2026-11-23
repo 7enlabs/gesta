@@ -106,7 +106,16 @@ def main() -> int:
         print(f"{'log over ' + str(N):<24} {log_cost:>9.2f} ms")
         print(f"{'bisect start (walk)':<24} {bisect:>9.2f} ms")
         print()
-        walk = max(bisect - startup, 0.0)
+        walk = bisect - startup
+        if walk <= 0:
+            # The baseline came out slower than the question, which happens when the machine is
+            # loaded: `status` reads the working tree and the walk reads the database, so load
+            # lands on them unevenly. Reporting "0.00 ms per changeset" would read as a result
+            # when it is a measurement that collapsed, and a caller that greps for the per-change
+            # figure would accept it.
+            print(f"startup ({startup:.2f} ms) came out at or above the walk ({bisect:.2f} ms),")
+            print("so this run cannot separate them. Re-run on an idle machine.")
+            return 1
         print(f"walk over {N} changesets, startup removed: {walk:.2f} ms "
               f"({walk / N * 1000:.1f} us per changeset)")
         print()

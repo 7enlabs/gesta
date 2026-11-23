@@ -4936,6 +4936,21 @@ def main():
             (r[1] or "")[-500:],
         )
 
+    if want("landed"):
+        # The question a merge asks: where did this change arrive. A walk that stops at the first
+        # commit containing the target answers "at the head, zero steps" and passes any check that
+        # only asks whether an answer came back, so the bench names the merge explicitly.
+        r = sh(
+            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'landed.py')}",
+            cwd=ZF_DIR,
+            timeout=400,
+        )
+        record(
+            "landed names the merge a change arrived through",
+            r[0] == 0 and "landed checks pass" in r[1],
+            (r[1] or "")[-500:],
+        )
+
     if want("history"):
         # Three questions about ancestry, measured against git with startup taken out on the
         # gesta side. The property being checked is not a time: it is that the walk reads the

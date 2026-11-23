@@ -13,6 +13,26 @@ gesta review --min-risk medium    # hide the steps that need no attention
 Each step prints its id, message, author, the risk band with its score, the reasons
 behind the score, and then the lines that changed for that step alone.
 
+## Where a change landed
+
+```
+gesta landed cs1a2b3c              # which merge brought it into main
+gesta landed cs1a2b3c --branch dev  
+gesta landed cs1a2b3c --json       # gesta.landed/1
+```
+
+On a linear branch a change is its own landing: it arrived when it was made. When work came in
+through a merge, the landing is the merge, and the answer names it along with the message it
+carried and how many first-parent steps it sits from the head.
+
+Not being on the branch is an answer, not a failure. The command exits 0 and says so, because a
+caller that has to tell "not landed yet" from "your repository is broken" cannot do it from an
+exit code that means both.
+
+The answer comes from the generation number each changeset records and a walk of the first-parent
+chain. A change whose generation is at or below the branch head's cannot have landed after it, so
+the common "no" costs one row read; a merge costs one walk.
+
 ## Why a risk read at all
 
 When more changes arrive than a person can read, attention has to be allocated

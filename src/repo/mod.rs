@@ -5,6 +5,7 @@ pub mod bisect;
 pub mod conflict;
 pub mod history;
 pub mod hooks;
+pub mod landed;
 pub mod merge;
 pub use merge::recursive_merge;
 pub mod notes;

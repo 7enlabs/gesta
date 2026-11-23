@@ -1,5 +1,44 @@
 # Decisions
 
+## A Prolly tree is not worth replacing the flat branch tree here
+
+Dolt stores table data in a Prolly tree - a content-addressed B-tree - so that comparing two
+versions scales with the difference instead of with the data. The argument is structural and
+correct: every subtree two versions share has the same root hash, so a diff descends only into what
+changed. It is also the reason Dolt could not have used a plain B-tree, whose structure depends on
+insertion order and therefore cannot be shared between two versions at all.
+
+This store keeps `branch_tree` as a flat table of `(branch, path, hash)`, and comparing two branches
+reads both sets and diffs them. By the structural argument that is the wrong shape.
+
+Measured with `bench/branch_diff_cost.py`, on trees of 200, 1000 and 4000 paths, asking what
+separates `main` from a side branch:
+
+| paths | changed paths | diff |
+|---|---|---|
+| 200 | 1 | 32.2 ms |
+| 200 | 20 | 48.7 ms |
+| 1000 | 1 | 31.1 ms |
+| 1000 | 100 | 34.1 ms |
+| 4000 | 1 | 87.3 ms |
+| 4000 | 400 | 43.2 ms |
+
+The cost does not track the tree. A twentyfold larger tree with a four hundredfold larger change
+costs about the same, and the differences between rows are startup noise rather than a slope: one
+path changed in a 4000 path tree is slower than four hundred changed in the same tree, which is not
+a property of any data structure.
+
+That measurement is the whole answer. The structural gap is real and would matter at a size this
+store has not been shown to reach, and replacing the branch tree is the largest change on the list -
+a new table shape, a new write path, a migration, and every reader audited. A change that large,
+made for a cost that cannot be shown at a hundredth of the size where it would appear, is the kind
+of work that reads as progress and delivers nothing measurable.
+
+What would reopen this: a repository where a branch diff takes more than a second, or a measurement
+showing the per-path cost rising with the tree rather than staying flat. Neither exists today. The
+bench stays in the tree so the next person can re-run it rather than argue from the analogy.
+
+
 Every choice that shaped this program, with the reason it was made. Each one can be revisited.
 The numbers are for reference in a discussion, not an ordering.
 

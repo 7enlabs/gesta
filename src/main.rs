@@ -509,6 +509,21 @@ enum Cmd {
         #[arg(long, default_value = "agent")]
         author: String,
     },
+    /// Which merge brought a changeset into a branch, and when
+    ///
+    /// Answers "was this landed, and where" from the recorded generations when it can and from a
+    /// walk of the first-parent chain when it cannot. Not finding it is an answer, not an error:
+    /// work that was never landed reads as such.
+    Landed {
+        /// The changeset to look for
+        changeset: String,
+        /// The branch it should be on
+        #[arg(long, default_value = "main")]
+        branch: String,
+        /// Print machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Show a stack of changesets step by step, with a risk read on each
     Review {
         /// Start after this revision; everything after it is shown
@@ -1493,6 +1508,11 @@ fn run() -> ZResult<()> {
             expect,
             author,
         } => cli::cmd_land(&source, &onto, expect.as_deref(), &author),
+        Cmd::Landed {
+            changeset,
+            branch,
+            json,
+        } => cli::cmd_landed(&changeset, &branch, json),
         Cmd::Review { from, to, min_risk } => {
             if json {
                 cli::cmd_review_json(from.as_deref(), to.as_deref(), min_risk.as_deref())
