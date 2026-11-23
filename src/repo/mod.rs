@@ -3,6 +3,7 @@
 
 pub mod bisect;
 pub mod conflict;
+pub mod dangling;
 pub mod history;
 pub mod hooks;
 pub mod landed;

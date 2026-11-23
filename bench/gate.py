@@ -4982,6 +4982,21 @@ def main():
             (r[1] or "")[-500:],
         )
 
+    if want("dangling"):
+        # A deletion and a reference to the deleted name, made in parallel, apply cleanly in a
+        # replay because they touch different files. Git reports success and leaves the reference;
+        # the index answers the question directly, so the rebase answers it.
+        r = sh(
+            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dangling.py')}",
+            cwd=ZF_DIR,
+            timeout=300,
+        )
+        record(
+            "a rebase reports a reference to a path it removed",
+            r[0] == 0 and "dangling checks pass" in r[1],
+            (r[1] or "")[-500:],
+        )
+
     if want("remote-derive"):
         # A bundle moves history, not the index this store derives over it. Every receiving path has
         # to derive its own rows, and three paths did not: clone over HTTP, clone from a bundle, and

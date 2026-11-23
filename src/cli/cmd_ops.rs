@@ -309,9 +309,50 @@ pub fn cmd_rebase(
         Some(b) => b.to_string(),
         None => current_branch(&conn)?,
     };
+    // The tree the replay starts from is the one the branch is moving onto, not the branch's own
+    // previous head. A changeset on the branch may have deleted the file long before the rebase,
+    // and comparing against the branch's own past would then see nothing leave the tree.
+    let onto_head = crate::store::resolve_rev(&conn, onto)?;
     let progress = crate::repo::rebase::start(&conn, &root, &target, onto, author)?;
+    let after = crate::store::branch_head(&conn, &target)?;
+    let dangling = match &progress {
+        // Only a finished replay can carry this: a stopped one will report on the run that
+        // finishes it, and reporting twice would show the same names again.
+        crate::repo::rebase::Progress::Done(_) => crate::repo::rebase::dangling_after(
+            &conn,
+            onto_head.as_deref(),
+            after.as_deref().unwrap_or(""),
+        )
+        .unwrap_or_default(),
+        _ => Vec::new(),
+    };
     report_rebase(progress);
+    report_dangling(&dangling);
     Ok(())
+}
+
+/// Names that left the tree while other files still mention them.
+///
+/// Silence is the normal case, so anything printed here has to be worth interrupting for. It is
+/// not an error and the rebase succeeded: the tree holds a reference to a path that is not in it,
+/// which is a fact about the result rather than a failure of the operation.
+fn report_dangling(found: &[crate::repo::dangling::Dangling]) {
+    if found.is_empty() {
+        return;
+    }
+    println!();
+    println!(
+        "{} reference(s) to a path that is no longer in the tree:",
+        found.len()
+    );
+    for d in found {
+        println!("  {}:{} names {}", d.used_by, d.line, d.removed);
+        if !d.text.is_empty() {
+            println!("    {}", d.text);
+        }
+    }
+    println!();
+    println!("the rebase succeeded; this is what it left behind. Fix the line, or remove it.");
 }
 
 fn report_rebase(p: crate::repo::rebase::Progress) {

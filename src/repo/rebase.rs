@@ -30,6 +30,7 @@ type Row = (
     Option<String>,
     String,
     Option<String>,
+    String,
 );
 
 pub struct Session {
@@ -42,6 +43,12 @@ pub struct Session {
     pub done: Vec<String>,
     /// Where the branch pointed before the rebase started.
     pub original_head: Option<String>,
+    /// The paths that conflicted when the replay stopped.
+    ///
+    /// Kept so the continuation can tell what the caller resolved from what was never applied.
+    /// Without this the continuation has to re-derive the conflict set from the working tree,
+    /// which is the state it is trying to interpret.
+    pub conflicts: Vec<String>,
 }
 
 fn init_schema(conn: &Connection) -> ZResult<()> {
@@ -54,16 +61,24 @@ fn init_schema(conn: &Connection) -> ZResult<()> {
             current       TEXT,
             done          TEXT NOT NULL,
             original_head TEXT,
+            conflicts     TEXT NOT NULL DEFAULT '',
             created_at    INTEGER NOT NULL
         );",
     )?;
+    // A session written before `conflicts` existed has no column, and reading it would fail the
+    // whole statement rather than the field. Adding it in place keeps a stopped rebase resumable
+    // across the upgrade: without this the only way out of a stopped rebase is --abort.
+    let _ = conn.execute(
+        "ALTER TABLE rebase ADD COLUMN conflicts TEXT NOT NULL DEFAULT ''",
+        [],
+    );
     Ok(())
 }
 
 fn save(conn: &Connection, s: &Session) -> ZResult<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO rebase(id, branch, onto, pending, current, done, original_head, created_at)
-         VALUES(1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT OR REPLACE INTO rebase(id, branch, onto, pending, current, done, original_head, conflicts, created_at)
+         VALUES(1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             s.branch,
             s.onto,
@@ -71,6 +86,7 @@ fn save(conn: &Connection, s: &Session) -> ZResult<()> {
             s.current,
             s.done.join(","),
             s.original_head,
+            s.conflicts.join(","),
             now()
         ],
     )?;
@@ -81,7 +97,7 @@ pub fn load(conn: &Connection) -> ZResult<Option<Session>> {
     init_schema(conn)?;
     let row: Option<Row> = conn
         .query_row(
-            "SELECT branch, onto, pending, current, done, original_head FROM rebase WHERE id = 1",
+            "SELECT branch, onto, pending, current, done, original_head, conflicts FROM rebase WHERE id = 1",
             [],
             |r| {
                 Ok((
@@ -91,18 +107,20 @@ pub fn load(conn: &Connection) -> ZResult<Option<Session>> {
                     r.get(3)?,
                     r.get(4)?,
                     r.get(5)?,
+                    r.get(6)?,
                 ))
             },
         )
         .ok();
     Ok(row.map(
-        |(branch, onto, pending, current, done, original_head)| Session {
+        |(branch, onto, pending, current, done, original_head, conflicts)| Session {
             branch,
             onto,
             pending: split(&pending),
             current,
             done: split(&done),
             original_head,
+            conflicts: split(&conflicts),
         },
     ))
 }
@@ -162,6 +180,29 @@ pub enum Progress {
     Nothing,
 }
 
+/// What a finished rebase left behind that no conflict reported.
+///
+/// A replay applies changesets one at a time, so a deletion and a reference to the deleted name,
+/// made in parallel, never meet in a three-way merge: they touch different files and both apply.
+/// The tree then holds a reference to a path that is not in it, and every step of the rebase said
+/// it succeeded.
+pub fn dangling_after(
+    conn: &Connection,
+    before: Option<&str>,
+    after: &str,
+) -> ZResult<Vec<crate::repo::dangling::Dangling>> {
+    let Some(before) = before else {
+        // A branch with no head had no tree, so nothing left it. Reporting an empty list rather
+        // than every name in the new tree is the difference between "nothing was removed" and
+        // "everything appears to have been added".
+        return Ok(Vec::new());
+    };
+    if before == after {
+        return Ok(Vec::new());
+    }
+    crate::repo::dangling::find(conn, before, after)
+}
+
 /// Replay every pending changeset onto the base.
 ///
 /// Stops at the first conflict and keeps the session so it can be continued.
@@ -171,6 +212,10 @@ pub fn run(conn: &Connection, root: &Path, author: &str, s: &mut Session) -> ZRe
         let out = repo::cherry_pick(conn, root, &id, &s.branch, author)?;
         if !out.conflicts.is_empty() {
             s.current = Some(id);
+            // The continuation needs to know which paths the caller resolved, so it can apply the
+            // ones they did not. Recording them here rather than re-deriving them there keeps the
+            // continuation from interpreting the state it is meant to record.
+            s.conflicts = out.conflicts.clone();
             s.done.extend(done.clone());
             save(conn, s)?;
             return Ok(Progress::Stopped {
@@ -252,9 +297,82 @@ pub fn start(
         current: None,
         done: Vec::new(),
         original_head: original,
+        conflicts: Vec::new(),
     };
     save(conn, &s)?;
     run(conn, root, author, &mut s)
+}
+
+/// Put the paths a stopped changeset touched but did not conflict on back into the working tree.
+///
+/// A stopped replay returned before applying these, so the tree on disk is the base for them. That
+/// is invisible for a file the changeset rewrote, because the caller's next `create` records
+/// whatever is there - but a deletion is a change whose absence from the tree is the change, and
+/// recording a tree that still holds the file silently undoes it. This is the only place the two
+/// kinds differ, so it is the only place that has to run.
+fn apply_non_conflicting(
+    conn: &Connection,
+    root: &Path,
+    changeset: &str,
+    branch: &str,
+    resolved: &std::collections::HashSet<String>,
+) -> ZResult<()> {
+    let files: Vec<(String, Option<String>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT path, new_hash FROM changeset_files WHERE changeset_id = ?1 ORDER BY path",
+        )?;
+        let rows = stmt.query_map(params![changeset], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (path, new_hash) in files {
+        if resolved.contains(&path) {
+            // The caller decided this one; their file on disk is the resolution and overwriting it
+            // would throw away the decision this command exists to record.
+            continue;
+        }
+        let want = match new_hash {
+            Some(h) => Some(crate::store::get_object_bytes(conn, &h)?),
+            None => None,
+        };
+        let dest = root.join(&path);
+        match want {
+            None => {
+                // The changeset deletes this path. Removing a file that is already gone is not an
+                // error: the true state of the world is what this is trying to establish.
+                if dest.exists() {
+                    std::fs::remove_file(&dest)?;
+                }
+                // A directory left empty by that removal is pruned up to the root, so the tree
+                // recorded afterwards does not carry a directory the changeset never had.
+                let mut parent = dest.parent().map(|p| p.to_path_buf());
+                while let Some(dir) = parent {
+                    if dir == *root || dir.symlink_metadata().is_err() {
+                        break;
+                    }
+                    if dir
+                        .read_dir()
+                        .map(|mut d| d.next().is_none())
+                        .unwrap_or(false)
+                    {
+                        let _ = std::fs::remove_dir(&dir);
+                        parent = dir.parent().map(|p| p.to_path_buf());
+                    } else {
+                        break;
+                    }
+                }
+            }
+            Some(bytes) => {
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&dest, &bytes)?;
+            }
+        }
+    }
+    let _ = branch;
+    Ok(())
 }
 
 /// Replay the changeset that stopped the rebase, after the caller resolved it.
@@ -277,6 +395,18 @@ pub fn continue_after_resolution(
         .current
         .clone()
         .ok_or_else(|| bad("no changeset to continue: the rebase is not stopped".to_string()))?;
+
+    // The replay stopped on a conflict, so the working tree holds the base plus whatever the
+    // caller resolved. Every other path this changeset touched was never applied, because
+    // `cherry_pick` returned before it got there - and a deletion is the case that loses work:
+    // the file is still on disk, so recording the tree records it as present and the deletion
+    // disappears from the branch with no error at any step.
+    //
+    // Re-apply the paths that did not conflict before recording, and let the caller's resolution
+    // win for the paths that did. A path in `conflicts` is what the caller decided; a path outside
+    // it is what the changeset meant, and the two sets do not overlap.
+    let resolved: std::collections::HashSet<String> = s.conflicts.iter().cloned().collect();
+    apply_non_conflicting(conn, root, &current, &s.branch, &resolved)?;
 
     // Use what the caller left on disk, not what the original pick produced.
     //
@@ -323,7 +453,9 @@ pub fn abort(conn: &Connection, root: &Path) -> ZResult<String> {
     let s = load(conn)?.ok_or_else(|| {
         Box::new(crate::support::error::Error::new(
             crate::support::error::Code::Unmerged,
-            "no rebase in progress: there is nothing to continue",
+            // The caller asked to abort, so the missing thing is the rebase to abort. Saying
+            // "nothing to continue" names the other flag and sends them to try the wrong one.
+            "no rebase in progress: there is nothing to abort",
         ))
     })?;
     match &s.original_head {
