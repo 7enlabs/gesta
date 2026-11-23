@@ -1682,6 +1682,14 @@ fn receive_bundle(root: &Path, branch: &str, body: &[u8], who: &str) -> Result<S
     // `status` inside the origin directory reports them as deleted.
     crate::repo::materialise(&conn, root, branch)?;
 
+    // A push carries changesets and objects, never this store's derived rows. The server is a
+    // repository like any other, so it has to derive its own: without this, blame on the receiving
+    // side answered "never committed" for every file the push just delivered. Isolated per push so
+    // one bad blob cannot fail the request after the branch already moved.
+    if let Err(e) = crate::repo::rebuild_all_blame(&conn) {
+        eprintln!("blame rebuild after push failed: {}", e);
+    }
+
     let head = branch_head(&conn, branch)?.unwrap_or_else(|| "-".into());
     log_access(
         root,

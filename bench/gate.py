@@ -4936,6 +4936,24 @@ def main():
             (r[1] or "")[-500:],
         )
 
+    if want("remote-derive"):
+        # A bundle moves history, not the index this store derives over it. Every receiving path has
+        # to derive its own rows, and three paths did not: clone over HTTP, clone from a bundle, and
+        # pull. Each answered "no blame data (never committed)" for files it had just imported, and
+        # a pull also left `branch_tree` stale, which fsck reported. The bench checks all of them
+        # against a backup round trip that was never broken, so a fix has to match a known-good
+        # answer rather than merely stop failing.
+        r = sh(
+            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'remote_blame.py')}",
+            cwd=ZF_DIR,
+            timeout=500,
+        )
+        record(
+            "every way a repository arrives leaves blame able to answer",
+            r[0] == 0 and "remote blame checks pass" in r[1],
+            (r[1] or "")[-600:],
+        )
+
     if want("landed"):
         # The question a merge asks: where did this change arrive. A walk that stops at the first
         # commit containing the target answers "at the head, zero steps" and passes any check that

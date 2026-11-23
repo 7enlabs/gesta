@@ -474,6 +474,18 @@ pub fn cmd_pull(remote_name: &str, branch: &str, author: &str) -> ZResult<()> {
         merge_fetched(&conn, &root, remote_name, branch, &remote_head, author)?;
     }
     repo::materialise(&conn, &root, &current)?;
+
+    // Blame ranges arrive with the changesets, never with the bundle: they are this store's index
+    // over the history, derived from it, so a pull has to derive them the same way a clone does.
+    // Without this a pulled file answered "never committed" on the side that received it.
+    let _ = crate::repo::rebuild_all_blame(&conn)?;
+
+    // The branch tree is the other derived table a bundle does not carry. A pull moves the head but
+    // left this describing the changesets that arrived before it, and `fsck` reported the gap as
+    // `STALE tree for branch origin/main: 0 row(s) stored, 2 in history`. Rebuilding costs one pass
+    // over the history and is what a clone already does through `restore_worktree`.
+    crate::store::refresh_branch_tree(&conn, branch)?;
+
     ops::record(&conn, "pull", Some(&remote_head), Some(remote_name))?;
     println!(
         "pulled {} changeset(s) from {} into {}",
@@ -539,6 +551,14 @@ pub fn cmd_clone(
     } else {
         restore_from_snapshot(&conn, target, &bundle.snapshot)?
     };
+
+    // Blame is derived, and a bundle carries changesets and objects but not the ranges: those are
+    // this store's own index over the history, not part of what a git-shaped transfer moves. The
+    // git import path learned this first (`git_bridge.rs` calls the same function), and the two
+    // remote paths were still answering "never committed" for every file a clone brought in.
+    // Deriving them once here costs a pass over the newest version of each path.
+    let _ = crate::repo::rebuild_all_blame(&conn)?;
+
     println!(
         "cloned {} into {} ({} changeset(s), {} file(s) on disk)",
         url,
@@ -600,6 +620,11 @@ fn clone_s3(url: &str, target: &Path, pin: Option<&str>, depth: Option<usize>) -
     } else {
         restore_from_snapshot(&conn, target, &bundle.snapshot)?
     };
+
+    // Same reason as the bundle path above: blame ranges are this store's index, not part of what
+    // the transfer carries, so they have to be derived on arrival.
+    let _ = crate::repo::rebuild_all_blame(&conn)?;
+
     println!(
         "cloned {} into {} ({} changeset(s), {} file(s) on disk{})",
         url,
@@ -1456,6 +1481,13 @@ fn clone_http(
         rusqlite::params![url, token],
     )?;
     let (written, _removed) = repo::restore_worktree(&conn, target, &branch)?;
+
+    // See the bundle path in `cmd_clone`: a bundle carries history, not this store's index over it,
+    // so blame has to be derived on arrival. This is the function `remote clone` actually reaches
+    // over HTTP, and it was the third of three clone paths, which is why fixing the first two left
+    // the bench still reading zeros.
+    let _ = crate::repo::rebuild_all_blame(&conn)?;
+
     println!(
         "cloned {} into {} (branch {}, {} changeset(s), {} file(s){})",
         base,

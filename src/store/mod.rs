@@ -1080,46 +1080,68 @@ pub fn object_is_sidecar(conn: &Connection, hash: &str) -> bool {
 }
 
 pub fn get_object(conn: &Connection, hash: &str) -> ZResult<String> {
-    // A stored object is either whole, or a delta against another object. The
-    // base may itself be a delta, so this recurses through get_object rather
-    // than reading the base's row directly: reading the row of a delta base
-    // returns an empty body, which is exactly how a nested delta silently
-    // stopped applying.
-    let payload: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT payload FROM deltas WHERE hash = ?1",
-            params![hash],
-            |r| r.get(0),
-        )
-        .optional()?;
-
-    let Some(packed) = payload else {
+    // A stored object is either whole, or a delta against another object, and the base may itself
+    // be a delta. One query fetches the whole chain below.
+    // Read the whole chain in one query, then apply it from the base upwards. This used to be two
+    // queries per link plus a hash check per link, so reading a file whose last edit was sixteen
+    // deltas deep cost thirty-two round trips to reconstruct 311 bytes. `bench/long_history.py`
+    // appends to one file, so that is the shape a real repository has when a file is edited in
+    // place: the chain grows one link per commit and never shortens.
+    //
+    // The hash is still checked, once per link, because it is the contract: a rebuild that does not
+    // match means the store holds bytes it cannot vouch for, and that has to surface as corruption
+    // rather than as wrong content. What changed is where the bytes come from, not what is checked.
+    let chain: Vec<(String, Vec<u8>)> = {
+        let mut stmt = conn.prepare(
+            "WITH RECURSIVE walk(hash, base, payload, n) AS (
+                 SELECT hash, base, payload, 0 FROM deltas WHERE hash = ?1
+                 UNION ALL
+                 SELECT d.hash, d.base, d.payload, walk.n + 1
+                 FROM deltas d JOIN walk ON d.hash = walk.base
+                 WHERE walk.n < ?2
+             )
+             SELECT hash, payload FROM walk ORDER BY n DESC",
+        )?;
+        let rows = stmt.query_map(params![hash, MAX_DELTA_DEPTH as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let Some((deepest, _)) = chain.first() else {
         return read_whole(conn, hash);
     };
+    // The far end of the chain is a whole object. If it is not, the chain is longer than the cap
+    // and the payload at the far end is a delta against something this read did not fetch; reading
+    // the whole object there keeps the answer correct and is what the recursion did before.
+    let base_hash: Option<String> = conn
+        .query_row(
+            "SELECT base FROM deltas WHERE hash = ?1",
+            params![deepest],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    let mut body = match base_hash {
+        Some(root) => get_object(conn, &root)?,
+        None => read_whole(conn, deepest)?,
+    };
 
-    let base_hash: String = conn.query_row(
-        "SELECT base FROM deltas WHERE hash = ?1",
-        params![hash],
-        |r| r.get(0),
-    )?;
-    let base = get_object(conn, &base_hash)?;
+    // Apply from the oldest link forwards: each payload is a delta against the body built so far.
+    for (link, packed) in &chain {
+        let raw = decompress_bytes(packed)?;
+        let ops = crate::store::delta::from_bytes(&raw)
+            .ok_or_else(|| bad(format!("delta for {} is malformed", link)))?;
+        body = crate::store::delta::apply(&body, &ops)
+            .ok_or_else(|| bad(format!("delta for {} does not apply to its base", link)))?;
+        if hash_content(&body) != *link {
+            return Err(Box::new(crate::support::error::Error::new(
+                crate::support::error::Code::Corrupt,
+                format!("rebuilt object {} does not match its hash", link),
+            )));
+        }
+    }
 
-    let raw = decompress_bytes(&packed)?;
-    let ops = crate::store::delta::from_bytes(&raw)
-        .ok_or_else(|| bad(format!("delta for {} is malformed", hash)))?;
-    let rebuilt = crate::store::delta::apply(&base, &ops).ok_or_else(|| {
-        bad(format!(
-            "delta for {} does not apply to its base {}",
-            hash, base_hash
-        ))
-    })?;
-
-    // The hash is the contract. A rebuild that does not match means the store is
-    // corrupt, and returning the wrong bytes would hide it.
+    let rebuilt = body;
     if hash_content(&rebuilt) != hash {
-        // The hash is the contract, so a rebuild that disagrees means the store holds bytes it
-        // cannot vouch for. That is corruption, not a missing name, and the caller should stop
-        // and run fsck rather than retry.
         return Err(Box::new(crate::support::error::Error::new(
             crate::support::error::Code::Corrupt,
             format!("rebuilt object {} does not match its hash", hash),
@@ -2823,7 +2845,11 @@ pub(crate) mod tests {
         let conn = mem_db();
         let v0: String = (0..200).map(|i| format!("line {}\n", i)).collect();
         let h0 = put_object(&conn, &v0).unwrap();
-        assert_eq!(delta_depth(&conn, &h0).unwrap(), 0, "a whole object has no chain");
+        assert_eq!(
+            delta_depth(&conn, &h0).unwrap(),
+            0,
+            "a whole object has no chain"
+        );
 
         let mut lines: Vec<String> = v0.lines().map(|s| s.to_string()).collect();
         let mut prev = h0;
