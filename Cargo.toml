@@ -40,10 +40,18 @@ webpki-roots = { version = "0.26", optional = true }
 # Self-signed certificate generation for `serve --tls self-signed`, so a private
 # network can be encrypted without an external CA.
 rcgen = { version = "0.13", optional = true }
+# Signal handling for `serve`. Already in the tree through other crates, so naming it
+# costs no new code; it is declared because the accept loop needs `sigaction` to hear
+# SIGTERM, and a server that ignores SIGTERM leaks a process per run.
 # Regular expressions for `grep --regex`, behind a feature so a build that only needs literal
 # search keeps a smaller binary. The engine is the Rust one, which has no lookaround or
 # backreferences: a pattern relying on them is refused rather than silently mismatched.
 regex = { version = "1.13", optional = true, default-features = false, features = ["std", "perf", "unicode"] }
+
+# `sigaction` for the accept loop, unix only. Declared in its own section because Windows has no
+# SIGTERM; the loop still polls the flag there, and nothing sets it by signal.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # WinFSP is the Windows filesystem driver `gesta mount` uses. It only builds on Windows, and a Linux
 # build must not see it: listing it unconditionally makes every non-Windows build fail in a

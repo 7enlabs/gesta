@@ -63,6 +63,22 @@ def main():
     shutil.copy2(ZF, local)
     os.chmod(local, 0o755)
 
+    # A ratio is only a measurement if the shape of the tree it was taken on travels with it. Two
+    # runs on differently shaped 100,000 file trees came out 3.6x apart and neither record said
+    # which shape it used, which left the pair impossible to reconcile.
+    count = 0
+    total = 0
+    for root, _, files in os.walk(args.dir):
+        if ".gesta" in root:
+            continue
+        for name in files:
+            count += 1
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    shape = f"{count} files, {total // max(1, count)} bytes each on average"
+
     ours, theirs = [], []
     for _ in range(args.rounds):
         a, ra = timed(f"{local} status", args.dir)
@@ -74,6 +90,7 @@ def main():
 
     gm, g10, g90 = summarise(ours)
     tm, t10, t90 = summarise(theirs)
+    print(f"tree: {shape}")
     print(f"{'tool':12} {'median':>9} {'p10':>9} {'p90':>9}")
     print("-" * 42)
     print(f"{'gesta':12} {gm:>8.1f}ms {g10:>8.1f}ms {g90:>8.1f}ms")

@@ -213,10 +213,19 @@ tool this replaces flips in one column and not the other.
 | files | gesta scan | git status | gesta write | git add+commit |
 |---:|---:|---:|---:|---:|
 | 8,000 | 33.1 | 11.0 | 13.4 | 15.6 |
-| 100,000 | 454.7 | 78.4 | 13.2 | 100.2 |
+| 100,000 | 791.4 | 54.9 | 13.2 | 100.2 |
 
 The write is flat: 13.4 to 13.2 ms while the tree grew 12x, against git going 15.6 to 100.2. Above
 roughly 10,000 files a commit is several times cheaper here.
+
+The scan figure was re-measured on a tree of 100,000 files with each file holding two lines, after a
+`gc` and with the commit finished, nine runs each: gesta 791.4 ms median against git 54.9 ms, and
+three repeat runs of five gave 787.5, 791.0 and 796.1, so the number is stable rather than a cache
+artefact. This paragraph previously said 454.7 against 78.4. Both were low, and the earlier number
+is not reproducible here; the ratio it implies, 5.8x, is also wrong, and the measured ratio is 14.4x.
+
+A 100,000 file tree at 2 lines each is close to the worst shape for a per-path cache, so the ratio
+should not be read as the ratio on a normal repository. It is the ratio on this one.
 
 The whole path says the opposite. A commit is a scan and a write, and at 100,000 files:
 
@@ -224,10 +233,12 @@ The whole path says the opposite. A commit is a scan and a write, and at 100,000
 |---|---:|---:|
 | scan + write, one file changed | 446.4 ms | 108.1 ms |
 
-The scan is 5.8x slower than `git status` and it swallows the write advantage. Measuring only the
-write would have reported a win on the phase nobody runs alone.
+The scan is more than 5.8x slower than `git status` and it swallows the write advantage. Measuring
+only the write would have reported a win on the phase nobody runs alone.
 
-Where the 364 ms of `status` goes at 100,000 files, measured part by part rather than guessed:
+Where the 791 ms of `status` goes at 100,000 files, measured part by part rather than guessed. The
+breakdown below was taken on the older 454.7 ms run, so the parts do not add up to the new total and
+are kept only to show the shape:
 
 | part | ms |
 |---|---:|
@@ -358,7 +369,7 @@ refuses to run unless both directories are repositories of the kind it expects, 
 the bind mount, and prints the median with p10 and p90. Every ratio in this file is meant to come from
 a run of it.
 
-Two runs of it, an hour apart:
+Two runs of it, an hour apart, on the fixture whose shape is described below:
 
 | | gesta median | git median | ratio |
 |---|---:|---:|---:|
@@ -366,6 +377,25 @@ Two runs of it, an hour apart:
 | run 2 | 215.3 ms | 58.8 ms | 3.66x |
 
 Those agree, which the numbers assembled by hand did not.
+
+**That fixture no longer exists on this machine and the figure cannot be reproduced here.** A fresh
+100,000 file tree, two lines per file, one hundred directories of a thousand, measured with this same
+script and the same interleaving, gives:
+
+| | gesta median | git median | ratio |
+|---|---:|---:|---:|
+| 100,000 files, 2 lines each | 779.5 ms | 54.5 ms | 14.31x |
+
+over 21 interleaved rounds, with `p10`/`p90` of 770.7/804.9 for this tool and 52.4/61.9 for git. The
+gap between 214.5 and 779.5 is too large to be drift, so one of the two fixtures differs in a way
+that matters: the scan cost here is dominated by the per-entry syscalls, and a tree of 100,000
+separate small files is a harder shape than one whose files are larger or fewer per directory. Which
+shape the 214.5 run used is not recorded, and that omission is the reason the two numbers cannot be
+reconciled now.
+
+The ratio to carry forward is the one measured on a fixture that is written down: **around 14x** for
+a tree of 100,000 two-line files. A ratio quoted without the shape of the tree beside it is not a
+measurement.
 
 ### Why the maps are still there
 

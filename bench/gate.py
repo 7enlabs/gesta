@@ -12,8 +12,21 @@ Exit code is 0 only when every step passes.
 import io
 import os
 import re
+import socket
 import subprocess
 import sys
+import tempfile
+import time
+
+# A port nobody is using. Asking the kernel and letting go races with anything else that asks in
+# the same window, so the caller binds immediately; a stop check that reused a port in use would
+# fail on someone else's server.
+def free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
 
 # Taken from where this file sits, not from a fixed mount path. The harness ran in one container for
 # so long that the path became a constant, and a gate that only runs in one place cannot be the thing
@@ -4996,6 +5009,106 @@ def main():
             r[0] == 0 and "dangling checks pass" in r[1],
             (r[1] or "")[-500:],
         )
+
+    if want("serve-stops"):
+        # A server that ignores SIGTERM leaks one process per run of every bench that starts one.
+        # Two thousand had accumulated before this was noticed, holding twelve gigabytes and every
+        # port they had bound, and the next bench to want a port failed to bind.
+        #
+        # The check starts a real server, sends a real signal, and waits: asserting that a flag
+        # exists would pass with the handler never installed.
+        import tempfile as tfmod
+        import socket as sockmod
+        import time as timemod
+        d = tfmod.mkdtemp(prefix="serve-stop-")
+        r = sh(f"{ZF} init", cwd=d)
+        if r[0] != 0:
+            record("serve stops on SIGTERM", False, (r[1] or "")[:300])
+        else:
+            port = free_port()
+            proc = subprocess.Popen(
+                [ZF, "serve", "--port", str(port)],
+                cwd=d,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            died = False
+            why = ""
+            try:
+                # Wait for the listener rather than sleeping a guessed interval.
+                deadline = timemod.time() + 10
+                while timemod.time() < deadline:
+                    s = sockmod.socket()
+                    try:
+                        s.connect(("127.0.0.1", port))
+                        s.close()
+                        break
+                    except OSError:
+                        s.close()
+                        timemod.sleep(0.05)
+                else:
+                    why = "the server never accepted a connection"
+                if not why:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                        died = True
+                    except subprocess.TimeoutExpired:
+                        why = "still running 5 s after SIGTERM"
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=5)
+            record("serve stops on SIGTERM", died, why or "exited on the signal")
+
+            # A stop must not cost latency. Making the accept loop poll for a stop, with the check
+            # before `accept`, added exactly the poll interval to every request: measured 101.2 ms
+            # median and 101.5 p90 against an interval of 100 ms. That is a worse defect than the
+            # one being fixed.
+            if died:
+                d2 = tfmod.mkdtemp(prefix="serve-lat-")
+                sh(f"{ZF} init", cwd=d2)
+                port2 = free_port()
+                proc2 = subprocess.Popen(
+                    [ZF, "serve", "--port", str(port2)],
+                    cwd=d2,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                worst = None
+                try:
+                    deadline = timemod.time() + 10
+                    while timemod.time() < deadline:
+                        s = sockmod.socket()
+                        try:
+                            s.connect(("127.0.0.1", port2))
+                            s.close()
+                            break
+                        except OSError:
+                            s.close()
+                            timemod.sleep(0.05)
+                    samples = []
+                    for _ in range(20):
+                        s = sockmod.socket()
+                        t0 = timemod.perf_counter()
+                        try:
+                            s.connect(("127.0.0.1", port2))
+                            s.close()
+                        except OSError:
+                            pass
+                        samples.append((timemod.perf_counter() - t0) * 1000)
+                    samples.sort()
+                    worst = samples[len(samples) // 2]
+                finally:
+                    if proc2.poll() is None:
+                        proc2.kill()
+                        proc2.wait(timeout=5)
+                record(
+                    "stopping does not cost every request a poll interval",
+                    worst is not None and worst < 20,
+                    f"median connect {worst:.1f} ms" if worst is not None else "never connected",
+                )
 
     if want("remote-derive"):
         # A bundle moves history, not the index this store derives over it. Every receiving path has

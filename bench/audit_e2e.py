@@ -74,7 +74,7 @@ def main():
                 fh.write("secret-token\n")
 
             sport = free_port()
-            server = subprocess.Popen(f"{ZF} serve --port {sport}", shell=True, cwd=d,
+            server = subprocess.Popen([ZF, "serve", "--port", str(sport)], cwd=d,
                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             try:
                 wait_port(sport)

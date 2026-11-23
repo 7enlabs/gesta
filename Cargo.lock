@@ -319,6 +319,7 @@ dependencies = [
  "embed-resource",
  "flate2",
  "hex",
+ "libc",
  "rcgen",
  "regex",
  "ring",

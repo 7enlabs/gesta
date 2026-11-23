@@ -98,7 +98,10 @@ def main():
             if re.fullmatch(r"[0-9a-f]{64}", line):
                 auth = line
         port = free_port()
-        server = subprocess.Popen(f"{ZF} serve --port {port}", shell=True, cwd=d,
+        # No shell: with `shell=True` the process object is the shell, so terminate() kills the
+        # shell and leaves the server it started running as an orphan. Two thousand of those had
+        # accumulated by the time this was noticed, holding twelve gigabytes.
+        server = subprocess.Popen([ZF, "serve", "--port", str(port)], cwd=d,
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         push_logged = False
         try:

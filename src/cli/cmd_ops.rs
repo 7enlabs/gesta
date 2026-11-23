@@ -386,6 +386,21 @@ pub fn cmd_worktree(sub: crate::WorktreeCmd) -> ZResult<()> {
     let (root, conn) = open_repo()?;
     match sub {
         WorktreeCmd::Add { path, branch } => {
+            // Both arguments are required in meaning, and neither is guessable: a path with no
+            // branch would have to pick one, and a branch with no path has nowhere to go. The
+            // refusal names the shape, because clap's message only says which token is missing.
+            let path = path.ok_or_else(|| {
+                bad(
+                    "worktree add needs a path and a branch: `gesta worktree add ../other feature`"
+                        .to_string(),
+                )
+            })?;
+            let branch = branch.ok_or_else(|| {
+                bad(format!(
+                    "worktree add needs a branch as well as a path: `gesta worktree add {} <branch>`",
+                    path
+                ))
+            })?;
             let target = std::path::PathBuf::from(&path);
             let target = if target.is_absolute() {
                 target
@@ -405,6 +420,12 @@ pub fn cmd_worktree(sub: crate::WorktreeCmd) -> ZResult<()> {
             Ok(())
         }
         WorktreeCmd::Remove { path, force } => {
+            let path = path.ok_or_else(|| {
+                bad(
+                    "worktree remove needs the tree to remove: `gesta worktree list` names them"
+                        .to_string(),
+                )
+            })?;
             let target = std::path::PathBuf::from(&path);
             let target = if target.is_absolute() {
                 target

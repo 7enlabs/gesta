@@ -140,7 +140,7 @@ def main():
         # worth anything against a running server: a unit test that parses our own response proves
         # the response is well formed and nothing about whether a client can use it.
         port = _free_port()
-        server = subprocess.Popen(f"{ZF} serve --port {port}", shell=True, cwd=d,
+        server = subprocess.Popen([ZF, "serve", "--port", str(port)], cwd=d,
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             base = f"http://127.0.0.1:{port}"

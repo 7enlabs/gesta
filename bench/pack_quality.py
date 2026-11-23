@@ -37,7 +37,7 @@ try:
     port = str(sk.getsockname()[1])
     sk.close()
 
-    srv = subprocess.Popen(f"{BIN} serve --port {port}", shell=True, cwd=d,
+    srv = subprocess.Popen([BIN, "serve", "--port", str(port)], cwd=d,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         for _ in range(60):

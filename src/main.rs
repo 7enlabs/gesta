@@ -872,16 +872,16 @@ enum WorktreeCmd {
     /// Add a working tree on another branch
     Add {
         /// Where to put it; created if missing
-        path: String,
+        path: Option<String>,
         /// The branch to check out there
-        branch: String,
+        branch: Option<String>,
     },
     /// List the working trees of this repository
     List,
     /// Remove a working tree, leaving its store alone
     Remove {
         /// The working tree to remove
-        path: String,
+        path: Option<String>,
         /// Remove it even though it holds uncommitted work
         ///
         /// Without this, a tree with edits that are not in a changeset is refused: those edits exist
@@ -894,26 +894,26 @@ enum WorktreeCmd {
 #[derive(Subcommand)]
 enum BranchCmd {
     Create {
-        name: String,
+        name: Option<String>,
         #[arg(long, default_value = "main")]
         from: String,
     },
     List,
     Switch {
-        name: String,
+        name: Option<String>,
     },
     Delete {
-        name: String,
+        name: Option<String>,
     },
     Merge {
-        source: String,
+        source: Option<String>,
         #[arg(long, default_value = "main")]
         target: String,
         #[arg(long, default_value = "agent")]
         author: String,
     },
     Info {
-        name: String,
+        name: Option<String>,
     },
     /// Protect a branch so a push to it needs a sign-off from another credential
     Protect {
@@ -1274,7 +1274,13 @@ fn run() -> ZResult<()> {
                     target,
                     author,
                 },
-        } if json => cli::cmd_branch_merge_json(&source, &target, &author),
+        } if json => {
+            let source = source.ok_or_else(|| {
+                bad("branch merge needs the branch to merge: `gesta branch merge feature --target main`"
+                    .to_string())
+            })?;
+            cli::cmd_branch_merge_json(&source, &target, &author)
+        }
         Cmd::Branch { sub } if json => cli::cmd_branch_json(sub),
         Cmd::Changeset { sub } if json => cli::cmd_changeset_json(sub),
         Cmd::Notes { sub } => cli::cmd_notes(sub),
@@ -1426,20 +1432,10 @@ fn run() -> ZResult<()> {
             list,
             force,
         } => cli::cmd_tag(name.as_deref(), changeset.as_deref(), list, force),
-        Cmd::Branch { sub } => match sub {
-            BranchCmd::Create { name, from } => cli::cmd_branch_create(&name, &from),
-            BranchCmd::List => cli::cmd_branch_list(),
-            BranchCmd::Switch { name } => cli::cmd_branch_switch(&name),
-            BranchCmd::Delete { name } => cli::cmd_branch_delete(&name),
-            BranchCmd::Merge {
-                source,
-                target,
-                author,
-            } => cli::cmd_branch_merge(&source, &target, &author),
-            BranchCmd::Info { name } => cli::cmd_branch_info(&name),
-            BranchCmd::Protect { name, unset } => cli::cmd_branch_protect(&name, unset),
-            BranchCmd::Conflicts { source, target } => cli::cmd_merge_preview(&source, &target),
-        },
+        // The text path goes through the same dispatch as everything else: the match that used to
+        // live here duplicated `dispatch_branch_text` arm for arm, so a change had to be made in
+        // two places or one of them silently kept the old behaviour.
+        Cmd::Branch { sub } => cli::dispatch_branch_text(sub),
         Cmd::Forge { sub } => match sub {
             ForgeCmd::Push {
                 url,

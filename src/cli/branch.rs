@@ -364,17 +364,58 @@ pub fn cmd_branch_json(sub: crate::BranchCmd) -> YResultAlias {
 // Text-mode dispatch for the subcommands JSON mode does not cover. Keeping it
 // here means `main.rs` does not need to know which subcommands have a JSON form.
 pub fn dispatch_branch_text(sub: crate::BranchCmd) -> ZResult<()> {
+    // A branch name is the one thing every one of these needs, and clap's message for a missing
+    // one says only that a token is absent. Each refusal names the shape and, where it helps, the
+    // command that lists what exists: a typo is the common case.
+    let need = |what: &str, example: &str, got: Option<String>| -> ZResult<String> {
+        got.ok_or_else(|| bad(format!("{what}: `{example}`")))
+    };
     match sub {
-        crate::BranchCmd::Create { name, from } => cmd_branch_create(&name, &from),
+        crate::BranchCmd::Create { name, from } => {
+            let name = need(
+                "branch create needs a name",
+                "gesta branch create feature",
+                name,
+            )?;
+            cmd_branch_create(&name, &from)
+        }
         crate::BranchCmd::List => cmd_branch_list(),
-        crate::BranchCmd::Switch { name } => cmd_branch_switch(&name),
-        crate::BranchCmd::Delete { name } => cmd_branch_delete(&name),
+        crate::BranchCmd::Switch { name } => {
+            let name = need(
+                "branch switch needs a name; `gesta branch list` names them",
+                "gesta branch switch feature",
+                name,
+            )?;
+            cmd_branch_switch(&name)
+        }
+        crate::BranchCmd::Delete { name } => {
+            let name = need(
+                "branch delete needs a name; `gesta branch list` names them",
+                "gesta branch delete feature",
+                name,
+            )?;
+            cmd_branch_delete(&name)
+        }
         crate::BranchCmd::Merge {
             source,
             target,
             author,
-        } => cmd_branch_merge(&source, &target, &author),
-        crate::BranchCmd::Info { name } => cmd_branch_info(&name),
+        } => {
+            let source = need(
+                "branch merge needs the branch to merge",
+                "gesta branch merge feature --target main",
+                source,
+            )?;
+            cmd_branch_merge(&source, &target, &author)
+        }
+        crate::BranchCmd::Info { name } => {
+            let name = need(
+                "branch info needs a name; `gesta branch list` names them",
+                "gesta branch info main",
+                name,
+            )?;
+            cmd_branch_info(&name)
+        }
         crate::BranchCmd::Protect { name, unset } => cmd_branch_protect(&name, unset),
         crate::BranchCmd::Conflicts { source, target } => cmd_merge_preview(&source, &target),
     }

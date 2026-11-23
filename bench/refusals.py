@@ -235,6 +235,26 @@ def main() -> int:
             f"rc={r.returncode} kept={kept} {r.stdout}{r.stderr}",
         )
 
+        # Every command that needs a name or a path refused with the argument parser's message,
+        # which says a token is absent and nothing about the shape. The shape is the part a reader
+        # cannot derive: `worktree add` wants a path *and* a branch, in that order.
+        for args, must_say in [
+            (["worktree", "add"], "worktree add ../other feature"),
+            (["worktree", "add", "../x"], "worktree add ../x <branch>"),
+            (["worktree", "remove"], "worktree list"),
+            (["branch", "create"], "branch create feature"),
+            (["branch", "switch"], "branch list"),
+            (["branch", "info"], "branch list"),
+            (["branch", "merge"], "--target main"),
+        ]:
+            r = sh([ZF] + args, full)
+            out = r.stdout + r.stderr
+            record(
+                "a missing argument names the shape: " + " ".join(args),
+                must_say in out and r.returncode != 0,
+                out,
+            )
+
         passed = sum(1 for _, ok in checks if ok)
         print(f"\n{passed}/{len(checks)} refusal checks pass")
         if passed != len(checks):

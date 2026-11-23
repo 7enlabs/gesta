@@ -76,7 +76,7 @@ def main():
         auth_before = open(os.path.join(d, ".gesta", "auth")).read().strip()
 
         port = free_port()
-        server = subprocess.Popen(ZF + " serve --port " + str(port), shell=True, cwd=d,
+        server = subprocess.Popen([ZF, "serve", "--port", str(port)], cwd=d,
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             wait_port(port)

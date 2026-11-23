@@ -82,7 +82,7 @@ def main():
         print(f"  token: {'yes' if token else 'MISSING: ' + tok_out.strip()[:200]}")
 
         port = free_port()
-        server = subprocess.Popen(f"{ZF} serve --port {port}", shell=True, cwd=d,
+        server = subprocess.Popen([ZF, "serve", "--port", str(port)], cwd=d,
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             wait_port(port)

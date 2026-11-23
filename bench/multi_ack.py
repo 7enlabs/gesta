@@ -61,7 +61,7 @@ def main():
                 sh(f"{ZF} changeset commit {m.group(1)}", d)
 
         port = free_port()
-        server = subprocess.Popen(f"{ZF} serve --port {port}", shell=True, cwd=d,
+        server = subprocess.Popen([ZF, "serve", "--port", str(port)], cwd=d,
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             wait_port(port)

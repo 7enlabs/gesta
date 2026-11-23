@@ -65,7 +65,7 @@ def main():
         print(f"  {len(obj)} object(s) in the store")
 
         # The server's pack, measured by asking it for everything through a real git client.
-        srv = subprocess.Popen(f"{binp} serve --port {port}", shell=True, cwd=d,
+        srv = subprocess.Popen([binp, "serve", "--port", str(port)], cwd=d,
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             import socket
