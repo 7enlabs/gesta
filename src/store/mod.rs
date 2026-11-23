@@ -743,27 +743,28 @@ pub fn put_object_for(
 /// version took 131 ms on a 200 line file with 120 versions. The cap below keeps
 /// a read at a constant cost.
 fn delta_depth(conn: &Connection, hash: &str) -> ZResult<usize> {
-    let mut depth = 0usize;
-    let mut cur = hash.to_string();
-    // A corrupt store could contain a cycle. Stopping at the cap keeps this a
-    // bounded walk rather than an infinite one.
-    while depth <= MAX_DELTA_DEPTH {
-        let base: Option<String> = conn
-            .query_row(
-                "SELECT base FROM deltas WHERE hash = ?1",
-                params![cur],
-                |r| r.get(0),
-            )
-            .optional()?;
-        match base {
-            Some(b) => {
-                depth += 1;
-                cur = b;
-            }
-            None => return Ok(depth),
-        }
-    }
-    Ok(depth)
+    // One query for the whole chain. This used to be a query per link, and it is called for every
+    // candidate a delta base search considers, so a chain sixteen deep cost sixteen queries before
+    // anything was decided. `bench/long_history.py` appends to one file, which is exactly the shape
+    // that builds a deep chain, and the commit got 5.91x slower over a tenfold history once the base
+    // search existed: the gate caught it on CI while the local machine was too noisy to show it.
+    //
+    // The cap is in the query, so a corrupt store with a cycle still terminates.
+    let depth: i64 = conn
+        .query_row(
+            "WITH RECURSIVE chain(hash, base, n) AS (
+                 SELECT hash, base, 0 FROM deltas WHERE hash = ?1
+                 UNION ALL
+                 SELECT d.hash, d.base, chain.n + 1
+                 FROM deltas d JOIN chain ON d.hash = chain.base
+                 WHERE chain.n < ?2
+             )
+             SELECT COALESCE(MAX(n) + 1, 0) FROM chain",
+            params![hash, MAX_DELTA_DEPTH as i64],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    Ok(depth as usize)
 }
 
 /// Delta chains are capped so that reading the newest version costs the same
@@ -919,9 +920,18 @@ fn find_delta_base(conn: &Connection, content: &str) -> ZResult<Option<String>> 
     let mut considered = 0usize;
 
     for c in candidates.flatten() {
-        // A candidate with a deep chain would make the next read deeper, so it is not a base.
-        if c.2.is_some() && delta_depth(conn, &c.0)? >= MAX_DELTA_DEPTH {
-            continue;
+        // A candidate with a deep chain would make the next read deeper, so it is not a base. The
+        // depth is asked for every candidate, which is why it is one query for the whole chain
+        // rather than one per link.
+        if c.2.is_some() {
+            // A chain of any depth costs a walk on every later read of the object built on it, and
+            // a chain that keeps growing makes each commit's base search deeper than the last. Only
+            // a shallow chain is a base here: a whole object is best, and anything more than a
+            // quarter of the cap is not worth the read it will cost later. The depth is one query
+            // for the whole chain rather than one per link, because it runs for every candidate.
+            if delta_depth(conn, &c.0)? > MAX_DELTA_DEPTH / 4 {
+                continue;
+            }
         }
         let Some(head) = object_prefix(conn, &c.0, 64)? else {
             continue;
@@ -2802,6 +2812,55 @@ pub(crate) mod tests {
         assert_eq!(get_object(&conn, &h1).unwrap(), v1, "first delta");
         assert_eq!(get_object(&conn, &h2).unwrap(), v2, "nested delta");
         assert_eq!(get_object(&conn, &h0).unwrap(), v0, "base still whole");
+    }
+
+    #[test]
+    fn delta_depth_counts_the_whole_chain_in_one_query() {
+        // The count is what decides whether an object may be a base, so it has to be right at the
+        // ends: a whole object is depth 0, a chain of three is 3, and the cap stops a cycle
+        // instead of looping. This replaced a loop that asked the database once per link; the
+        // answer has to be identical, because the guard that keeps chains shallow reads it.
+        let conn = mem_db();
+        let v0: String = (0..200).map(|i| format!("line {}\n", i)).collect();
+        let h0 = put_object(&conn, &v0).unwrap();
+        assert_eq!(delta_depth(&conn, &h0).unwrap(), 0, "a whole object has no chain");
+
+        let mut lines: Vec<String> = v0.lines().map(|s| s.to_string()).collect();
+        let mut prev = h0;
+        for round in 1..=3 {
+            lines[10] = format!("round {}\n", round);
+            let body = lines.join("\n") + "\n";
+            prev = put_object_against(&conn, &body, Some(&prev)).unwrap();
+            assert_eq!(
+                delta_depth(&conn, &prev).unwrap(),
+                round,
+                "chain length after {} edits",
+                round
+            );
+        }
+    }
+
+    #[test]
+    fn a_cycle_in_the_delta_table_does_not_loop_forever() {
+        // A store this program never writes can still be handed to it: a cycle in `deltas` would
+        // make an uncapped walk run for ever. The cap has to be inside the query, not around it.
+        let conn = mem_db();
+        conn.execute(
+            "INSERT INTO deltas(hash, base, payload, created_at) VALUES('a', 'b', x'', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO deltas(hash, base, payload, created_at) VALUES('b', 'a', x'', 1)",
+            [],
+        )
+        .unwrap();
+        let d = delta_depth(&conn, "a").unwrap();
+        assert!(
+            d <= MAX_DELTA_DEPTH + 1,
+            "a cycle must stop at the cap, got {}",
+            d
+        );
     }
 
     #[test]
