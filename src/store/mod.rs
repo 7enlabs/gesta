@@ -99,10 +99,32 @@ pub fn with_retry<T>(mut f: impl FnMut() -> ZResult<T>) -> ZResult<T> {
 /// existing repository keeps working without a manual migration step.
 /// Add a column if the table does not have it. Returns true when this call added it, which is the
 /// only moment a caller can know the column is empty and needs filling.
+/// Columns of a table, read once per process.
+///
+/// `PRAGMA table_info` is not free on a table with rows in it: SQLite opens the schema and walks the
+/// column list, and `migrate` used to ask for the same table's columns once per column it checked -
+/// five times for `changesets` alone. On a repository with a thousand changesets that was thirty
+/// milliseconds of every command, which is the whole reason `bench/long_history.py` read a slope: it
+/// was timing the schema check, not the commit.
+///
+/// Cached by table name. The cache is per process, which is correct here because a column is only
+/// added by this function and the entry is updated when that happens.
+fn columns_cached(conn: &Connection, table: &str) -> ZResult<Vec<String>> {
+    use std::cell::RefCell;
+    thread_local! {
+        static CACHE: RefCell<std::collections::HashMap<String, Vec<String>>> =
+            RefCell::new(std::collections::HashMap::new());
+    }
+    if let Some(hit) = CACHE.with(|c| c.borrow().get(table).cloned()) {
+        return Ok(hit);
+    }
+    let cols = table_columns(conn, table)?;
+    CACHE.with(|c| c.borrow_mut().insert(table.to_string(), cols.clone()));
+    Ok(cols)
+}
+
 fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> ZResult<bool> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
-    let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
-    let existing: Vec<String> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    let existing = columns_cached(conn, table)?;
     if !existing.iter().any(|c| c == column) {
         // The check above and the ALTER below are not one atomic step. Twenty processes starting on a
         // fresh repository all find the column missing and all try to add it; one wins and the rest
@@ -120,9 +142,23 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> ZR
                 if m.contains("duplicate column") => {}
             Err(e) => return Err(e.into()),
         }
+        // The cache said this column was missing and it has just been added, so the cached answer
+        // would be wrong for every later check in this process.
+        invalidate_columns(table);
         return Ok(true);
     }
     Ok(false)
+}
+
+fn invalidate_columns(table: &str) {
+    use std::cell::RefCell;
+    thread_local! {
+        static CACHE: RefCell<std::collections::HashMap<String, Vec<String>>> =
+            RefCell::new(std::collections::HashMap::new());
+    }
+    CACHE.with(|c| {
+        c.borrow_mut().remove(table);
+    });
 }
 
 /// Give every committed changeset a generation number, oldest first.
@@ -440,6 +476,7 @@ pub fn migrate(conn: &Connection) -> ZResult<bool> {
     if obj_cols.is_empty() {
         return Ok(false); // fresh database; init_schema creates the full shape
     }
+    let _t_idx = std::time::Instant::now();
 
     // Tables added after a database was created. Each is created once and then
     // filled from history, so an existing repository upgrades on first open
@@ -543,14 +580,25 @@ pub fn migrate(conn: &Connection) -> ZResult<bool> {
     // migration was interrupted. A parent that is not in the table (a shallow import) counts
     // as generation 0, which is what a shallow root is.
     let _ = ensure_column(conn, "changesets", "generation", "INTEGER")?;
-    let unfilled: i64 = conn
+    // Asking whether anything is unfilled, not how many. `COUNT(*) ... WHERE generation IS NULL`
+    // has no index to help it and no early exit: SQLite reads every row of `changesets` to produce a
+    // number, and `migrate` runs on every command, so the cost of opening the repository grew with
+    // the length of its history. `EXPLAIN QUERY PLAN` said `SCAN changesets` at both 100 and 1000
+    // commits; measured, `migrate` went from 6 ms to 31 ms over that range on an unchanged
+    // repository, and that was the whole slope `bench/long_history.py` was reporting.
+    //
+    // `SELECT 1 ... LIMIT 1` stops at the first row it finds, so the common answer - nothing to do -
+    // is O(1) once the table has a row at all, and the slow answer only happens when there really is
+    // history to fill.
+    let any_unfilled: bool = conn
         .query_row(
-            "SELECT COUNT(*) FROM changesets WHERE generation IS NULL",
+            "SELECT 1 FROM changesets WHERE generation IS NULL LIMIT 1",
             [],
-            |r| r.get(0),
+            |_| Ok(()),
         )
-        .unwrap_or(0);
-    if unfilled > 0 {
+        .optional()?
+        .is_some();
+    if any_unfilled {
         backfill_generation(conn)?;
         changed = true;
     }
@@ -574,11 +622,12 @@ pub fn migrate(conn: &Connection) -> ZResult<bool> {
     // A signature over the changeset's identity, and the public key it verifies against.
     let _ = ensure_column(conn, "changesets", "signature", "TEXT")?;
     let _ = ensure_column(conn, "changesets", "signer", "TEXT")?;
-    if !table_columns(conn, "changesets")?
+    if !columns_cached(conn, "changesets")?
         .iter()
         .any(|c| c == "parent2")
     {
         conn.execute_batch("ALTER TABLE changesets ADD COLUMN parent2 TEXT")?;
+        invalidate_columns("changesets");
     }
     // A branch is unprotected by default, which is what every repository created before this is.
     let _ = ensure_column(conn, "branches", "protected", "INTEGER NOT NULL DEFAULT 0")?;

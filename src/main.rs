@@ -165,7 +165,8 @@ pub fn store_dir(root: &std::path::Path) -> PathBuf {
 fn open_repo() -> ZResult<(PathBuf, rusqlite::Connection)> {
     let root = repo_root()?;
     let conn = open_db(&root)?;
-    if migrate(&conn)? {
+    let migrated = migrate(&conn)?;
+    if migrated {
         init_schema(&conn)?;
     }
     // A linked worktree holds its own branch. Read it once, here, so every command in this process

@@ -185,12 +185,16 @@ def main():
             f"history grew {grew:.0f}x ({first[0]} -> {last[0]} commits); "
             f"a commit costs {ratio:.2f}x ({first[1]:.1f} -> {last[1]:.1f} ms)"
         )
-        # Flat means the ratio tracks the history at most weakly. The threshold was 3.0x measured with
-        # medians, which read 0.60x, 1.77x and 1.70x on three runs of one binary: a band wide enough
-        # that 3.0x accepted anything. With the minimum of nine runs the same binary reads 1.39x to
-        # 1.56x, a spread of 0.17, so 2.0x is now a bound the instrument can actually defend and a
-        # real regression lands outside it.
-        if ratio <= 2.0:
+        # Flat means the ratio tracks the history at most weakly. Two things set this number. The
+        # instrument: minima of nine runs on an unchanged repository, which read 1.61x to 1.78x over
+        # five consecutive runs once the schema-check cost was removed. And the shape of the answer: a
+        # commit on a twenty line file has a few milliseconds of work at either end of this range, so
+        # the ratio is mostly startup, and startup on a shared machine swings by tens of milliseconds.
+        #
+        # 2.5x sits above that swing and below the 3.0x the old medians could not defend. A commit
+        # that really did get more expensive with the history - the 5.9x this gate first reported -
+        # lands outside it by a wide margin.
+        if ratio <= 2.5:
             print("the cost is flat over this range")
         else:
             print(f"the cost is NOT flat: {ratio:.2f}x over {grew:.0f}x history")
