@@ -211,6 +211,12 @@ pub fn advertise(endpoint: &Endpoint) -> ZResult<Advertisement> {
             format!("the forge answered HTTP {}: {}", status, preview),
         )));
     }
+    // A chunked advertisement is the same trap as a chunked report: the hex chunk length reads as a
+    // pkt-line length, so `14C\r\n001f# service=...` parses as one 0x14C-byte pkt and every ref is
+    // lost. GitHub chunks both responses. Without this, `advertise` returned zero refs against a
+    // repository that had one, the push then claimed the ref was new (`old` all zeroes), and GitHub
+    // refused it as a non-fast-forward while the real fault was this line.
+    let body = crate::transport::http::dechunk(&body);
     parse_advertisement(&body)
 }
 
@@ -435,10 +441,31 @@ fn push_refs(
             Some(sha) if sha.len() >= 40 => sha.to_string(),
             _ => "0".repeat(40),
         };
+        // A command that moves a ref to where it already is costs the server work and some servers
+        // refuse it outright, which is why `push_all` filters these before calling in. A single-branch
+        // push goes straight here and did not filter, so pushing an unchanged branch a second time was
+        // sent as `old == new` and GitHub answered `ng refs/heads/main failed`. Skipping it is what
+        // git does for the same case and it is the answer the caller wanted: nothing to do.
+        if old == want {
+            continue;
+        }
         updates.push(Update {
             name: remote_ref.clone(),
             old,
             new: want,
+        });
+    }
+
+    if updates.is_empty() {
+        // Every requested ref is already where the caller wants it. Reporting the first name keeps the
+        // answer shaped like the others; the message is what a reader needs.
+        return Ok(UpdateResult {
+            name: pairs
+                .first()
+                .map(|(_, r)| r.clone())
+                .unwrap_or_else(|| "refs/heads/main".to_string()),
+            ok: true,
+            message: "already at that id, nothing to send".to_string(),
         });
     }
 
@@ -451,9 +478,31 @@ fn push_refs(
     // asking for it from a server that never advertised it is asking for an answer that never comes,
     // and then a refused push reads as a silent success. A remote without it gets no claim of success
     // from this client either.
+    //
+    // GitHub advertises `report-status-v2` and does **not** advertise plain `report-status`, so a
+    // client that only asks for the v1 name gets no report at all: the push is accepted, the ref moves,
+    // and this client reports "the remote sent no report-status" because it never negotiated one.
+    // v2 is a superset - same `unpack` line, per-ref `ok`/`ng` lines, plus optional `option` lines -
+    // so the existing parser reads it once the request negotiates it. v1 stays the fallback for
+    // servers that only have that.
     let mut caps: Vec<&str> = Vec::new();
-    if adv.can("report-status") {
+    if adv.can("report-status-v2") {
+        caps.push("report-status-v2");
+        // v2 pushes may carry `option` lines; asking for side-band is what git does here and it also
+        // keeps a verbose rejection inside its own channel rather than mixed into the pkt stream.
+        if adv.can("side-band-64k") {
+            caps.push("side-band-64k");
+        }
+    } else if adv.can("report-status") {
         caps.push("report-status");
+    }
+    // `ofs-delta` is not optional when the pack carries OFS_DELTA entries, which `write_pack` always
+    // writes when it finds a base: without this capability the server reads the delta offset as blob
+    // content and the unpack fails with "no voting servers succeeded" while the pack itself indexes
+    // cleanly under real git. GitHub advertises it; a server that does not is sent a full pack instead,
+    // which is correct but larger.
+    if adv.can("ofs-delta") {
+        caps.push("ofs-delta");
     }
     if adv.can("delete-refs") {
         caps.push("delete-refs");
@@ -486,7 +535,11 @@ fn push_refs(
 
     // A smart server wraps the report in side-band frames when it negotiated side-band, which this
     // client does not ask for, so the report is the body. Strip the v0 framing if one arrived anyway.
-    let report = parse_report(&crate::transport::http::strip_side_band(&resp));
+    // GitHub chunks the answer. De-chunk first, then strip any side-band framing, then read the
+    // report - the order matters, because a chunked body whose payload is side-band frames has two
+    // layers and `strip_side_band` alone sees the chunk header as a bad frame and gives up.
+    let plain = crate::transport::http::dechunk(&resp);
+    let report = parse_report(&crate::transport::http::strip_side_band(&plain));
     let want_ref = &updates[0].name;
     let mine = report
         .iter()

@@ -5000,6 +5000,24 @@ def main():
             (r[1] or "")[-500:],
         )
 
+    if want("forge-push"):
+        # Two halves. The first is always run: a push to this tool's own server, read back with git.
+        # The second runs only when a token and a repository are supplied, and skips otherwise -
+        # a missing credential is not a defect here, and a forge step that goes red for it teaches
+        # people to ignore the gate. That second half is the one that matters: every GitHub defect
+        # this client had was in how the real server answers (chunked bodies, `report-status-v2`),
+        # and the local server does neither, so the first half passed throughout.
+        r = sh(
+            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'forge_push.py')}",
+            cwd=ZF_DIR,
+            timeout=600,
+        )
+        record(
+            "a push to a forge is readable by a real git client",
+            r[0] == 0 and ("forge checks pass" in r[1] or "is readable by git" in r[1]),
+            (r[1] or "")[-600:],
+        )
+
     if want("history"):
         # Three questions about ancestry, measured against git with startup taken out on the
         # gesta side. The property being checked is not a time: it is that the walk reads the

@@ -1900,6 +1900,54 @@ fn base64_encode(input: &[u8]) -> String {
 /// v0 git wraps part of an answer in `\x01`-prefixed pkt-lines. This client does not request side-band,
 /// so a body without any is returned untouched; a body that has it is unwrapped rather than parsed as
 /// if the frames were the content.
+/// Undo HTTP/1.1 chunked transfer encoding.
+///
+/// GitHub answers `git-receive-pack` with `Transfer-Encoding: chunked`, and the report-status lines
+/// are the payload of that encoding. A reader that takes the body as-is sees the hex length prefixes
+/// as if they were pkt-line lengths: `51\r\n002b\u{1}...` parses as a 0x51 byte pkt instead of the
+/// `002b` pkt inside it, so every report is unreadable and a successful push reports as unconfirmed.
+///
+/// A body that does not begin with a valid chunk length is returned unchanged, because not every
+/// server chunks and the caller should not have to know which one it is talking to.
+pub fn dechunk(raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let mut chunks = 0usize;
+    while i < raw.len() {
+        let Some(nl) = raw[i..].windows(2).position(|w| w == b"\r\n") else {
+            return if chunks > 0 { out } else { raw.to_vec() };
+        };
+        let header = match std::str::from_utf8(&raw[i..i + nl]) {
+            Ok(h) => h,
+            Err(_) => return if chunks > 0 { out } else { raw.to_vec() },
+        };
+        // The size may carry `;ext=...`; only the hex prefix matters.
+        let size_hex = header.split(';').next().unwrap_or("").trim();
+        let Ok(size) = usize::from_str_radix(size_hex, 16) else {
+            return if chunks > 0 { out } else { raw.to_vec() };
+        };
+        i += nl + 2;
+        if size == 0 {
+            return out;
+        }
+        if i + size > raw.len() {
+            return if chunks > 0 { out } else { raw.to_vec() };
+        }
+        out.extend_from_slice(&raw[i..i + size]);
+        chunks += 1;
+        i += size;
+        // Each chunk ends with CRLF, which is not part of the payload.
+        if raw[i..].starts_with(b"\r\n") {
+            i += 2;
+        }
+    }
+    if chunks > 0 {
+        out
+    } else {
+        raw.to_vec()
+    }
+}
+
 pub fn strip_side_band(raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -1949,6 +1997,35 @@ fn parse_response(raw: &[u8]) -> ZResult<(u16, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dechunk_undoes_chunked_transfer_encoding() {
+        // The exact body GitHub returned for a push, captured from the wire: one chunk of `0x51`
+        // bytes, then the terminator. Read as pkt-line, `51` becomes the length of an 81-byte packet
+        // and every byte inside it is misaligned, which is how a correct push was reported as
+        // unconfirmed against a real forge.
+        let raw = b"51\r\n002b\x010026unpack no voting servers succeeded001eng refs/heads/main failed\n00000000\r\n0\r\n\r\n";
+        let plain = dechunk(raw);
+        assert_eq!(
+            plain,
+            b"002b\x010026unpack no voting servers succeeded001eng refs/heads/main failed\n00000000"
+        );
+        assert_eq!(plain.len(), 0x51);
+    }
+
+    #[test]
+    fn dechunk_leaves_an_unchunked_body_alone() {
+        // Not every server chunks. A body that does not begin with a valid chunk length has to come
+        // back untouched, or every other caller of this path is corrupted by the fix for one server.
+        let plain = b"0023unpack ok\n000eok refs/heads/main\n0000";
+        assert_eq!(dechunk(plain), plain.to_vec());
+    }
+
+    #[test]
+    fn dechunk_handles_several_chunks() {
+        let raw = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        assert_eq!(dechunk(raw), b"hello world".to_vec());
+    }
 
     #[test]
     fn parses_a_request_line_with_query() {
