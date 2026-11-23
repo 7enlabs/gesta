@@ -74,6 +74,13 @@ A commit that touches one line of a 2000 line file pays for a diff of 2000 lines
 place this design is quadratic where git is not, and it is worth knowing before committing a generated
 file.
 
+A third cost sits on the commit path that is easy to attribute to the wrong thing:
+`refuse_secrets` runs the leak scanner over the body of every file in the changeset. That is regex
+work proportional to the file, so it belongs to the property below, not to the history. Measured on
+two repositories of the same shape, one at 100 commits and one at 1000, the scanner went from 8 ms to
+42 ms, because a bench that appends one line per commit had made the file 7.5x longer. The commit
+itself did not move.
+
 Two properties are easy to confuse here, and the benches keep them apart.
 
 **The cost follows the file.** `bench/file_growth.py` holds the history at one commit and varies the

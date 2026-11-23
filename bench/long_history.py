@@ -146,7 +146,11 @@ def main():
         # cost of the setup.
         while made < target:
             made += 1
-            w, _s, err = commit_one(ROOT, f"b{made}")
+            # Setup commits go to their own file, so the file the measurement commits never grows
+            # during setup. `commit_one` appends one line; using the probe file here would build a
+            # thousand line file before the first timed commit and the measurement would read the
+            # scanner walking it.
+            w, _s, err = commit_one(ROOT, f"b{made}", "history.txt")
             if w is None and made % 500 == 0:
                 print(f"  commit {made} failed: {err}")
                 return 1
