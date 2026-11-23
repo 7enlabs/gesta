@@ -465,6 +465,9 @@ enum Cmd {
         changeset: Option<String>,
         #[arg(long)]
         list: bool,
+        /// Move the tag if it already exists, instead of refusing
+        #[arg(long)]
+        force: bool,
     },
     /// Branch operations
     Branch {
@@ -1412,7 +1415,8 @@ fn run() -> ZResult<()> {
             name,
             changeset,
             list,
-        } => cli::cmd_tag(name.as_deref(), changeset.as_deref(), list),
+            force,
+        } => cli::cmd_tag(name.as_deref(), changeset.as_deref(), list, force),
         Cmd::Branch { sub } => match sub {
             BranchCmd::Create { name, from } => cli::cmd_branch_create(&name, &from),
             BranchCmd::List => cli::cmd_branch_list(),

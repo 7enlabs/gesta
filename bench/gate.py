@@ -4936,6 +4936,22 @@ def main():
             (r[1] or "")[-500:],
         )
 
+    if want("tags"):
+        # A tag name that moves silently is worse than a missing feature: the build script that read
+        # it yesterday read something else today and nothing reported a difference. The bench pins
+        # all four behaviours, including the one that was missing - a second tag at a different point
+        # is refused, and the refusal names where the tag actually is.
+        r = sh(
+            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tags.py')}",
+            cwd=ZF_DIR,
+            timeout=300,
+        )
+        record(
+            "a tag cannot be moved without saying so",
+            r[0] == 0 and "tag checks pass" in r[1],
+            (r[1] or "")[-500:],
+        )
+
     if want("remote-derive"):
         # A bundle moves history, not the index this store derives over it. Every receiving path has
         # to derive its own rows, and three paths did not: clone over HTTP, clone from a bundle, and

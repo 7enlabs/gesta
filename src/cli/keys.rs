@@ -235,7 +235,12 @@ pub fn cmd_verify(id: Option<&str>, key_hex: Option<&str>) -> ZResult<()> {
     Ok(())
 }
 
-pub fn cmd_tag(name: Option<&str>, changeset: Option<&str>, list: bool) -> ZResult<()> {
+pub fn cmd_tag(
+    name: Option<&str>,
+    changeset: Option<&str>,
+    list: bool,
+    force: bool,
+) -> ZResult<()> {
     let (_root, conn) = open_repo()?;
     if list {
         let tags: Vec<(String, String, i64)> = {
@@ -277,9 +282,46 @@ pub fn cmd_tag(name: Option<&str>, changeset: Option<&str>, list: bool) -> ZResu
             branch_head(&conn, &branch)?.ok_or_else(|| bad("branch has no changesets to tag"))?
         }
     };
+    // A tag that already exists is refused, not moved. `ON CONFLICT DO UPDATE` made `gesta tag v1`
+    // twice silently relocate `v1` to the second changeset: exit 0, a success message, and the
+    // first target gone from every record. A name that people put in a build script or a release
+    // note has to mean the same thing the next time it is read.
+    //
+    // The escape is explicit: `--force` moves it and says the old target in the message, so a
+    // script that means to re-point a tag has to say so and the log keeps the previous answer.
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT changeset_id FROM tags WHERE name = ?1",
+            rusqlite::params![name],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match (&existing, force) {
+        (Some(old), false) if old == &target => {
+            // Re-tagging the same point is a no-op, not an error: a script that sets a tag after
+            // every build should not fail on the runs where nothing moved.
+            println!("{} is already at {}", name, target);
+            return Ok(());
+        }
+        (Some(old), false) => {
+            return Err(bad(format!(
+                "tag {} already points at {}; pass --force to move it to {}",
+                name, old, target
+            )));
+        }
+        (Some(old), true) => {
+            conn.execute(
+                "UPDATE tags SET changeset_id = ?2, created_at = ?3 WHERE name = ?1",
+                rusqlite::params![name, target, now()],
+            )?;
+            ops::record(&conn, "tag-move", Some(name), Some(old))?;
+            println!("moved {} from {} to {}", name, old, target);
+            return Ok(());
+        }
+        (None, _) => {}
+    }
     conn.execute(
-        "INSERT INTO tags(name, changeset_id, message, created_at) VALUES(?1, ?2, NULL, ?3)
-         ON CONFLICT(name) DO UPDATE SET changeset_id = excluded.changeset_id",
+        "INSERT INTO tags(name, changeset_id, message, created_at) VALUES(?1, ?2, NULL, ?3)",
         rusqlite::params![name, target, now()],
     )?;
     ops::record(&conn, "tag", Some(name), None)?;
