@@ -255,39 +255,58 @@ def main() -> int:
                 out,
             )
 
-        # Every command in the help output, not a hand-picked list. Two earlier passes fixed the
-        # commands that came to mind and reported "0 left" from the sample; the count of commands
-        # that still refuse with a bare parser message was 11 after both. Reading the surface from
-        # `--help` is what makes the claim about the whole surface rather than about the sample.
-        listing = sh([ZF, "--help"], full)
-        names = []
-        in_commands = False
-        for line in (listing.stdout or "").splitlines():
-            if line.strip() == "Commands:":
-                in_commands = True
-                continue
-            if in_commands:
-                if not line.startswith("  "):
-                    break
-                parts = line.split()
-                if parts and parts[0] not in ("help",):
-                    names.append(parts[0])
+        # Every command in the help output, top level and one level of subcommand, not a hand-picked
+        # list. Three earlier passes fixed the commands that came to mind and each reported no work
+        # left, and the count still refusing with a bare parser message was eleven after two of
+        # them and twenty-seven after the third, because the sweep only looked at top-level names.
+        # Reading the surface out of `--help` is what makes the claim about the surface.
+        #
+        # What counts as fixed is a line the parser would not have written: clap already prints
+        # `Usage: gesta changeset create <MESSAGE>`, so the check cannot be "the word required is
+        # absent". It looks for a `gesta ...` line after the usage block, which is the example this
+        # program adds.
+        def commands_of(prefix):
+            listing = sh([ZF, "--help"] if prefix is None else [ZF, prefix, "--help"], full)
+            out, seen, found = (listing.stdout or ""), False, []
+            for line in out.splitlines():
+                if line.strip() == "Commands:":
+                    seen = True
+                    continue
+                if seen:
+                    if not line.startswith("  "):
+                        break
+                    parts = line.split()
+                    if parts and parts[0] != "help":
+                        found.append(parts[0])
+            return found
+
         # `serve` and `mcp` do not exit, so a timeout says nothing about their messages. Both are
         # covered by their own gate steps.
         skip = {"serve", "mcp"}
-        bare = []
-        for name in names:
-            if name in skip:
+        cases = [(c,) for c in commands_of(None) if c not in skip]
+        for parent in commands_of(None):
+            if parent in skip or parent == "init":
                 continue
-            r = sh([ZF, name], full, timeout=20)
+            for sub in commands_of(parent):
+                cases.append((parent, sub))
+
+        bare = []
+        for case in cases:
+            r = sh([ZF, *case], full, timeout=20)
             combined = (r.stdout or "") + (r.stderr or "")
-            if "required arguments were not provided" in combined:
-                bare.append(name)
+            if "required arguments were not provided" not in combined:
+                continue
+            hints = [
+                l.strip()
+                for l in combined.splitlines()
+                if l.strip().startswith("gesta ") and not l.strip().startswith("gesta: ")
+            ]
+            if not hints:
+                bare.append(" ".join(case))
         record(
-            f"no command answers a missing argument with the bare parser message "
-            f"({len(names) - len(skip)} commands)",
+            f"every command that needs an argument also shows one ({len(cases)} commands)",
             not bare,
-            ("these still do: " + ", ".join(bare)) if bare else "none",
+            ("these show none: " + ", ".join(bare)) if bare else "none",
         )
 
         passed = sum(1 for _, ok in checks if ok)

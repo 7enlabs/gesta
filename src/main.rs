@@ -1236,8 +1236,143 @@ fn main() {
     }
 }
 
+/// One example of a command with its arguments filled in, for the commands an agent is most likely
+/// to call with one missing.
+///
+/// A table rather than deriving the name from the usage line: `gesta changeset create <MESSAGE>`
+/// would become `gesta changeset create MESSAGE`, which looks like a real command and fails if
+/// pasted. An example has to be a value someone could actually use.
+///
+/// Returning None is not a failure: clap's own message already prints the usage line, so a command
+/// absent from this table is no worse off than before.
+fn example_for(argv: &[String]) -> Option<&'static str> {
+    let words: Vec<&str> = argv
+        .iter()
+        .skip(1)
+        .filter(|a| !a.starts_with('-'))
+        .map(|a| a.as_str())
+        .collect();
+    let key = words.join(" ");
+    // Longest match first, so `changeset create` wins over `changeset`.
+    let table: &[(&str, &str)] = &[
+        (
+            "changeset create",
+            "gesta changeset create \"what changed, in one line\"",
+        ),
+        ("changeset apply", "gesta changeset apply cs1234"),
+        ("changeset diff", "gesta changeset diff cs1234"),
+        ("changeset sign", "gesta changeset sign cs1234"),
+        (
+            "changeset approve",
+            "gesta changeset approve cs1234 --by alice",
+        ),
+        ("changeset approvals", "gesta changeset approvals cs1234"),
+        ("changeset find", "gesta changeset find --commit 3f2a1c9"),
+        ("branch create", "gesta branch create feature"),
+        ("branch switch", "gesta branch switch feature"),
+        ("branch delete", "gesta branch delete feature"),
+        ("branch info", "gesta branch info main"),
+        ("branch merge", "gesta branch merge feature --target main"),
+        ("branch protect", "gesta branch protect main"),
+        ("branch conflicts", "gesta branch conflicts feature"),
+        (
+            "remote add",
+            "gesta remote add origin https://example.com/repo.git",
+        ),
+        (
+            "remote clone",
+            "gesta remote clone https://example.com/repo.git",
+        ),
+        (
+            "forge push",
+            "gesta forge push https://github.com/owner/repo main",
+        ),
+        ("secret set", "gesta secret set s3.access_key"),
+        ("secret remove", "gesta secret remove s3.access_key"),
+        ("sub add", "gesta sub add vendor/lib"),
+        ("sub pin", "gesta sub pin vendor/lib"),
+        ("sub remove", "gesta sub remove vendor/lib"),
+        ("hook install", "gesta hook install pre-commit"),
+        ("hook remove", "gesta hook remove pre-commit"),
+        ("ignore add", "gesta ignore add target/"),
+        ("ignore remove", "gesta ignore remove target/"),
+        ("ignore attr", "gesta ignore attr src/main.rs"),
+        ("ignore why", "gesta ignore why target/debug/app"),
+        (
+            "submodule add",
+            "gesta submodule add vendor/lib https://example.com/lib.git",
+        ),
+        ("notes add", "gesta notes add cs1234 --message \"why\""),
+        ("notes show", "gesta notes show cs1234"),
+        ("notes remove", "gesta notes remove cs1234"),
+        ("worktree add", "gesta worktree add ../other feature"),
+        ("worktree remove", "gesta worktree remove ../other"),
+        ("blame", "gesta blame src/main.rs"),
+        ("history", "gesta history src/main.rs"),
+        ("show", "gesta show main:src/main.rs"),
+        ("grep", "gesta grep TODO --path src"),
+        ("backup", "gesta backup repo.gesta"),
+        ("verify-backup", "gesta verify-backup repo.gesta"),
+        ("restore-repo", "gesta restore-repo repo.gesta"),
+        ("cherry-pick", "gesta cherry-pick cs1234"),
+        ("revert", "gesta revert cs1234"),
+        ("land", "gesta land feature --onto main"),
+        ("landed", "gesta landed cs1234"),
+        ("tag", "gesta tag v1.0.0"),
+        (
+            "git export",
+            "gesta git export https://example.com/upstream.git",
+        ),
+        (
+            "git push",
+            "gesta git push https://example.com/upstream.git",
+        ),
+        (
+            "git pull",
+            "gesta git pull https://example.com/upstream.git",
+        ),
+        (
+            "backup-remote pull",
+            "gesta backup-remote pull s3://bucket/key",
+        ),
+        ("bisect start", "gesta bisect start cs1234 cs5678"),
+        ("bisect run", "gesta bisect run -- cargo test"),
+    ];
+    // The longest key that the argv starts with, so a subcommand beats its parent.
+    table
+        .iter()
+        .filter(|(k, _)| key == *k || key.starts_with(&format!("{} ", k)))
+        .max_by_key(|(k, _)| k.len())
+        .map(|(_, v)| *v)
+}
+
 fn run() -> ZResult<()> {
-    let cli = Cli::parse();
+    // `try_parse` rather than `parse`, so the missing-argument message can carry one line the
+    // parser does not write: what the command is for and an example of it filled in. clap already
+    // prints `Usage: gesta changeset create <MESSAGE>`, which names the shape to a reader who knows
+    // how to read a usage line and says nothing to a reader who does not.
+    //
+    // Handled here rather than by declaring 37 arguments optional across nine files: every field
+    // that came up would have changed a function signature, and the whole point of the message is
+    // one sentence in one place. The commands whose argument can be inferred (the only pending
+    // changeset, the current branch) keep their hand-written refusals, because those do more than
+    // explain: they resolve.
+    let cli = match Cli::try_parse() {
+        Ok(c) => c,
+        Err(e) => {
+            let text = e.to_string();
+            if text.contains("required arguments were not provided") {
+                if let Some(hint) = example_for(&std::env::args().collect::<Vec<_>>()) {
+                    eprint!("{}", text);
+                    eprintln!("\n{}", hint);
+                    std::process::exit(2);
+                }
+            }
+            // Every other parse outcome, including --help and --version, is clap's to print and clap
+            // prints it: `e.exit()` writes to the right stream and uses the right status.
+            e.exit()
+        }
+    };
     let json = cli.json;
     match cli.cmd {
         Cmd::Status if json => cli::cmd_status_json(),

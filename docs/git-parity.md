@@ -224,6 +224,14 @@ three repeat runs of five gave 787.5, 791.0 and 796.1, so the number is stable r
 artefact. This paragraph previously said 454.7 against 78.4. Both were low, and the earlier number
 is not reproducible here; the ratio it implies, 5.8x, is also wrong, and the measured ratio is 14.4x.
 
+A later run of the same tree through `bench/status_vs_git.py`, which interleaves the two tools
+round by round rather than timing one after the other, gave 779.5 ms against 54.5 ms, and that is
+the 14.31x quoted near the end of this file. The two runs disagree by 12 ms out of 790, or 1.5
+percent, which is the drift between measurement shapes rather than between builds: the interleaved
+script copies the binary off the bind mount and alternates, and the nine-run figures above did
+neither. Both are recorded because neither is wrong and picking one would hide that the method
+moves the answer.
+
 A 100,000 file tree at 2 lines each is close to the worst shape for a per-path cache, so the ratio
 should not be read as the ratio on a normal repository. It is the ratio on this one.
 

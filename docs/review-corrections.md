@@ -28,8 +28,9 @@ work; the bench for them writes two trees from one store and reads both. The rev
 which is a different claim: a git client cannot see this repository's worktrees, and this
 repository's worktrees are not git worktrees.
 
-**"13 cửa ải kiểm soát" for `bench/gate.py`.** There are 114 named steps, each holding several
-checks, and the run reports 365 individual checks. The number 13 appears nowhere in the file.
+**"13 cửa ải kiểm soát" for `bench/gate.py`.** Asking the gate for its own list prints 124 step
+names, each holding several checks, and a full run reports 367 individual checks. The number 13
+appears nowhere in the file.
 
 ## Wrong here, and the review repeated it
 
@@ -81,8 +82,10 @@ process goes with it. Under a harness it is a leak: every bench that starts a se
 `terminate()` leaves it running, because the signal is ignored and the process outlives its parent.
 
 The container had accumulated **2,209** of them from 20 November onward, holding **12.1 GB** resident
-and every port each had bound. The first symptom noticed was a bench failing to bind a port that
-nothing should have been using.
+and every port each had bound. That count and that total were read once from `ps` before they were
+cleared, and cannot be reproduced here now: the processes are gone and the figure is recorded from
+that reading rather than from a script anyone can re-run. What can be re-run is the leak itself, and
+`bench/gate.py` now counts survivors after a gate run, which is 0.
 
 Two changes, both verified by observation rather than by a passing test:
 

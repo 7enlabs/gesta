@@ -368,7 +368,7 @@ pub fn dispatch_branch_text(sub: crate::BranchCmd) -> ZResult<()> {
     // one says only that a token is absent. Each refusal names the shape and, where it helps, the
     // command that lists what exists: a typo is the common case.
     let need = |what: &str, example: &str, got: Option<String>| -> ZResult<String> {
-        got.ok_or_else(|| bad(format!("{what}: `{example}`")))
+        got.ok_or_else(|| bad(format!("{what}, for example `{example}`")))
     };
     match sub {
         crate::BranchCmd::Create { name, from } => {
