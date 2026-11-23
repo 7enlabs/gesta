@@ -283,18 +283,18 @@ enum Cmd {
     },
     /// Show which changeset introduced each line of a file
     Blame {
-        file: String,
+        file: Option<String>,
         /// Revision to attribute to the change before it, instead of itself. Repeat for several,
         /// or name a file of revisions. With none, .gesta-blame-ignore-revs at the root is read.
         #[arg(long = "ignore-rev")]
         ignore_rev: Vec<String>,
     },
     /// Show version history of a file
-    History { file: String },
+    History { file: Option<String> },
     /// Show a file as of a changeset or branch
     Show {
         /// Path, optionally as `rev:path`
-        spec: String,
+        spec: Option<String>,
         /// Print a JSON object instead of the file's bytes. A binary body is base64, and `binary`
         /// says so, because a terminal writes raw bytes without a word about what they are.
         #[arg(long)]
@@ -331,7 +331,7 @@ enum Cmd {
     /// Search the working tree, or every version in the history
     Grep {
         /// Text to find
-        pattern: String,
+        pattern: Option<String>,
         /// Search every recorded version instead of the files on disk
         #[arg(long)]
         history: bool,
@@ -375,7 +375,7 @@ enum Cmd {
     /// Write the whole repository to one file: every branch, tag and blame range
     Backup {
         /// Destination file. Replaced if it exists
-        dest: String,
+        dest: Option<String>,
         #[arg(long)]
         json_backup: bool,
     },
@@ -387,12 +387,12 @@ enum Cmd {
     /// Check a backup file without touching the repository
     VerifyBackup {
         /// The backup file
-        file: String,
+        file: Option<String>,
     },
     /// Replace this repository with the one in a backup file
     RestoreRepo {
         /// The backup file
-        file: String,
+        file: Option<String>,
         /// Skip the question. Without it, restoring asks first because it replaces the store
         #[arg(long)]
         yes: bool,
@@ -417,7 +417,7 @@ enum Cmd {
     /// Apply the change one changeset made onto the current branch
     CherryPick {
         /// Changeset id, tag, or branch name
-        source: String,
+        source: Option<String>,
         /// Branch to apply onto. Defaults to the current branch.
         #[arg(long)]
         onto: Option<String>,
@@ -450,7 +450,7 @@ enum Cmd {
     Redo,
     /// Undo the effect of one changeset by recording a new one
     Revert {
-        id: String,
+        id: Option<String>,
         #[arg(long)]
         reason: Option<String>,
         #[arg(long, default_value = "agent")]
@@ -507,7 +507,7 @@ enum Cmd {
     /// Land a branch onto a target, refusing if the target moved since it was read
     Land {
         /// Branch whose changes are being landed
-        source: String,
+        source: Option<String>,
         /// Branch being landed onto
         #[arg(long, default_value = "main")]
         onto: String,
@@ -524,7 +524,7 @@ enum Cmd {
     /// work that was never landed reads as such.
     Landed {
         /// The changeset to look for
-        changeset: String,
+        changeset: Option<String>,
         /// The branch it should be on
         #[arg(long, default_value = "main")]
         branch: String,
@@ -602,13 +602,12 @@ enum Cmd {
     },
     /// Report storage statistics
     Stats,
-    /// Ignore patterns
-
     /// Manage git submodules
     Submodule {
         #[command(subcommand)]
         sub: SubmoduleCmd,
     },
+    /// Ignore patterns
     Ignore {
         #[command(subcommand)]
         sub: IgnoreCmd,
@@ -1245,8 +1244,17 @@ fn run() -> ZResult<()> {
         Cmd::Log {
             limit, envelope, ..
         } if json => cli::cmd_log_json(limit, envelope),
-        Cmd::Blame { file, .. } if json => cli::cmd_blame_json(&file),
-        Cmd::History { file } if json => cli::cmd_history_json(&file),
+        Cmd::Blame { file, .. } if json => {
+            let file = file
+                .ok_or_else(|| bad("blame needs a file: `gesta blame src/main.rs`".to_string()))?;
+            cli::cmd_blame_json(&file)
+        }
+        Cmd::History { file } if json => {
+            let file = file.ok_or_else(|| {
+                bad("history needs a file: `gesta history src/main.rs`".to_string())
+            })?;
+            cli::cmd_history_json(&file)
+        }
         Cmd::Diff {
             changeset,
             from,
@@ -1303,7 +1311,15 @@ fn run() -> ZResult<()> {
             source,
             onto,
             author,
-        } => cli::cmd_cherry_pick(&source, onto.as_deref(), &author),
+        } => {
+            let source = source.ok_or_else(|| {
+                bad(
+                    "cherry-pick needs the changeset to apply: `gesta cherry-pick cs1234`"
+                        .to_string(),
+                )
+            })?;
+            cli::cmd_cherry_pick(&source, onto.as_deref(), &author)
+        }
         Cmd::Bisect { sub } => cli::cmd_bisect(sub),
         Cmd::Sub { sub } => cli::cmd_sub(sub, json),
         Cmd::Submodule { sub } => cli::cmd_submodule(sub, json),
@@ -1357,9 +1373,23 @@ fn run() -> ZResult<()> {
             ChangesetCmd::Diff { id } => cli::cmd_changeset_diff(&id),
             ChangesetCmd::List => cli::cmd_changeset_list(),
         },
-        Cmd::Blame { file, ignore_rev } => cli::cmd_blame(&file, &ignore_rev),
-        Cmd::History { file } => cli::cmd_history(&file),
-        Cmd::Show { spec, json } => cli::cmd_show(&spec, json),
+        Cmd::Blame { file, ignore_rev } => {
+            let file = file
+                .ok_or_else(|| bad("blame needs a file: `gesta blame src/main.rs`".to_string()))?;
+            cli::cmd_blame(&file, &ignore_rev)
+        }
+        Cmd::History { file } => {
+            let file = file.ok_or_else(|| {
+                bad("history needs a file: `gesta history src/main.rs`".to_string())
+            })?;
+            cli::cmd_history(&file)
+        }
+        Cmd::Show { spec, json } => {
+            let spec = spec.ok_or_else(|| {
+                bad("show needs a path, or `rev:path`: `gesta show main:src/main.rs`".to_string())
+            })?;
+            cli::cmd_show(&spec, json)
+        }
         Cmd::Ls { rev, path, long: _ } if json => cli::cmd_ls_json(rev.as_deref(), path.as_deref()),
         Cmd::Ls { rev, path, long } => cli::cmd_ls(rev.as_deref(), path.as_deref(), long),
         Cmd::Git { sub } => match sub {
@@ -1397,6 +1427,9 @@ fn run() -> ZResult<()> {
             files_with_matches,
             max_line,
         } => {
+            let pattern = pattern.ok_or_else(|| {
+                bad("grep needs text to find: `gesta grep TODO --path src`".to_string())
+            })?;
             let search = cli::Search {
                 pattern,
                 history,
@@ -1418,13 +1451,39 @@ fn run() -> ZResult<()> {
             cli::cmd_checkout(file.as_deref(), changeset.as_deref())
         }
         Cmd::Restore { file } => cli::cmd_restore(file.as_deref()),
-        Cmd::Backup { dest, json_backup } => cli::cmd_backup(&dest, json_backup),
+        Cmd::Backup { dest, json_backup } => {
+            let dest = dest.ok_or_else(|| {
+                bad("backup needs a destination file: `gesta backup repo.gesta`".to_string())
+            })?;
+            cli::cmd_backup(&dest, json_backup)
+        }
         Cmd::BackupRemote { sub } => cli::cmd_backup_remote(sub),
-        Cmd::VerifyBackup { file } => cli::cmd_verify_backup(&file),
-        Cmd::RestoreRepo { file, yes } => cli::cmd_restore_repo(&file, yes),
+        Cmd::VerifyBackup { file } => {
+            let file = file.ok_or_else(|| {
+                bad(
+                    "verify-backup needs the backup file: `gesta verify-backup repo.gesta`"
+                        .to_string(),
+                )
+            })?;
+            cli::cmd_verify_backup(&file)
+        }
+        Cmd::RestoreRepo { file, yes } => {
+            let file = file.ok_or_else(|| {
+                bad(
+                    "restore-repo needs the backup file: `gesta restore-repo repo.gesta`"
+                        .to_string(),
+                )
+            })?;
+            cli::cmd_restore_repo(&file, yes)
+        }
         Cmd::Undo => cli::cmd_undo(),
         Cmd::Redo => cli::cmd_redo(),
-        Cmd::Revert { id, reason, author } => cli::cmd_revert(&id, reason.as_deref(), &author),
+        Cmd::Revert { id, reason, author } => {
+            let id = id.ok_or_else(|| {
+                bad("revert needs the changeset to undo: `gesta revert cs1234`".to_string())
+            })?;
+            cli::cmd_revert(&id, reason.as_deref(), &author)
+        }
         Cmd::Ops { limit } => cli::cmd_ops(limit),
         Cmd::Tag {
             name,
@@ -1516,12 +1575,22 @@ fn run() -> ZResult<()> {
             onto,
             expect,
             author,
-        } => cli::cmd_land(&source, &onto, expect.as_deref(), &author),
+        } => {
+            let source = source.ok_or_else(|| {
+                bad("land needs the branch to land: `gesta land feature --onto main`".to_string())
+            })?;
+            cli::cmd_land(&source, &onto, expect.as_deref(), &author)
+        }
         Cmd::Landed {
             changeset,
             branch,
             json,
-        } => cli::cmd_landed(&changeset, &branch, json),
+        } => {
+            let changeset = changeset.ok_or_else(|| {
+                bad("landed needs the changeset to look for: `gesta landed cs1234`".to_string())
+            })?;
+            cli::cmd_landed(&changeset, &branch, json)
+        }
         Cmd::Review { from, to, min_risk } => {
             if json {
                 cli::cmd_review_json(from.as_deref(), to.as_deref(), min_risk.as_deref())

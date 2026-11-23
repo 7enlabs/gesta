@@ -45,8 +45,8 @@ def record(name, ok, detail=""):
             print(f"         {line}")
 
 
-def sh(args, cwd):
-    return subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=180)
+def sh(args, cwd, timeout=180):
+    return subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout)
 
 
 def commit(repo, body, message):
@@ -254,6 +254,41 @@ def main() -> int:
                 must_say in out and r.returncode != 0,
                 out,
             )
+
+        # Every command in the help output, not a hand-picked list. Two earlier passes fixed the
+        # commands that came to mind and reported "0 left" from the sample; the count of commands
+        # that still refuse with a bare parser message was 11 after both. Reading the surface from
+        # `--help` is what makes the claim about the whole surface rather than about the sample.
+        listing = sh([ZF, "--help"], full)
+        names = []
+        in_commands = False
+        for line in (listing.stdout or "").splitlines():
+            if line.strip() == "Commands:":
+                in_commands = True
+                continue
+            if in_commands:
+                if not line.startswith("  "):
+                    break
+                parts = line.split()
+                if parts and parts[0] not in ("help",):
+                    names.append(parts[0])
+        # `serve` and `mcp` do not exit, so a timeout says nothing about their messages. Both are
+        # covered by their own gate steps.
+        skip = {"serve", "mcp"}
+        bare = []
+        for name in names:
+            if name in skip:
+                continue
+            r = sh([ZF, name], full, timeout=20)
+            combined = (r.stdout or "") + (r.stderr or "")
+            if "required arguments were not provided" in combined:
+                bare.append(name)
+        record(
+            f"no command answers a missing argument with the bare parser message "
+            f"({len(names) - len(skip)} commands)",
+            not bare,
+            ("these still do: " + ", ".join(bare)) if bare else "none",
+        )
 
         passed = sum(1 for _, ok in checks if ok)
         print(f"\n{passed}/{len(checks)} refusal checks pass")
