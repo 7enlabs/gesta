@@ -419,7 +419,10 @@ pub fn init_schema(conn: &Connection) -> ZResult<()> {
         -- repository, which made the cost of a commit grow with the size of the store:
         -- measured at 1000 changesets, a commit went from 12.9 ms to 40.7 ms, 3.14x, and the
         -- gate's `long_history` step is what caught it.
-        CREATE INDEX IF NOT EXISTS idx_objects_size ON objects(size);
+        -- `(size, created_at)` serves both halves of the base search: the range on size and the
+        -- recent-first order within it. `objects` is a WITHOUT ROWID table keyed by hash, so there
+        -- is no rowid to order by; `created_at` is the column that says when the body was written.
+        CREATE INDEX IF NOT EXISTS idx_objects_size_recent ON objects(size, created_at DESC);
         "#,
     )?;
 
@@ -772,6 +775,16 @@ fn delta_depth(conn: &Connection, hash: &str) -> ZResult<usize> {
 /// the same shape of answer (delta chain limits plus periodic repacking).
 const MAX_DELTA_DEPTH: usize = 16;
 
+/// How much of two bodies is compared when deciding whether one is a useful base for the other.
+///
+/// The probe used to walk the whole length of the smaller body. `bench/long_history.py` appends to
+/// one file and commits, so both bodies grow with the history and the comparison grew with them:
+/// the cost of a commit was O(history) even after the base search itself was fixed. A fixed window
+/// keeps the decision cheap and still finds the base for the case deltas exist for - a file edited
+/// in place, which shares its beginning. A body whose only shared region lies past this window
+/// would produce a payload encoding everything before it, so such a base is not worth having.
+const DELTA_PROBE_WINDOW: usize = 4096;
+
 pub fn put_object_against(conn: &Connection, content: &str, base: Option<&str>) -> ZResult<String> {
     let h = hash_content(content);
     let exists: Option<i64> = conn
@@ -893,13 +906,29 @@ fn find_delta_base(conn: &Connection, content: &str) -> ZResult<Option<String>> 
     // reading the range and sorting it, which meant the query touched the whole store on every
     // commit. Ordering by size alone lets `idx_objects_size` serve both the range and the order;
     // the depth-0 preference is applied below, where the rows have been read anyway.
-    let size_min = target_len / 2;
-    let size_max = target_len * 2;
+    // The window has to shrink as the body grows, not widen with it. `long_history.py` appends one
+    // line per commit, so a file's size tracks the history: a 2x window around 8 kB covered 495
+    // objects at 1000 commits and 50 at 100, which is exactly the 10x the gate measured. The number
+    // of candidates a search has to weigh was rising with the repository while the work per
+    // candidate stayed the same.
+    //
+    // A body worth basing on is one this commit is an edit of, and that object was written by a
+    // recent commit, so recency is the useful filter. The size band still has to hold - a delta
+    // against something twice the size pays for the copy - but a narrow band plus a recent-first
+    // order keeps the candidate set bounded no matter how long the file has been growing.
+    let slack = (target_len / 8).max(64);
+    // A body that has been growing for a thousand commits has a thousand siblings within any
+    // useful band, because each one was one line shorter than the next. Comparing all of them costs
+    // the same work per candidate no matter how the band is chosen, so the bound that matters is the
+    // count: the candidate this commit is an edit of was written by one of the last few commits that
+    // touched this size, and anything older shares proportionally less of its beginning.
+    let size_min = target_len.saturating_sub(slack);
+    let size_max = target_len + slack;
     let mut stmt = conn.prepare(
         "SELECT hash, size, base_hash FROM objects
          WHERE size BETWEEN ?1 AND ?2
-         ORDER BY size DESC
-         LIMIT 50",
+         ORDER BY created_at DESC
+         LIMIT 24",
     )?;
     let candidates = stmt.query_map(params![size_min as i64, size_max as i64], |r| {
         Ok((
@@ -920,23 +949,21 @@ fn find_delta_base(conn: &Connection, content: &str) -> ZResult<Option<String>> 
     let mut considered = 0usize;
 
     for c in candidates.flatten() {
-        // A candidate with a deep chain would make the next read deeper, so it is not a base. The
-        // depth is asked for every candidate, which is why it is one query for the whole chain
-        // rather than one per link.
-        if c.2.is_some() {
-            // A chain of any depth costs a walk on every later read of the object built on it, and
-            // a chain that keeps growing makes each commit's base search deeper than the last. Only
-            // a shallow chain is a base here: a whole object is best, and anything more than a
-            // quarter of the cap is not worth the read it will cost later. The depth is one query
-            // for the whole chain rather than one per link, because it runs for every candidate.
-            if delta_depth(conn, &c.0)? > MAX_DELTA_DEPTH / 4 {
-                continue;
-            }
-        }
+        // Cheap rejection first. The depth check below is a recursive query, and running it for every
+        // candidate before the prefix probe meant up to fifty chain walks per commit; each walk is
+        // short, but the number of candidates that have a base at all grows with the history, so the
+        // cost of a commit grew with it. The prefix probe is a bounded read of the first bytes and
+        // rejects almost everything, which is why it goes first even though it looks like detail.
         let Some(head) = object_prefix(conn, &c.0, 64)? else {
             continue;
         };
         if target.len() < 64 || head.len() < 64 || target[..64] != head[..64] {
+            continue;
+        }
+        // A candidate that got this far is worth the chain walk. A deep chain would make every later
+        // read of the object built on it walk too, so it is not a base: a whole object is best, and
+        // anything past a quarter of the cap costs more to read than the delta saves.
+        if c.2.is_some() && delta_depth(conn, &c.0)? > MAX_DELTA_DEPTH / 4 {
             continue;
         }
         considered += 1;
@@ -946,8 +973,18 @@ fn find_delta_base(conn: &Connection, content: &str) -> ZResult<Option<String>> 
         };
         let cand_bytes = cand.as_bytes();
         let limit = target_len.min(cand_bytes.len());
-        let shared = lcs_prefix_len(target, cand_bytes, limit);
-        if shared < limit / 2 {
+        // Compare a bounded window, not the whole file. `bench/long_history.py` appends to one file
+        // and commits, so the file grows with the history: an unbounded prefix walk meant the cost
+        // of a commit grew with the repository, which is the shape that gate measures (5.98x over a
+        // 10x history on CI). The window is what makes a delta worth writing - a shared prologue -
+        // and its cost has to be constant for the gate to mean anything.
+        //
+        // A file edited in place still shares its whole beginning, so the cheaper probe finds the
+        // same base. A file whose only shared region lies past this window is a worse delta anyway:
+        // the payload would have to encode everything before it.
+        let window = limit.min(DELTA_PROBE_WINDOW);
+        let shared = lcs_prefix_len(target, cand_bytes, window);
+        if shared < window / 2 {
             continue;
         }
         // Prefer a depth-0 base, which keeps the chain shallow: it scores a tenth of the
