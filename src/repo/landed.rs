@@ -66,28 +66,43 @@ pub fn find(conn: &rusqlite::Connection, target: &str, branch: &str) -> ZResult<
     // linear history every commit from the target onwards contains it, so the walk answered "landed
     // at the head, 0 steps from the head" for a change made three commits ago. The number that says
     // where a change arrived is the earliest commit that has it, not the latest.
-    let mut steps = 0usize;
-    let mut cur = Some(head.clone());
-    let mut landing: Option<(String, usize)> = None;
-    // A history this store cannot walk in this many steps has a cycle, which `fsck` reports;
-    // stopping is the bounded answer rather than looping.
-    let cap = 1_000_000usize;
-    while let Some(id) = cur {
-        if !store::is_ancestor(conn, target, &id)? {
-            // This commit is before the target arrived. The previous one, if any, is the landing.
-            break;
+    //
+    // The chain is read once, here, rather than asking `is_ancestor` at every step. That call builds
+    // the whole parent map, so a loop over n steps read every row of `changesets` n times: answering
+    // one question cost O(n^2) rows, which is the shape the systems this borrows from were built to
+    // avoid. One read of the chain plus one read of the parent map answers the same question once.
+    let chain = store::first_parent_chain(conn, &head)?;
+    let parents = store::parent_map_for(conn)?;
+
+    // The chain runs newest to oldest, and the answer is a prefix of it: every commit from the head
+    // down to the landing contains the target, and none below the landing does. That makes the answer
+    // a boundary, so a binary search finds it in log(n) ancestry checks rather than one per step.
+    //
+    // When the target is itself on the chain the boundary is exact and no ancestry check is needed:
+    // the target landed at its own position, and the commit below it is a parent that predates it.
+    let on_chain = chain.iter().position(|id| id == target);
+
+    let landing_index = match on_chain {
+        Some(i) => Some(i),
+        None => {
+            // Index 0 is known to contain the target (checked above), so a boundary always exists in
+            // [0, len). `lo` is the highest index proven to contain it, `hi` the lowest proven not to.
+            let mut lo = 0usize;
+            let mut hi = chain.len();
+            while hi - lo > 1 {
+                let mid = lo + (hi - lo) / 2;
+                if store::walk_reaches(&parents, &chain[mid], target) {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            Some(lo)
         }
-        landing = Some((id.clone(), steps));
-        steps += 1;
-        if steps > cap {
-            return Err(bad(format!(
-                "the first-parent chain from {} did not reach a root",
-                branch
-            )));
-        }
-        let (p1, _p2) = store::parents_of_public(conn, &id)?;
-        cur = p1;
-    }
+    };
+
+    let landing: Option<(String, usize)> =
+        landing_index.and_then(|i| chain.get(i).map(|id| (id.clone(), i)));
 
     let Some((id, at_steps)) = landing else {
         return Ok(None);

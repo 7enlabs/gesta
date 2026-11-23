@@ -619,22 +619,32 @@ Wren, Jujutsu, Sapling and Dolt answer "is this an ancestor of that", "what is t
 Wren writes the rule as an invariant - a new history query may not scan the commit log - and uses
 binary lifting over the first-parent chain so `landed` costs log(n) ancestry checks.
 
-This store walks. `ancestors` visits every parent from the tip, and `merge_bases` calls it once per
-input and once per common ancestor, so a merge base on a forked history used to cost a query per step
-per candidate. What shipped is the cheap half: the parent table is read once and shared by every walk
-inside one answer, which removes the per-step query without changing the shape. Measured on 300
-changesets with a fork and a re-merge, the walk is 12.8 ms after removing 32.8 ms of startup, or
-42.8 us per changeset (`bench/merge_base_cost.py`).
+This store records a `generation` number on every changeset, filled for existing repositories by the
+migration, and reads it in three places:
 
-Each committed changeset now records a `generation` number, which is the input a pruning walk needs,
-and a migration fills it for an existing repository. Nothing reads it yet. What is still missing:
+- `is_ancestor` returns false without a walk when the candidate's generation is at or below the
+  descendant's, which settles the common "no" - a client asking whether its head is behind, a push
+  checking that the remote moved forward.
+- `merge_bases` answers a fast-forward from generations alone, before building the parent map.
+- `landed` reads the first-parent chain once and binary-searches the boundary, so the answer costs
+  log(n) ancestry checks against one shared parent map instead of one per step.
 
-- pruning by generation, so a step can skip a whole level instead of visiting it;
-- a skip list over the first-parent chain, which is what makes `landed` logarithmic;
-- a command that answers `landed` at all - this store has no equivalent.
+That last one was the defect. `landed` asked `is_ancestor` at every step, and that call builds the
+whole parent map, so one question on an n-commit branch read every row of `changesets` n times:
+O(n^2) rows for a single answer. Measured over a 4x growth in history (200 to 800 commits) the work
+outside process startup went from 0 ms to 2 ms, which is what a logarithmic boundary looks like next
+to a quadratic one. `bench/landed.py` holds the eight behavioural checks, including the one that
+caught the original error - answering the head for a change made three commits ago.
 
-At a few hundred changesets none of this is felt. The figure is linear in the history, so the gap
-opens where the systems above were built to operate.
+Path history is the other question in this area and it never needed the index the others have:
+`history <path>` filters `file_versions` on a `(path, version DESC)` covering index, so it does not
+walk the log at all. On a 1000-commit history with a fork it answers in 5.24 ms against git's
+42.55 ms (`bench/history_index.py`), because git reads a tree per commit it walks.
+
+What is still missing is pruning by generation in `ancestors` itself, so the range and merge-base
+walks skip a level rather than visiting it, and a skip list over the first-parent chain. Neither is
+felt at a few hundred changesets; the merge-base walk is 42.8 us per changeset
+(`bench/merge_base_cost.py`).
 
 ### 9. What git has that nothing here replaces
 

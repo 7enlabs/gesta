@@ -1543,7 +1543,51 @@ fn walk_ancestors(parents: &ParentMap, id: &str) -> Vec<String> {
 }
 
 /// A changeset's two parents, by id. A merge has both; everything else has one or none.
-type ParentMap = std::collections::HashMap<String, (Option<String>, Option<String>)>;
+pub type ParentMap = std::collections::HashMap<String, (Option<String>, Option<String>)>;
+
+/// Every changeset's parents, for a caller that will walk more than once.
+///
+/// `is_ancestor` is the one-shot answer and builds this map per call. A caller that asks ancestry
+/// repeatedly against one history - `landed` does, at every step of its search - has to hold the map
+/// itself or pay a full table read per question.
+pub fn parent_map_for(conn: &Connection) -> ZResult<ParentMap> {
+    parent_map(conn)
+}
+
+/// Does walking parents from `desc` reach `anc`?
+///
+/// The map is the caller's, so a loop over candidates reads the table once rather than once per
+/// candidate. This is `is_ancestor` without either the generation shortcut or the per-call read.
+pub fn walk_reaches(parents: &ParentMap, desc: &str, anc: &str) -> bool {
+    if desc == anc {
+        return true;
+    }
+    walk_ancestors(parents, desc).iter().any(|id| id == anc)
+}
+
+/// The first-parent chain from `id` towards the root, newest first.
+///
+/// The first parent is the line a branch moved along: a merge's second parent is the work that
+/// arrived, and following both would answer a different question. The bound exists because a
+/// corrupt history can hold a cycle - `fsck` reports one, and a walk that ran forever would report
+/// it as a hang instead.
+pub fn first_parent_chain(conn: &Connection, id: &str) -> ZResult<Vec<String>> {
+    const CAP: usize = 1_000_000;
+    let mut out = Vec::new();
+    let mut cur = Some(id.to_string());
+    let mut seen = std::collections::HashSet::new();
+    while let Some(at) = cur {
+        // A cycle would repeat; stopping at the repeat is the bounded answer and matches what the
+        // walk-based caller did before this existed.
+        if !seen.insert(at.clone()) || out.len() >= CAP {
+            break;
+        }
+        let (p1, _p2) = parents_of(conn, &at)?;
+        out.push(at);
+        cur = p1;
+    }
+    Ok(out)
+}
 
 /// Every changeset's parents, in one query.
 ///
