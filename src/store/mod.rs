@@ -785,6 +785,14 @@ const MAX_DELTA_DEPTH: usize = 16;
 /// would produce a payload encoding everything before it, so such a base is not worth having.
 const DELTA_PROBE_WINDOW: usize = 4096;
 
+/// How many candidates a base search will inflate before it gives up and stores the body whole.
+///
+/// The loop used to stop after four *successful* probes, but a probe that fails the prefix test
+/// costs the same inflation and did not count, so a file with a long history could inflate every
+/// candidate in the band on every commit. Six is enough to find the body this one is an edit of -
+/// the immediately preceding versions - and small enough that the work stays bounded.
+const MAX_PROBE_ATTEMPTS: usize = 6;
+
 pub fn put_object_against(conn: &Connection, content: &str, base: Option<&str>) -> ZResult<String> {
     let h = hash_content(content);
     let exists: Option<i64> = conn
@@ -947,6 +955,12 @@ fn find_delta_base(conn: &Connection, content: &str) -> ZResult<Option<String>> 
     // A probe reads the first bytes of each object without decompressing the whole body.
     let mut best: Option<(String, usize)> = None;
     let mut considered = 0usize;
+    // `considered` counts bases that passed the probe, and the loop breaks on it. That bounded how
+    // many deltas were weighed but not how much work was done: a candidate that failed the prefix
+    // test never incremented it, so the loop could inflate every candidate in the band - up to
+    // twenty-four bodies, each of which grows with the file - and still count zero. The counter that
+    // stops the loop has to count attempts, not successes.
+    let mut attempts = 0usize;
 
     for c in candidates.flatten() {
         // Cheap rejection first. The depth check below is a recursive query, and running it for every
@@ -954,6 +968,10 @@ fn find_delta_base(conn: &Connection, content: &str) -> ZResult<Option<String>> 
         // short, but the number of candidates that have a base at all grows with the history, so the
         // cost of a commit grew with it. The prefix probe is a bounded read of the first bytes and
         // rejects almost everything, which is why it goes first even though it looks like detail.
+        attempts += 1;
+        if attempts > MAX_PROBE_ATTEMPTS {
+            break;
+        }
         let Some(head) = object_prefix(conn, &c.0, 64)? else {
             continue;
         };
@@ -1021,18 +1039,38 @@ fn find_delta_base(conn: &Connection, content: &str) -> ZResult<Option<String>> 
 /// cheaper than `get_object` for the raw case and the same for the compressed one; what it avoids
 /// is resolving a delta chain, which `get_object` does and a prefix comparison does not need.
 fn object_prefix(conn: &Connection, hash: &str, n: usize) -> ZResult<Option<Vec<u8>>> {
-    let row: Option<(Vec<u8>, i64)> = conn
+    let row: Option<(Vec<u8>, i64, Option<i64>)> = conn
         .query_row(
-            "SELECT content, compressed FROM objects WHERE hash = ?1",
+            "SELECT content, compressed, length FROM objects WHERE hash = ?1",
             params![hash],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
     match row {
         None => Ok(None),
-        Some((blob, 0)) => Ok(Some(blob.into_iter().take(n).collect())),
-        // Compressed: inflate, then cut. Same work as `get_object` without the delta walk.
-        Some((blob, _)) => match decompress_bytes(&blob) {
+        // A body stored whole and uncompressed is its own prefix.
+        Some((blob, 0, _)) => Ok(Some(blob.into_iter().take(n).collect())),
+        // A body in a sidecar or a shared stream is not in `content`, so there is no prefix to cut
+        // cheaply; refusing it as a candidate is correct and costs nothing.
+        Some((blob, _, Some(_))) => {
+            if blob.is_empty() {
+                return Ok(None);
+            }
+            match decompress_bytes(&blob) {
+                Ok(body) => Ok(Some(body.into_iter().take(n).collect())),
+                Err(_) => Ok(None),
+            }
+        }
+        // Compressed: inflate, then cut. This is the expensive path, and it is the one that made the
+        // cost of a commit grow with the file: `long_history.py` appends a line per commit, so every
+        // candidate in the size band is a body that grows with the history, and inflating all of
+        // them to read 64 bytes each cost more than the delta it was deciding to write.
+        //
+        // The objects that matter for a base are the ones this commit is an edit of, and an edit of
+        // a growing file produces a body one line longer than the last. Those were written moments
+        // ago and are still in the page cache; older siblings are both colder and share less. The
+        // caller bounds the count for that reason, so this stays a bounded number of inflations.
+        Some((blob, _, None)) => match decompress_bytes(&blob) {
             Ok(body) => Ok(Some(body.into_iter().take(n).collect())),
             Err(_) => Ok(None),
         },
