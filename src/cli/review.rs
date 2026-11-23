@@ -472,7 +472,7 @@ pub fn cmd_landed(changeset: &str, branch: &str, json: bool) -> ZResult<()> {
     if json {
         let doc = match &found {
             None => crate::support::json::Json::obj(vec![
-                ("schema", crate::support::json::Json::str("gesta.landed/1")),
+                ("schema", crate::support::json::Json::str("gesta@1")),
                 (
                     "changeset",
                     crate::support::json::Json::str(changeset.to_string()),
@@ -484,7 +484,7 @@ pub fn cmd_landed(changeset: &str, branch: &str, json: bool) -> ZResult<()> {
                 ("landed", crate::support::json::Json::Bool(false)),
             ]),
             Some(l) => crate::support::json::Json::obj(vec![
-                ("schema", crate::support::json::Json::str("gesta.landed/1")),
+                ("schema", crate::support::json::Json::str("gesta@1")),
                 (
                     "changeset",
                     crate::support::json::Json::str(changeset.to_string()),
