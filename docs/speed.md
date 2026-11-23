@@ -80,6 +80,38 @@ A command that does no work at all costs about 2 ms: open the database, read the
 `log --limit 1` is 3 ms and `status` on an unchanged tree is 3 ms, which is the floor. Nothing in the
 figures above is process startup; all of it is work.
 
+## History questions
+
+A question about ancestry - is this an ancestor of that, what is the merge base, which changesets
+separate these two points - is answered by walking parents. Wren, Jujutsu, Sapling and Dolt all
+answer it from an index instead, and Wren writes the rule down as an invariant: a history query may
+not scan the commit log. That is a design this store has not adopted, and `docs/git-parity.md` records
+it as an open gap rather than a closed one.
+
+What changed here is the shape of the walk, not the walk. `ancestors` used to ask the database for a
+row's parents every time it visited one, and `merge_bases` calls it once per input and again for every
+common ancestor, so a merge base on a forked history was a query per step per candidate. The whole
+parent table is now read once and used for every walk inside one answer.
+
+Measured with `bench/merge_base_cost.py` on 300 changesets with a fork and a re-merge:
+
+| | |
+|---|---|
+| `status` (startup and one read) | 32.8 ms |
+| `bisect start`, which resolves two ancestries | 45.6 ms |
+| walk after removing startup | 12.8 ms, or 42.8 us per changeset |
+
+The per-changeset number is the one to watch. At a few hundred changesets the walk is inside the
+noise of process startup and is not a problem; the figure is linear, so it does not go away as a
+history grows. `bench/history_slope.py` tries to fit the slope and reports honestly when it cannot:
+at 600 changesets the walk is under 10 ms against a 38 ms startup, so the slope is not
+distinguishable from noise, and that bench cannot say what a walk would cost at 85,545 commits.
+
+Each committed changeset now carries a `generation` number - one more than its highest parent, the
+number git, Jujutsu, Sapling and Wren all keep. It is written at commit time and a migration fills it
+for a repository that predates the column. Nothing reads it yet: pruning a walk by generation is the
+next step, and recording the number without using it is a schema change, not an optimisation.
+
 ## What is not measured here
 
 - Concurrent writers: `bench/many_writers.py` covers the shape, not the absolute cost.

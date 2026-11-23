@@ -612,6 +612,30 @@ Conflicts are data: both sides, line numbers, context, all three whole files. An
 answer. A human is handed conflict markers. That is a deliberate design choice, not a gap, but it
 is a difference from git that a person will notice.
 
+### 8b. A history question walks the log
+
+Wren, Jujutsu, Sapling and Dolt answer "is this an ancestor of that", "what is the merge base" and
+"which merge brought this in" from a derived index: a generation number, a skip list, a commit graph.
+Wren writes the rule as an invariant - a new history query may not scan the commit log - and uses
+binary lifting over the first-parent chain so `landed` costs log(n) ancestry checks.
+
+This store walks. `ancestors` visits every parent from the tip, and `merge_bases` calls it once per
+input and once per common ancestor, so a merge base on a forked history used to cost a query per step
+per candidate. What shipped is the cheap half: the parent table is read once and shared by every walk
+inside one answer, which removes the per-step query without changing the shape. Measured on 300
+changesets with a fork and a re-merge, the walk is 12.8 ms after removing 32.8 ms of startup, or
+42.8 us per changeset (`bench/merge_base_cost.py`).
+
+Each committed changeset now records a `generation` number, which is the input a pruning walk needs,
+and a migration fills it for an existing repository. Nothing reads it yet. What is still missing:
+
+- pruning by generation, so a step can skip a whole level instead of visiting it;
+- a skip list over the first-parent chain, which is what makes `landed` logarithmic;
+- a command that answers `landed` at all - this store has no equivalent.
+
+At a few hundred changesets none of this is felt. The figure is linear in the history, so the gap
+opens where the systems above were built to operate.
+
 ### 9. What git has that nothing here replaces
 
 - **File modes are recorded, not derived.** A file's mode (`100644`, `100755` for an executable,

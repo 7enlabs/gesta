@@ -435,9 +435,43 @@ pub fn commit_one(conn: &Connection, id: &str) -> ZResult<usize> {
         }
     }
 
+    // Record how far this changeset is from a root. A commit is one more than its highest parent,
+    // which is the number git calls `generation` and every history walk in git, Jujutsu, Sapling and
+    // Wren uses to skip a level. Written at commit time so it is never derived on a read.
+    let generation: i64 = {
+        let p1: Option<String> = tx
+            .query_row(
+                "SELECT parent FROM changesets WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let p2: Option<String> = tx
+            .query_row(
+                "SELECT parent2 FROM changesets WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        let gen_of = |p: &Option<String>| -> i64 {
+            p.as_ref()
+                .and_then(|h| {
+                    tx.query_row(
+                        "SELECT COALESCE(generation, 0) FROM changesets WHERE id = ?1",
+                        params![h],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .ok()
+                })
+                .unwrap_or(0)
+        };
+        1 + gen_of(&p1).max(gen_of(&p2))
+    };
     tx.execute(
-        "UPDATE changesets SET status = 'committed' WHERE id = ?1",
-        params![id],
+        "UPDATE changesets SET status = 'committed', generation = ?2 WHERE id = ?1",
+        params![id, generation],
     )?;
     crate::store::set_branch_head(&tx, &branch, id)?;
 

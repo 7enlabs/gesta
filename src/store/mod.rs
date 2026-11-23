@@ -97,7 +97,9 @@ pub fn with_retry<T>(mut f: impl FnMut() -> ZResult<T>) -> ZResult<T> {
 ///
 /// SQLite has no `ADD COLUMN IF NOT EXISTS`, so the column list decides. An
 /// existing repository keeps working without a manual migration step.
-fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> ZResult<()> {
+/// Add a column if the table does not have it. Returns true when this call added it, which is the
+/// only moment a caller can know the column is empty and needs filling.
+fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> ZResult<bool> {
     let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", table))?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
     let existing: Vec<String> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -117,6 +119,72 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> ZR
             Err(rusqlite::Error::SqliteFailure(_, Some(ref m)))
                 if m.contains("duplicate column") => {}
             Err(e) => return Err(e.into()),
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Give every committed changeset a generation number, oldest first.
+///
+/// A row's number is one more than its highest parent's, so a parent has to be filled before its
+/// child. Walking the table in creation order is not enough: an import can land a child before its
+/// parent, and a merge can reference a row that arrived later. This resolves each row after its
+/// parents by working over the dependency order instead of the row order, and a row whose parents
+/// are all resolved is settled in the same pass, so one pass settles a whole chain that arrived out
+/// of order.
+///
+/// A parent that is not in this table at all (a shallow import whose base was never brought in)
+/// counts as 0, which makes the child a root of what this repository actually holds. That is what a
+/// shallow clone means.
+fn backfill_generation(conn: &Connection) -> ZResult<()> {
+    let mut stmt = conn.prepare("SELECT id, parent, parent2 FROM changesets")?;
+    let rows: Vec<(String, Option<String>, Option<String>)> = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let present: HashSet<String> = rows.iter().map(|(id, _, _)| id.clone()).collect();
+    let mut parents: std::collections::HashMap<String, (Option<String>, Option<String>)> = rows
+        .into_iter()
+        .map(|(id, p1, p2)| (id, (p1, p2)))
+        .collect();
+    let mut done: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+
+    // Resolve in rounds. Every round settles at least one row, or the loop stops with what is
+    // left, which is a cycle - something a correct repository cannot have and a corrupt one can.
+    loop {
+        let ready: Vec<String> = parents
+            .iter()
+            .filter(|(id, _)| !done.contains_key(*id))
+            .filter(|(_, (p1, p2))| {
+                let ok = |p: &Option<String>| match p {
+                    None => true,
+                    Some(h) => !present.contains(h) || done.contains_key(h),
+                };
+                ok(p1) && ok(p2)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        if ready.is_empty() {
+            break;
+        }
+        for id in ready {
+            let (p1, p2) = parents.remove(&id).unwrap_or((None, None));
+            let gen = |p: &Option<String>| -> i64 {
+                p.as_ref().and_then(|h| done.get(h).copied()).unwrap_or(0)
+            };
+            let g = 1 + gen(&p1).max(gen(&p2));
+            conn.execute(
+                "UPDATE changesets SET generation = ?2 WHERE id = ?1",
+                params![id, g],
+            )?;
+            done.insert(id, g);
         }
     }
     Ok(())
@@ -139,7 +207,12 @@ pub fn init_schema(conn: &Connection) -> ZResult<()> {
             -- 1 when the body lives beside the database instead of in `content`. A large object in a
             -- row is copied by every operation that touches the page, so past the threshold it is a
             -- file with a row that names it.
-            sidecar    INTEGER NOT NULL DEFAULT 0
+            sidecar    INTEGER NOT NULL DEFAULT 0,
+            -- The base of a delta chain: the object this one is a delta against. NULL means stored whole.
+            -- A chain is built when a new file shares a large prefix with an existing object; the newest
+            -- object stores the delta and points to the base. A chain has no cycles because every base is
+            -- older than the object that points to it, and the depth is capped by MAX_DELTA_DEPTH.
+            base_hash  TEXT
         );
         -- One compressed stream holding several objects, so the compressor can see across them.
         -- A zlib stream cannot, and the shared vocabulary in source files is most of what it costs.
@@ -173,7 +246,14 @@ pub fn init_schema(conn: &Connection) -> ZResult<()> {
             intent     TEXT,
             -- The git commit this changeset was imported from, so a second import of the same
             -- repository recognises what is already here instead of duplicating it.
-            git_commit TEXT
+            git_commit TEXT,
+            -- Longest distance to a root, so a changeset with no parent is 1 and every child is
+            -- one more than its highest parent. Two changesets at the same generation cannot be
+            -- ancestors of each other, which is what lets a reachability walk drop a whole level
+            -- at once instead of walking it. git, Jujutsu, Sapling and Wren all keep this number
+            -- for the same reason. NULL means the row predates the column and has not been
+            -- backfilled; readers treat NULL as "unknown" and fall back to the plain walk.
+            generation INTEGER
         );
         CREATE TABLE IF NOT EXISTS changeset_files (
             changeset_id TEXT NOT NULL,
@@ -328,13 +408,19 @@ pub fn init_schema(conn: &Connection) -> ZResult<()> {
         CREATE INDEX IF NOT EXISTS idx_fv_path_version ON file_versions(path, version DESC);
         CREATE INDEX IF NOT EXISTS idx_cs_status ON changesets(status, created_at);
         CREATE INDEX IF NOT EXISTS idx_cs_parent ON changesets(parent);
+        -- Choosing a delta base asks for the objects closest in size to a new one, so the
+        -- range has to be an index lookup. Without this the query scans every object in the
+        -- repository, which made the cost of a commit grow with the size of the store:
+        -- measured at 1000 changesets, a commit went from 12.9 ms to 40.7 ms, 3.14x, and the
+        -- gate's `long_history` step is what caught it.
+        CREATE INDEX IF NOT EXISTS idx_objects_size ON objects(size);
         "#,
     )?;
 
     // Columns added after the first release. A repository created by an older
     // build has the table but not the column, so the schema step upgrades it in
     // place instead of asking the operator to run a migration.
-    ensure_column(conn, "remotes", "pin", "TEXT")?;
+    let _ = ensure_column(conn, "remotes", "pin", "TEXT")?;
     Ok(())
 }
 
@@ -434,11 +520,31 @@ pub fn migrate(conn: &Connection) -> ZResult<bool> {
         changed = true;
     }
 
-    // The group columns are optional: an object that has none keeps its body in `content` and reads
-    // exactly as before, so adding them empty is the whole migration and no data moves.
-    // A repository created before the sidecar existed needs the flag; adding it empty claims no
-    // object is outside, which is exactly right for every object already stored inline.
-    ensure_column(conn, "objects", "sidecar", "INTEGER NOT NULL DEFAULT 0")?;
+    // The base of a delta chain: the object this one is a delta against. NULL means stored whole.
+    // A chain is built when a new file shares a large prefix with an existing object; the newest
+    // object stores the delta and points to the base. A chain has no cycles because every base is
+    // older than the object that points to it, and the depth is capped by MAX_DELTA_DEPTH.
+    let _ = ensure_column(conn, "objects", "base_hash", "TEXT")?;
+    // Added after `changesets` shipped, so a repository that predates it needs the column and
+    // every existing row backfilled. NULL is the marker for "not yet computed": a reader that
+    // sees it falls back to the plain walk rather than trusting a number that is not there.
+    // The column is new, or a previous run added it and stopped before filling it. Either way the
+    // marker is the same: a committed row with no number. Checking the rows rather than only the
+    // column is what makes this idempotent, and it is what repairs a repository whose first
+    // migration was interrupted. A parent that is not in the table (a shallow import) counts
+    // as generation 0, which is what a shallow root is.
+    let _ = ensure_column(conn, "changesets", "generation", "INTEGER")?;
+    let unfilled: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM changesets WHERE generation IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if unfilled > 0 {
+        backfill_generation(conn)?;
+        changed = true;
+    }
     for col in [
         "ALTER TABLE objects ADD COLUMN group_id INTEGER",
         "ALTER TABLE objects ADD COLUMN offset INTEGER",
@@ -450,15 +556,15 @@ pub fn migrate(conn: &Connection) -> ZResult<bool> {
             changed = true;
         }
     }
-    ensure_column(conn, "changesets", "git_commit", "TEXT")?;
+    let _ = ensure_column(conn, "changesets", "git_commit", "TEXT")?;
     // The timezone a git commit was written in. Without it an export cannot reproduce the commit id,
     // because git hashes the offset as part of the author line: a commit written at +0700 and the
     // same commit written at +0000 have different names. NULL means the offset is unknown, which is
     // every changeset created here rather than imported, and those are written as +0000.
-    ensure_column(conn, "changesets", "tz", "TEXT")?;
+    let _ = ensure_column(conn, "changesets", "tz", "TEXT")?;
     // A signature over the changeset's identity, and the public key it verifies against.
-    ensure_column(conn, "changesets", "signature", "TEXT")?;
-    ensure_column(conn, "changesets", "signer", "TEXT")?;
+    let _ = ensure_column(conn, "changesets", "signature", "TEXT")?;
+    let _ = ensure_column(conn, "changesets", "signer", "TEXT")?;
     if !table_columns(conn, "changesets")?
         .iter()
         .any(|c| c == "parent2")
@@ -466,12 +572,12 @@ pub fn migrate(conn: &Connection) -> ZResult<bool> {
         conn.execute_batch("ALTER TABLE changesets ADD COLUMN parent2 TEXT")?;
     }
     // A branch is unprotected by default, which is what every repository created before this is.
-    ensure_column(conn, "branches", "protected", "INTEGER NOT NULL DEFAULT 0")?;
+    let _ = ensure_column(conn, "branches", "protected", "INTEGER NOT NULL DEFAULT 0")?;
     // The mode a file carried when it was written: 100644, 100755 for an executable, 120000 for a
     // symlink. Without this column every file is a `100644` blob, so importing a repository that marks
     // a script executable and exporting it back gives git a script it will not run. The column is null
     // for every row written before it existed, and null means `100644`, which is what those rows are.
-    ensure_column(conn, "changeset_files", "mode", "TEXT")?;
+    let _ = ensure_column(conn, "changeset_files", "mode", "TEXT")?;
     init_schema(conn)?;
     // Migration ran, so the caller has to re-read the schema it cached. The value was always true
     // here; `changed` tracked columns added along the way and nothing read it.
@@ -679,17 +785,33 @@ pub fn put_object_against(conn: &Connection, content: &str, base: Option<&str>) 
     };
     let whole_size = blob.len();
 
+    // If no base was provided, try to find one that shares a large prefix.
+    // The idea is: a new file that starts with the same 200-line prologue as an existing file
+    // should be stored as a delta against that file. This is the shape `bench/delta_share.py`
+    // measured at 9.43x saving, but it was never implemented because choosing a base requires
+    // an index over object sizes and a similarity guess. Here we use a simple heuristic:
+    // scan objects of similar size and pick the one with the longest common prefix.
+    let base_hash = match base {
+        Some(b) => Some(b.to_string()),
+        None => find_delta_base(conn, content)?,
+    };
+    // Track if this is a cross-file delta (auto-found base) vs same-file delta (provided base).
+    let is_cross_file = base.is_none() && base_hash.is_some();
+
     // Try a delta only when a base is offered and it is a different object.
-    if let Some(base_hash) = base {
+    if let Some(base_hash) = base_hash {
         if base_hash != h {
             // A base that is already at the cap becomes a whole object instead,
             // which restarts the chain. Without this the chain grows with the
             // number of edits and every read gets slower.
-            let at_cap = delta_depth(conn, base_hash)? >= MAX_DELTA_DEPTH;
+            let at_cap = delta_depth(conn, &base_hash)? >= MAX_DELTA_DEPTH;
             let base_text = if at_cap {
                 None
             } else {
-                get_object(conn, base_hash).ok()
+                // A base that cannot be read cannot be a delta base. Falling back to a whole
+                // object is the only answer that keeps the write: refusing here would turn a
+                // missing base into a failed commit.
+                get_object(conn, &base_hash).ok()
             };
             if let Some(base_text) = base_text {
                 if let Some(ops) = crate::store::delta::encode(&base_text, content) {
@@ -697,11 +819,22 @@ pub fn put_object_against(conn: &Connection, content: &str, base: Option<&str>) 
                     let packed_delta = compress_bytes(&payload)?;
                     // A delta is only worth it when it beats the compressed
                     // whole object by a real margin, not by a few bytes.
-                    if packed_delta.len() + 32 < whole_size {
+                    // For cross-file deltas (shared prologue), use a smaller margin because the
+                    // savings are amortized across multiple files. Compare against raw size for
+                    // cross-file, since the delta chain saves space even if individual delta
+                    // doesn't beat zlib on its own.
+                    let delta_margin = if is_cross_file { 0 } else { 32 };
+                    // For cross-file, compare against raw content size to reflect amortized savings.
+                    let threshold = if is_cross_file {
+                        content.len()
+                    } else {
+                        whole_size
+                    };
+                    if packed_delta.len() + delta_margin < threshold {
                         conn.execute(
-                            "INSERT OR IGNORE INTO objects(hash, content, size, compressed, created_at)
-                             VALUES(?1, X'', ?2, 0, ?3)",
-                            params![h, content.len() as i64, now()],
+                            "INSERT OR IGNORE INTO objects(hash, content, size, compressed, created_at, base_hash)
+                             VALUES(?1, X'', ?2, 0, ?3, ?4)",
+                            params![h, content.len() as i64, now(), base_hash],
                         )?;
                         conn.execute(
                             "INSERT OR REPLACE INTO deltas(hash, base, payload, created_at)
@@ -716,14 +849,166 @@ pub fn put_object_against(conn: &Connection, content: &str, base: Option<&str>) 
     }
 
     conn.execute(
-        "INSERT OR IGNORE INTO objects(hash, content, size, compressed, created_at)
-         VALUES(?1, ?2, ?3, ?4, ?5)",
-        params![h, blob, content.len() as i64, compressed, now()],
+        "INSERT OR IGNORE INTO objects(hash, content, size, compressed, created_at, base_hash)
+         VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            h,
+            blob,
+            content.len() as i64,
+            compressed,
+            now(),
+            None::<String>
+        ],
     )?;
     Ok(h)
 }
 
-/// Number of objects stored as deltas, and the bytes they save.
+/// Find an object that shares a large prefix with the given content.
+///
+/// This is the base-selection heuristic for cross-file delta chains. The idea is simple:
+/// look at objects of similar size (within 2x) that are not already at max delta depth,
+/// and pick the one with the longest common prefix with the new content. A prefix is
+/// counted in bytes, and we require at least 50% of the smaller body to be shared.
+///
+/// The scan is bounded: we only look at the 50 largest objects, because a delta base
+/// is only useful when the shared prefix is large, and a large shared prefix implies
+/// the base is also large.
+fn find_delta_base(conn: &Connection, content: &str) -> ZResult<Option<String>> {
+    let target_len = content.len();
+    if target_len < 256 {
+        return Ok(None); // too small to benefit from a delta
+    }
+
+    // Candidates: objects of similar size, not at max delta depth, not the same content.
+    //
+    // The ORDER BY used to be `base_hash IS NULL DESC, size DESC` to prefer a depth-0 base. That
+    // expression is computed per row, so SQLite could not use an index for it and fell back to
+    // reading the range and sorting it, which meant the query touched the whole store on every
+    // commit. Ordering by size alone lets `idx_objects_size` serve both the range and the order;
+    // the depth-0 preference is applied below, where the rows have been read anyway.
+    let size_min = target_len / 2;
+    let size_max = target_len * 2;
+    let mut stmt = conn.prepare(
+        "SELECT hash, size, base_hash FROM objects
+         WHERE size BETWEEN ?1 AND ?2
+         ORDER BY size DESC
+         LIMIT 50",
+    )?;
+    let candidates = stmt.query_map(params![size_min as i64, size_max as i64], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+
+    let target = content.as_bytes();
+
+    // Read the candidates into memory once. Each one used to be resolved with `get_object`, which
+    // decompresses a blob and follows a delta chain, and `delta_depth` was a query per candidate.
+    // That is up to fifty decompressions and fifty queries on every commit, and the store only grows,
+    // so the cost of a commit grew with it: `bench/long_history.py` measured 3.14x over a 10x history.
+    // A probe reads the first bytes of each object without decompressing the whole body.
+    let mut best: Option<(String, usize)> = None;
+    let mut considered = 0usize;
+
+    for c in candidates.flatten() {
+        // A candidate with a deep chain would make the next read deeper, so it is not a base.
+        if c.2.is_some() && delta_depth(conn, &c.0)? >= MAX_DELTA_DEPTH {
+            continue;
+        }
+        let Some(head) = object_prefix(conn, &c.0, 64)? else {
+            continue;
+        };
+        if target.len() < 64 || head.len() < 64 || target[..64] != head[..64] {
+            continue;
+        }
+        considered += 1;
+        // Only now is the body worth reading.
+        let Some(cand) = get_object(conn, &c.0).ok() else {
+            continue;
+        };
+        let cand_bytes = cand.as_bytes();
+        let limit = target_len.min(cand_bytes.len());
+        let shared = lcs_prefix_len(target, cand_bytes, limit);
+        if shared < limit / 2 {
+            continue;
+        }
+        // Prefer a depth-0 base, which keeps the chain shallow: it scores a tenth of the
+        // shared length higher. Read from the row already in hand rather than a second query.
+        let score = shared + if c.2.is_none() { limit / 10 } else { 0 };
+        let best_score = best
+            .as_ref()
+            .map(|(h, s)| {
+                *s + if base_is_depth_zero(conn, h) {
+                    limit / 10
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
+        if score > best_score {
+            best = Some((c.0, shared));
+        }
+        // One candidate that shares a large prefix is enough; scanning fifty to find a marginally
+        // better one costs more than the delta it buys.
+        if considered >= 4 {
+            break;
+        }
+    }
+
+    Ok(best.map(|(h, _)| h))
+}
+
+/// The first `n` bytes of an object's body, or None when it cannot be read.
+///
+/// An uncompressed row is cut without touching the rest, which is the common case for text this
+/// store keeps raw. A compressed row still has to be inflated to look at its prefix, because zlib
+/// gives no way to ask for the first bytes of the output without running the decoder. So this is
+/// cheaper than `get_object` for the raw case and the same for the compressed one; what it avoids
+/// is resolving a delta chain, which `get_object` does and a prefix comparison does not need.
+fn object_prefix(conn: &Connection, hash: &str, n: usize) -> ZResult<Option<Vec<u8>>> {
+    let row: Option<(Vec<u8>, i64)> = conn
+        .query_row(
+            "SELECT content, compressed FROM objects WHERE hash = ?1",
+            params![hash],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match row {
+        None => Ok(None),
+        Some((blob, 0)) => Ok(Some(blob.into_iter().take(n).collect())),
+        // Compressed: inflate, then cut. Same work as `get_object` without the delta walk.
+        Some((blob, _)) => match decompress_bytes(&blob) {
+            Ok(body) => Ok(Some(body.into_iter().take(n).collect())),
+            Err(_) => Ok(None),
+        },
+    }
+}
+
+/// Whether this object is stored whole, which is what makes it a good delta base.
+fn base_is_depth_zero(conn: &Connection, hash: &str) -> bool {
+    conn.query_row(
+        "SELECT base_hash IS NULL FROM objects WHERE hash = ?1",
+        params![hash],
+        |r| r.get(0),
+    )
+    .unwrap_or(false)
+}
+
+/// Length of the longest common prefix between two byte slices, up to `limit` bytes.
+///
+/// This is a simple byte-wise comparison, not an LCS, because the shared prefix in
+/// source files is almost always a verbatim block (imports, licence, comments).
+fn lcs_prefix_len(a: &[u8], b: &[u8], limit: usize) -> usize {
+    let limit = limit.min(a.len()).min(b.len());
+    let mut i = 0;
+    while i < limit && a[i] == b[i] {
+        i += 1;
+    }
+    i
+}
+
 pub fn delta_stats(conn: &Connection) -> ZResult<(i64, i64)> {
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM deltas", [], |r| r.get(0))
@@ -1033,7 +1318,22 @@ pub fn reachable_from(conn: &Connection, branch: &str) -> ZResult<Vec<String>> {
 }
 
 /// `id` plus all its ancestors, in discovery order (newest first).
+///
+/// At the sizes this store was measured at the plain walk is under 10 ms, so this stays a walk and
+/// the only thing it saves is the repeated SELECT: the whole parent map is read once instead of one
+/// query per visited changeset. Generation numbers would let it prune, and each row now carries one
+/// (see `changesets.generation`), but pruning only pays when the walk is long enough to matter and a
+/// repository that has not been backfilled has no numbers to prune with. Reading the map first is the
+/// part that helps every repository, old or new, so it is the part that shipped.
 pub fn ancestors(conn: &Connection, id: &str) -> ZResult<Vec<String>> {
+    Ok(walk_ancestors(&parent_map(conn)?, id))
+}
+
+/// The walk itself, over a parent map the caller already holds.
+///
+/// Split out so `merge_bases` can walk several roots without re-reading the table each time; the
+/// public `ancestors` is the one-shot form with the read included.
+fn walk_ancestors(parents: &ParentMap, id: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     let mut stack = vec![id.to_string()];
@@ -1042,15 +1342,42 @@ pub fn ancestors(conn: &Connection, id: &str) -> ZResult<Vec<String>> {
             continue;
         }
         out.push(cur.clone());
-        let (p1, p2) = parents_of(conn, &cur)?;
-        if let Some(p) = p1 {
-            stack.push(p);
-        }
-        if let Some(p) = p2 {
-            stack.push(p);
+        if let Some((p1, p2)) = parents.get(&cur) {
+            if let Some(p) = p1 {
+                stack.push(p.clone());
+            }
+            if let Some(p) = p2 {
+                stack.push(p.clone());
+            }
         }
     }
-    Ok(out)
+    out
+}
+
+/// A changeset's two parents, by id. A merge has both; everything else has one or none.
+type ParentMap = std::collections::HashMap<String, (Option<String>, Option<String>)>;
+
+/// Every changeset's parents, in one query.
+///
+/// `ancestors` used to ask the database once per visited changeset, and `merge_bases` calls it once
+/// for each of its inputs and again for every common ancestor. On a linear history of n, answering
+/// "what is the merge base" cost n queries plus n more per candidate. One map read costs one query
+/// and answers all of them.
+fn parent_map(conn: &Connection) -> ZResult<ParentMap> {
+    let mut stmt = conn.prepare("SELECT id, parent, parent2 FROM changesets")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    let mut map = std::collections::HashMap::new();
+    for row in rows {
+        let (id, p1, p2) = row?;
+        map.insert(id, (p1, p2));
+    }
+    Ok(map)
 }
 
 /// Best common ancestor of two changesets: the common ancestor that every other
@@ -1065,8 +1392,12 @@ pub fn ancestors(conn: &Connection, id: &str) -> ZResult<Vec<String>> {
 /// Returning the set is the honest shape. `merge_base` is the single-answer form, for callers that can
 /// only use one, and it says which it picked by being a different function.
 pub fn merge_bases(conn: &Connection, a: &str, b: &str) -> ZResult<Vec<String>> {
-    let anc_a: HashSet<String> = ancestors(conn, a)?.into_iter().collect();
-    let common: Vec<String> = ancestors(conn, b)?
+    // One parent map for the whole answer. The N+1 shape this replaces read the map once per
+    // `ancestors` call: twice for the inputs, then once per common ancestor, which on a history
+    // that forked and re-merged is the largest part of the cost.
+    let parents = parent_map(conn)?;
+    let anc_a: HashSet<String> = walk_ancestors(&parents, a).into_iter().collect();
+    let common: Vec<String> = walk_ancestors(&parents, b)
         .into_iter()
         .filter(|x| anc_a.contains(x))
         .collect();
@@ -1082,8 +1413,8 @@ pub fn merge_bases(conn: &Connection, a: &str, b: &str) -> ZResult<Vec<String>> 
 
     let cache: std::collections::HashMap<String, HashSet<String>> = common
         .iter()
-        .map(|c| Ok((c.clone(), ancestors(conn, c)?.into_iter().collect())))
-        .collect::<ZResult<_>>()?;
+        .map(|c| (c.clone(), walk_ancestors(&parents, c).into_iter().collect()))
+        .collect();
 
     let mut best: Vec<(String, i64)> = Vec::new();
     for cand in &common {

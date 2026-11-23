@@ -4936,6 +4936,34 @@ def main():
             (r[1] or "")[-500:],
         )
 
+    if want("history"):
+        # Three questions about ancestry, measured against git with startup taken out on the
+        # gesta side. The property being checked is not a time: it is that the walk reads the
+        # parent table once instead of once per step, so a change that puts the per-step query
+        # back shows up as the walk growing with the history.
+        r = sh(
+            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'merge_base_cost.py')} 200",
+            cwd=ZF_DIR,
+            timeout=500,
+        )
+        record(
+            "an ancestry question does not read one row per step",
+            r[0] == 0 and "per changeset" in r[1],
+            (r[1] or "")[-400:],
+        )
+        # The slope bench reports when it cannot see its own signal. Accepting that answer is
+        # deliberate: a bench that claimed a slope it could not measure would be the defect.
+        r = sh(
+            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'history_slope.py')} 200",
+            cwd=ZF_DIR,
+            timeout=500,
+        )
+        record(
+            "the cost of walking history is measured, or honestly reported as unmeasurable",
+            r[0] == 0 and ("per change" in r[1] or "not distinguishable" in r[1]),
+            (r[1] or "")[-400:],
+        )
+
     if want("typography"):
         # A long dash is not a character this project uses. It arrives by pasting prose from a
         # document that has them, and once one is in the tree every later paste copies the style.

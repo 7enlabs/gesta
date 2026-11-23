@@ -164,6 +164,10 @@ pub fn scan_with_cache(
                 } else {
                     content
                 };
+                // A scan reads a file to learn its hash; it does not write one. Storing an object
+                // here made every read path (`status`, `grep`, `diff`) pay for a write and a
+                // delta-base search, which is work only a commit owes. The object is written by
+                // `put_object_for` at commit time, and that is where a base is chosen.
                 let hash = hash_content(&content);
                 rehashed += 1;
                 pending_writes.push((rel.clone(), mtime, size, hash.clone()));
