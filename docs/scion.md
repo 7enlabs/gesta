@@ -39,13 +39,45 @@ That is the gap this report closes first: not a missing capability, a missing se
 Scion's `git-operations` skill states it plainly: when a PR deletes a file, a concurrent edit that
 adds a *reference* to that file from a different file produces no conflict at all. Git sees two
 disjoint changes, prints "Successfully rebased", and leaves the reference pointing at nothing. Only
-an edit *to* the deleted file raises a conflict, because only that case forces a decision.
+an edit *to* the deleted file raises a conflict, because only that case forces a decision. The
+skill's answer is procedural: after rebasing a deletion, grep for the deleted name, because any
+inbound-reference count taken before the rebase is stale by construction.
 
-**Why this is not a gap here.** This store has the whole tree in an index, so the question "does
-anything still mention this name" is answerable per changeset rather than by grepping. What is
-missing is not the ability but the check, and the check belongs in `rebase` rather than in a
-document telling agents to grep afterwards. Recorded as work, not done in this pass; the honest
-statement is that a rebase here can currently land the same dangling reference and say nothing.
+**Done here, and done in the tool rather than in a document.** This store keeps the whole tree in an
+index, so the question "does anything still mention this name" is a query and not a grep over a
+working directory that may not be the tree the scan is about. `rebase` now compares the tree it
+moved onto with the tree the replay produced, and reports every path that left while another file
+still mentions it, with the file, the line number and the line.
+
+The matching is narrow on purpose. A name counts only when it appears delimited by characters that
+cannot continue a path, so `source util.sh` is a reference and `myutil.sh` and `util.sh.bak` are not.
+A wider test reports prose and substrings, and a warning that fires on those is a warning people
+learn to skip. `bench/dangling.py` pins both directions: seventeen checks, six of which assert that
+nothing is printed.
+
+The narrowness has a known cost, stated because it is a choice and not an oversight: `./util.sh` and
+`lib/util.sh` are not reported for a deleted `util.sh`, because a match ending in a path separator
+prefix is a different path. `source ./util.sh` after `util.sh` is deleted is a real dangling
+reference that this does not catch. Widening it was refused because the same rule that catches
+`./util.sh` also catches `lib/util.sh`, and the second is correct - deleting `util.sh` leaves
+`lib/util.sh` perfectly valid, so reporting it would be wrong every time.
+
+Three design points that a first version got wrong:
+
+- **The comparison base is the tree the branch moved onto, not the branch's own previous head.** A
+  changeset on the branch may have deleted the file long before the rebase; comparing against the
+  branch's own past then sees nothing leave the tree, and the feature silently reports nothing. The
+  first implementation made exactly that mistake and the fixture caught it.
+- **The report is not an error.** The rebase succeeded and the tree is what it is; the output says so
+  in those words, because a reader who thinks the operation failed will reach for `--abort`.
+- **A stopped rebase was losing the deletion it stopped on, and this was already true before the
+  report existed.** Replay returns at the first conflict, so every other path the changeset touched
+  is still at its base value on disk. `--continue` then records the whole tree, which records a
+  deleted file as present, and the deletion disappears from the branch with no error at any step.
+  A rewrite is invisible here because the caller's next snapshot records whatever is on disk; a
+  deletion is exactly the change whose mark is an absence. The continuation now re-applies the paths
+  that did not conflict before recording, and leaves the resolved ones to the caller. This was a
+  data-loss defect found while building the report, and it is pinned by five bench checks.
 
 ### 2. `git clean -fdx` is not a stronger clean
 
@@ -122,16 +154,21 @@ Three defects, each found by running a plausible wrong argument rather than by r
   required and now refuses with the form that discards everything. The two commands have opposite
   failure modes, so they get opposite defaults, and the reason is written where the argument is
   declared.
+- `rebase` reports a path that left the tree while another file still mentions it. The comparison
+  base is the tree the branch moved onto, not the branch's own past, because a deletion may predate
+  the rebase. The report is not an error and says the rebase succeeded.
 
-`bench/refusals.py` pins all twenty-three behaviours and runs as gate step `refusals`.
+`bench/refusals.py` pins twenty-three behaviours and runs as gate step `refusals`.
+`bench/dangling.py` pins seventeen more and runs as gate step `dangling`.
 
 ## What was not verified
 
 - Scion's own benchmark figures were not read or repeated. Nothing in this report depends on a
   performance number from that project.
-- The dangling-reference check for rebase was reasoned from the index, not implemented. It is
-  recorded as work with no measurement, because a check that has not been written has no cost to
-  report.
+- The dangling-reference report was checked against fixtures built for it, not against a real
+  repository with a long parallel history. The matching rule is pinned by unit tests and by ten
+  bench checks, but a large real tree may hold a reference shape the fixtures do not, and the rule
+  is deliberately narrow enough that a false negative is more likely than a false positive.
 - The four-attempt table was measured on this machine against the release binary at `a07250e`. A
   different binary will produce different messages, and the count is a property of those messages
   rather than of the tool.
