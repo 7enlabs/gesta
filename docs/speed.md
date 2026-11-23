@@ -84,10 +84,19 @@ depth was asked before the cheap prefix probe rejected a candidate, the size ban
 at 1000 commits against 50 at 100 (now a narrow band ordered by `created_at`), and the index that
 serves that query orders by `(size, created_at)` rather than size alone.
 
-What is left is the line diff itself, and it is not a bound that can be tightened: `recompute_blame`
-reads the blame ranges of the previous version, expands them to one entry per line, and matches. Each
-commit on this bench has one more line than the last. Closing it means matching ranges against ranges
-instead of expanding them, which is a change to how blame is computed rather than a limit on it.
+What is left is not the line diff, and saying it was would be wrong. A file of 400 lines and one of
+4000 lines, each committed with a one line change in a repository of the same size, cost 45 ms and
+49 ms: ten times the lines bought 4 ms, so the per-line work is not what the gate is reading.
+
+The number of changesets that touched the path is not it either: the same path committed once cost
+44 ms, and committed a hundred and one times cost 55 ms, so a hundredfold history on one path bought
+11 ms.
+
+So the growth is real, is measured on a clean runner (6.2 to 36.8 ms over a tenfold history), and is
+not explained by the size of the file or the length of the path's history. What is known is that it
+lives in the base search: turning `find_delta_base` off brought the same bench from 5.98x to 1.58x.
+The four causes found there are fixed. The remainder is not attributed, and the honest reading of a
+red gate here is that the bound is not yet found rather than that the cost is inherent.
 
 ## Startup
 
