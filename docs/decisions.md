@@ -114,6 +114,10 @@ without its mistakes reads as if it were obvious.
 | A6 | Every JSON object carries `schema: gesta@1`, including MCP results. | A renamed field breaks a caller silently: it keeps running and reads the wrong value. |
 | A7 | A top-level list stays a bare list, and `--envelope` asks for the versioned object. | A list cannot carry a key, and wrapping it would break the pipes people already write. |
 | A8 | `grep --regex` is a separate feature from the default build. | A build that only needs literal search keeps a smaller binary. A pattern the engine cannot express is refused with the construct named. |
+| A9 | `changeset commit` takes no id when exactly one changeset is pending. | The shortest session is create-then-commit, and requiring the id there made the second call fail on a value the program already had. Measured: four plausible attempts before the right form, each a lost turn. With several pending the id stays required, because choosing silently commits work the caller did not name. |
+| A10 | A refusal names the reading the command used, and the three readings are separate sentences. | `show nope` is a path against the current branch, `show nosuch:a.txt` names a revision, and a repository with no changesets has no tree at all. One message covering all three sends the reader to look at whichever part was never in question. Collapsing the colon case into the file case is what the gate's `errors` step caught. |
+| A11 | A refusal lists the names that do exist. | `rebase nosuchbranch` said `no such changeset`, an argument that accepts a branch, a tag or a changeset, and named nothing the reader could compare against. The list is what turns a typo into the next attempt. |
+| A12 | `checkout` defaults to the whole tree; `restore` keeps its argument required. | The two have opposite failure modes. Writing the branch out cannot lose uncommitted work, because the branch already holds those files. Discarding cannot be undone, so a default there would fire on a typo. Neither path deletes an untracked file, checked end to end. |
 
 ## Install and delivery
 
