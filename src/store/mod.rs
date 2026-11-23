@@ -29,6 +29,14 @@ pub fn db_path(root: &Path) -> PathBuf {
     repo_db(root)
 }
 
+/// The on-disk shape this build expects.
+///
+/// Bump this whenever a table, column or index is added to `init_schema` or `migrate`. A database
+/// stamped with an older value runs the migration body once; one stamped with this value skips it.
+/// Forgetting to bump it does not corrupt anything, but a repository created by an older build keeps
+/// paying the migration cost on every open.
+const SCHEMA_VERSION: i64 = 1;
+
 pub fn open_db(root: &Path) -> ZResult<Connection> {
     let conn = Connection::open(db_path(root))?;
     conn.execute_batch(
@@ -476,6 +484,17 @@ pub fn migrate(conn: &Connection) -> ZResult<bool> {
     if obj_cols.is_empty() {
         return Ok(false); // fresh database; init_schema creates the full shape
     }
+    // The whole body below is idempotent DDL: 28 CREATE IF NOT EXISTS statements plus a dozen column
+    // probes. Running it on every open is a fixed pile of write transactions, and a write transaction
+    // is far more expensive on a large database with a dirty WAL than on a small one - so a store that
+    // grew to 1000 commits paid 31 ms per open for work that changed nothing, against 6.7 ms at 100.
+    // That read as "the cost of a commit grows with the history".
+    //
+    // user_version records the shape this code already produced. A database at SCHEMA_VERSION skips
+    // the body; anything older runs it and is stamped.
+    if conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))? >= SCHEMA_VERSION {
+        return Ok(false);
+    }
     let _t_idx = std::time::Instant::now();
 
     // Tables added after a database was created. Each is created once and then
@@ -637,6 +656,10 @@ pub fn migrate(conn: &Connection) -> ZResult<bool> {
     // for every row written before it existed, and null means `100644`, which is what those rows are.
     let _ = ensure_column(conn, "changeset_files", "mode", "TEXT")?;
     init_schema(conn)?;
+    // Stamped last: a database reaching this line has the full shape, so the next open can skip the
+    // body. Writing it before init_schema would leave a database that claims the current shape while
+    // missing the tables init_schema creates.
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     // Migration ran, so the caller has to re-read the schema it cached. The value was always true
     // here; `changed` tracked columns added along the way and nothing read it.
     let _ = changed;

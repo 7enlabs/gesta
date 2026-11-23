@@ -87,23 +87,33 @@ Two properties are easy to confuse here, and the benches keep them apart.
 file: 20 to 8000 lines, 400x, costs 1.40x. The diff is linear in the file and that is the design.
 
 **The cost does not follow the history.** `bench/long_history.py` holds the file at twenty lines and
-varies the history: 100 to 1000 commits, 10x, costs 0.97x. A commit on a small file costs what it
+varies the history: 100 to 1000 commits, 10x, costs 0.89x. A commit on a small file costs what it
 costs whether the repository holds a hundred changesets or a thousand.
 
-That bench used to append one line per commit, which moved both at once: the history grew and so did
-the file, and the ratio it printed could not be attributed to either. It read 5.9x on CI and the
-number was real, but it was the file growing, not the history. Splitting the measurement is what made
-that visible.
+Getting to that number took three separate corrections, and each one had made the bench measure
+itself rather than the commit:
 
-Four things did rise with the history for reasons that had nothing to do with blame, and they are
-fixed: the delta base comparison walked the whole of both bodies (now a 4096 byte window), the chain
-depth was asked before the cheap prefix probe rejected a candidate, the size band covered 495 objects
-at 1000 commits against 50 at 100 (now a narrow band ordered by `created_at`), and the index that
-serves that query orders by `(size, created_at)` rather than size alone.
+1. The bench appended one line per commit, so the history grew and the file grew together and the
+   ratio could not be attributed to either. It now holds the file fixed.
+2. Setup commits wrote to one growing file and left it in the tree. `changeset create` scans and
+   hashes every file in the working tree, so by the first timed commit the scan was walking a file
+   the setup had built: 35 ms at 100 commits against 107 ms at 1000, while the commit itself was
+   1.3 ms against 1.5 ms. Each setup commit now writes its own file and deletes it.
+3. `migrate` ran its whole body on every open: 28 `CREATE ... IF NOT EXISTS` statements plus a
+   dozen column probes, then `init_schema`, then `Ok(true)` regardless. A write transaction costs far
+   more on a large database with a dirty WAL, so the same fixed work took 6.7 ms at 100 commits and
+   31 ms at 1000. It now stamps `PRAGMA user_version` and skips the body when the shape is current.
 
-What is left after those four is `recompute_blame` reading the blame ranges of the previous version
-and expanding them to one entry per line before matching. That is linear in the file, which is the
-property above rather than a slope in the history, so it does not need a bound - it needs the range
+Four other things rose with the history for reasons unrelated to blame, and they are fixed too: the
+delta base comparison walked the whole of both bodies (now a 4096 byte window), the chain depth was
+asked before the cheap prefix probe rejected a candidate, the size band covered 495 objects at 1000
+commits against 50 at 100 (now a narrow band ordered by `created_at`), and the index that serves
+that query orders by `(size, created_at)` rather than size alone.
+
+`recompute_blame` reads the blame ranges of the previous version and expands them to one entry per
+line before matching. That is linear in the file, not in the history: a 400 line file and a 4000
+line file differ by 4 ms, so it is the property measured above rather than a slope in the history,
+and it does not need a bound - it needs the range
 match to run over ranges instead of expanded lines, and that is a change to the algorithm rather than
 a limit on it.
 
