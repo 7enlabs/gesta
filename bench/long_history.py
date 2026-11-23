@@ -18,7 +18,6 @@ Run: python3 bench/long_history.py [--max N]
 
 import os
 import shutil
-import statistics
 import subprocess
 import sys
 import time
@@ -66,7 +65,14 @@ def commit_one(root, i):
 
 
 def measure(root, reps=5):
-    """Median write and scan over `reps` commits at the current history size."""
+    """Fastest write and scan over `reps` commits at the current history size.
+
+    The minimum, not the median. Interference on a shared machine only ever adds time, so the
+    fastest of five runs is the closest reading of the work itself; a median carries half the noise
+    into the answer. Three runs of the same binary on an idle container gave 0.60x, 1.77x and 1.70x
+    with medians, which is a spread wide enough that the ratio said more about the machine than the
+    code. The minimum is the instrument that measures the thing the gate is named after.
+    """
     writes, scans, errs = [], [], []
     for i in range(reps):
         w, s, err = commit_one(root, f"m{i}_{time.time_ns()}")
@@ -76,8 +82,8 @@ def measure(root, reps=5):
         else:
             writes.append(w)
     return (
-        statistics.median(writes) if writes else None,
-        statistics.median(scans) if scans else None,
+        min(writes) if writes else None,
+        min(scans) if scans else None,
         errs,
     )
 
