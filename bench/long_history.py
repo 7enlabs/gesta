@@ -68,7 +68,7 @@ PROBE = "probe.txt"
 PROBE_LINES = 20
 
 
-def measure(root, reps=9):
+def measure(root, reps=15):
     """Fastest commit of a fixed-size file at the current history size.
 
     Two properties are easy to confuse here and the gate needs them separate:
@@ -146,11 +146,22 @@ def main():
         # cost of the setup.
         while made < target:
             made += 1
-            # Setup commits go to their own file, so the file the measurement commits never grows
-            # during setup. `commit_one` appends one line; using the probe file here would build a
-            # thousand line file before the first timed commit and the measurement would read the
-            # scanner walking it.
-            w, _s, err = commit_one(ROOT, f"b{made}", "history.txt")
+            # Each setup commit writes its own file and the file is deleted after the commit, so the
+            # working tree the measurement runs in holds only `probe.txt`.
+            #
+            # This is not tidiness. `changeset create` scans and hashes every file in the tree, so a
+            # setup that left one growing file behind made `create` cost 35 ms at 100 commits and
+            # 107 ms at 1000 - a 3x slope with the measured commit unchanged at 1.3 ms against 1.5 ms
+            # inside the process. The bench reported that as the cost of a commit growing with the
+            # history.
+            name = f"hist{made}.txt"
+            with open(os.path.join(ROOT, name), "w") as fh:
+                fh.write(f"line {made}\n")
+            w, _s, err = commit_one(ROOT, f"b{made}", name)
+            try:
+                os.unlink(os.path.join(ROOT, name))
+            except OSError:
+                pass
             if w is None and made % 500 == 0:
                 print(f"  commit {made} failed: {err}")
                 return 1
