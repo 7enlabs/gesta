@@ -74,6 +74,21 @@ A commit that touches one line of a 2000 line file pays for a diff of 2000 lines
 place this design is quadratic where git is not, and it is worth knowing before committing a generated
 file.
 
+That shape also decides what `bench/long_history.py` can measure. It appends one line per commit, so
+the file grows with the history and the blame diff grows with it: the gate reads a commit getting
+more expensive over a longer history even though the repository holds one file.
+
+Four things were rising with the history for reasons that had nothing to do with blame, and they are
+fixed: the delta base comparison walked the whole of both bodies (now a 4096 byte window), the chain
+depth was asked before the cheap prefix probe rejected a candidate, the size band covered 495 objects
+at 1000 commits against 50 at 100 (now a narrow band ordered by `created_at`), and the index that
+serves that query orders by `(size, created_at)` rather than size alone.
+
+What is left is the line diff itself, and it is not a bound that can be tightened: `recompute_blame`
+reads the blame ranges of the previous version, expands them to one entry per line, and matches. Each
+commit on this bench has one more line than the last. Closing it means matching ranges against ranges
+instead of expanding them, which is a change to how blame is computed rather than a limit on it.
+
 ## Startup
 
 A command that does no work at all costs about 2 ms: open the database, read the schema version, close.
