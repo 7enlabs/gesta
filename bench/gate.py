@@ -2952,7 +2952,7 @@ def main():
         s.close()
 
         server = subprocess.Popen(
-            f"{ZF} serve --port {port}", shell=True, cwd=d,
+            [ZF, "serve", "--port", str(port)], cwd=d,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         try:
@@ -3317,7 +3317,7 @@ def main():
         sk.close()
 
         srv = subprocess.Popen(
-            f"{ZF} serve --port {port}", shell=True, cwd=d,
+            [ZF, "serve", "--port", str(port)], cwd=d,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         try:
@@ -3657,7 +3657,7 @@ def main():
             port = s.getsockname()[1]
             s.close()
             server = subprocess.Popen(
-                f"{ZF} serve --port {port}", shell=True, cwd=d,
+                [ZF, "serve", "--port", str(port)], cwd=d,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
             try:
@@ -3762,7 +3762,7 @@ def main():
             port = s.getsockname()[1]
             s.close()
             server = subprocess.Popen(
-                f"{ZF} serve --port {port}", shell=True, cwd=d,
+                [ZF, "serve", "--port", str(port)], cwd=d,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
             try:
@@ -3841,7 +3841,7 @@ def main():
             port = s.getsockname()[1]
             s.close()
             server = subprocess.Popen(
-                f"{ZF} serve --port {port}", shell=True, cwd=d,
+                [ZF, "serve", "--port", str(port)], cwd=d,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
             try:
@@ -4111,7 +4111,7 @@ def main():
         s.close()
 
         server = subprocess.Popen(
-            f"{ZF} serve --port {port}", shell=True, cwd=d,
+            [ZF, "serve", "--port", str(port)], cwd=d,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         try:
