@@ -19,6 +19,35 @@ Three places, in order of preference:
 The remote URL holds no credential. `s3://bucket/prefix` is the whole thing, so a
 repository can be shared, pushed, or copied without carrying a key.
 
+## A token for an HTTP remote
+
+The same rule, which this file stated before the code obeyed it: a repository must not
+carry a key. `gesta remote add <name> <url> --token <value>` writes the token to the
+encrypted store under `remote.<name>.token`, never to the database. A store built
+before this change has the value in `remotes.token` in clear; nothing reads it any
+more, `gesta remote list` names it, and
+
+```
+gesta remote token clear origin
+```
+
+erases it and vacuums the file. Where a plaintext value and a store entry both exist,
+the store entry wins.
+
+A push takes the token from, in order:
+
+1. `GESTA_REMOTE_TOKEN_<NAME>` - the remote name upper-cased, with anything that is not
+   a letter or a digit turned into `_`. `origin` is `GESTA_REMOTE_TOKEN_ORIGIN` and
+   `up-stream` is `GESTA_REMOTE_TOKEN_UP_STREAM`. This is the path for a CI job, which
+   has no passphrase and should not have a key on disk.
+2. The encrypted store, which needs `GESTA_SECRETS_PASSPHRASE`.
+3. Nowhere. A push with no token goes anonymous, and a remote that wants one answers
+   401.
+
+With no passphrase and no environment variable, `remote add --token` refuses and writes
+nothing, naming the variable to set. It does not fall back to the database, because that
+fallback is the defect.
+
 ## What the store is
 
 One file, one secret per line, sealed as a whole:

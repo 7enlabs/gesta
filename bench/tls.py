@@ -38,7 +38,14 @@ def record(name, ok, detail=""):
 
 
 def run(*args, cwd=None):
-    r = subprocess.run([ZF, *args], capture_output=True, text=True, cwd=cwd)
+    # A passphrase, because `remote add --token` and `remote clone --token` keep the token in the
+    # encrypted store and that store needs one to open (#201). Without it `add` refuses on purpose -
+    # it has nowhere safe to put the value - so this suite would read a token-handling defect where
+    # it is looking at TLS. The file lives under ROOT and goes away with it.
+    env = dict(os.environ)
+    env.setdefault("GESTA_SECRETS_FILE", os.path.join(ROOT, "secrets"))
+    env.setdefault("GESTA_SECRETS_PASSPHRASE", "bench-passphrase")
+    r = subprocess.run([ZF, *args], capture_output=True, text=True, cwd=cwd, env=env)
     return r.returncode, (r.stdout + r.stderr).strip()
 
 

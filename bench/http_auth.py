@@ -35,7 +35,14 @@ def record(name, ok, detail=""):
 
 
 def run(*args, cwd=None):
-    r = subprocess.run([ZF, *args], capture_output=True, text=True, cwd=cwd)
+    # A passphrase, because `remote clone --token` keeps the token in the encrypted store and that
+    # store needs one to open (#201). Without it the clone still succeeds and the token is simply not
+    # kept, so the push that follows would go anonymous and this suite would report a real-looking
+    # auth failure. The file is under ROOT and is thrown away with it.
+    env = dict(os.environ)
+    env.setdefault("GESTA_SECRETS_FILE", os.path.join(ROOT, "secrets"))
+    env.setdefault("GESTA_SECRETS_PASSPHRASE", "bench-passphrase")
+    r = subprocess.run([ZF, *args], capture_output=True, text=True, cwd=cwd, env=env)
     return r.returncode, (r.stdout + r.stderr).strip()
 
 

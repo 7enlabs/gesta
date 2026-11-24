@@ -1118,6 +1118,11 @@ enum TokenCmd {
     },
     /// List configured tokens without revealing them
     List,
+    /// Erase a plaintext remote token a store built before #201 still carries
+    Clear {
+        /// Remote whose stored token should be erased
+        name: String,
+    },
     /// Show what the server decided: allowed, refused, and why
     Audit {
         /// Only the requests that were turned away
@@ -1673,6 +1678,7 @@ fn run() -> ZResult<()> {
                     cli_remote::cmd_token_rotate(&selector, hashed)
                 }
                 TokenCmd::List => cli_remote::cmd_token_list(),
+                TokenCmd::Clear { name } => cli_remote::cmd_remote_token_clear(&name),
                 TokenCmd::Remove { selector } => cli_remote::cmd_token_remove(&selector),
                 TokenCmd::Audit { refused, limit } => cli_remote::cmd_audit(refused, limit, json),
             },

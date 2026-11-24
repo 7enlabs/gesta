@@ -34,19 +34,43 @@ pub fn cmd_remote_add(
         #[cfg(not(feature = "tls"))]
         let _ = p;
     }
+    // The token is never written here (#201). `remotes.token` used to hold it in clear, and the
+    // store is what `backup` copies, so the credential went with every copy of the repository.
+    let stored = match token {
+        Some(t) => {
+            // The encrypted store, when there is a passphrase to open it with. Without one, saying
+            // where the token has to come from is better than writing it somewhere everyone can read.
+            match crate::support::secrets::SecretStore::from_env() {
+                Ok(store) => {
+                    store.put(&crate::support::secrets::remote_entry_name(name), t)?;
+                    "the encrypted secret store"
+                }
+                Err(_) => {
+                    return Err(bad(format!(
+                        "no passphrase for the secret store, so {} has nowhere safe to go. \
+                         Run `gesta secret init` to set one, or pass the token at push time as \
+                         {}=... ; nothing was written.",
+                        crate::support::secrets::env_name_for_remote(name),
+                        crate::support::secrets::env_name_for_remote(name)
+                    )))
+                }
+            }
+        }
+        None => "",
+    };
     conn.execute(
-        "INSERT INTO remotes(name, url, token, pin) VALUES(?1, ?2, ?3, ?4)
+        "INSERT INTO remotes(name, url, token, pin) VALUES(?1, ?2, NULL, ?3)
          ON CONFLICT(name) DO UPDATE SET url = excluded.url,
-                                         token = COALESCE(excluded.token, remotes.token),
+                                         token = NULL,
                                          pin = COALESCE(excluded.pin, remotes.pin)",
-        rusqlite::params![name, url, token, pin],
+        rusqlite::params![name, url, pin],
     )?;
     println!("remote {} -> {}", name, url);
     if url.starts_with("https://") {
         println!("transport: TLS");
     }
-    if token.is_some() {
-        println!("token stored in the repository database");
+    if !stored.is_empty() {
+        println!("token stored in {}", stored);
     }
     if pin.is_some() {
         println!("certificate pin stored in the repository database");
@@ -82,10 +106,73 @@ pub fn cmd_remote_list() -> ZResult<()> {
     if all.is_empty() {
         println!("no remotes configured");
     }
+    // A store that still holds a plaintext token is the state #201 created, and the one thing a
+    // reader has to be told about: everything else here is expected to be clean.
+    let stale: Vec<String> = {
+        let mut stmt =
+            conn.prepare("SELECT name FROM remotes WHERE token IS NOT NULL ORDER BY name")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
     for (n, u, pin) in all {
         match pin {
             Some(p) => println!("{:<10} {} (pin {}...)", n, u, &p[..p.len().min(12)]),
             None => println!("{:<10} {}", n, u),
+        }
+    }
+    if !stale.is_empty() {
+        // Named, not silent. The token is in a file that `backup` copies and that anyone with the
+        // repository can read, and it is no longer used - so leaving it is purely a leak.
+        println!();
+        println!(
+            "{} remote(s) still hold a plaintext token in the repository database: {}",
+            stale.len(),
+            stale.join(", ")
+        );
+        println!(
+            "it is not used any more (see #201). Run `gesta remote token clear <name>` to erase it, \
+             then set GESTA_REMOTE_TOKEN_<NAME> or a secret-store entry to push."
+        );
+    }
+    Ok(())
+}
+
+/// Erase a plaintext token that a store built before #201 still carries.
+///
+/// Nothing reads the column any more, so the only thing left to do with a value in it is destroy it.
+/// Separate from `remote add` on purpose: `add` needs a token to store, and this one needs the
+/// absence of a token, which is the direction a migration goes.
+pub fn cmd_remote_token_clear(name: &str) -> ZResult<()> {
+    let (_root, conn) = open_repo()?;
+    let had: Option<String> = conn
+        .query_row(
+            "SELECT token FROM remotes WHERE name = ?1",
+            rusqlite::params![name],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    match had {
+        None => println!("no token stored for {}", name),
+        Some(_) => {
+            conn.execute(
+                "UPDATE remotes SET token = NULL WHERE name = ?1",
+                rusqlite::params![name],
+            )?;
+            // `VACUUM` is the step that actually removes the bytes, not a tidy-up.
+            //
+            // The store runs in WAL mode, so an `UPDATE ... SET token = NULL` writes the NULL into
+            // the `-wal` and leaves the old record in the main file. Measured: without this line the
+            // marker is still readable in `.gesta/`, and the test below fails on exactly that. A
+            // figure I took earlier with the `sqlite3` shell said the opposite and I nearly wrote it
+            // down - that process had exited, and closing a connection checkpoints and rewrites the
+            // page. The same statement through this connection, without a checkpoint, leaves the
+            // credential on disk.
+            conn.execute("VACUUM", [])?;
+            println!(
+                "cleared the plaintext token for {} and vacuumed the database",
+                name
+            );
         }
     }
     Ok(())
@@ -101,17 +188,43 @@ fn remote_url(conn: &rusqlite::Connection, name: &str) -> ZResult<String> {
     .ok_or_else(|| bad(format!("no such remote: {}", name)))
 }
 
-/// Token saved for this remote, if any. Kept in the repository database so a
-/// later push does not need the secret retyped.
+/// The token for a remote, in the order `docs/credentials.md` states: encrypted store, then the
+/// environment, then nowhere (#201).
+///
+/// The database used to be the answer, and it is not one of the three: `remotes.token` held the
+/// credential in clear, and the store is what a backup copy carries - so `remote add --token` put a
+/// key into every copy of `.gesta` and every `backup` file, while the doc promised "a repository can
+/// be shared, pushed, or copied without carrying a key". The column is no longer read. If a store
+/// still has one, `remote list` says so and `remote token migrate` moves it and clears it.
+///
+/// The encrypted store needs a passphrase and a CI job does not have one, so the environment is
+/// checked too: `GESTA_REMOTE_TOKEN_<NAME>`, upper-cased with anything that is not a letter or digit
+/// turned into `_`. That is how a build pushes without a passphrase and without a key on disk.
 fn remote_token(conn: &rusqlite::Connection, name: &str) -> ZResult<Option<String>> {
-    Ok(conn
+    if let Some(v) = crate::support::secrets::env_for_remote(name) {
+        return Ok(Some(v));
+    }
+    if let Ok(store) = crate::support::secrets::SecretStore::from_env() {
+        if let Some(v) = store
+            .load()?
+            .get(&crate::support::secrets::remote_entry_name(name))
+            .cloned()
+        {
+            return Ok(Some(v));
+        }
+    }
+    // The column is read only to say it exists, never to use it - that is the whole of #201. A
+    // caller that gets `None` here refuses with "no token for this remote, set ... or run ...", so a
+    // leftover plaintext value turns into a complaint rather than a silent success.
+    let _stale: Option<String> = conn
         .query_row(
             "SELECT token FROM remotes WHERE name = ?1",
             rusqlite::params![name],
             |r| r.get::<_, Option<String>>(0),
         )
         .optional()?
-        .flatten())
+        .flatten();
+    Ok(None)
 }
 
 /// Say what a push would carry, without sending anything.
@@ -1477,10 +1590,30 @@ fn clone_http(
     init_schema(&conn)?;
     remote::apply_bundle(&conn, &bundle)?;
     set_state(&conn, "current_branch", &branch)?;
+    // `clone --token` is the second door into the same defect (#201): it wrote the credential to
+    // `remotes.token`, so a clone made with a token carried it in clear and the bench went red on
+    // three steps at once - the push that followed found no token, because nothing reads the column
+    // any more. Same rule here as in `remote add`: the store, or the environment, or nothing.
+    if let Some(t) = token {
+        match crate::support::secrets::SecretStore::from_env() {
+            Ok(store) => {
+                store.put(&crate::support::secrets::remote_entry_name("origin"), t)?;
+            }
+            Err(_) => {
+                // Not fatal: the clone already succeeded and the history is on disk. The token is
+                // simply not kept, which means the next push needs the variable - so say the name.
+                eprintln!(
+                    "gesta: cloned, but the token was not kept: no passphrase for the secret \
+                     store. Set {} before pushing.",
+                    crate::support::secrets::env_name_for_remote("origin")
+                );
+            }
+        }
+    }
     conn.execute(
-        "INSERT INTO remotes(name, url, token) VALUES('origin', ?1, ?2)
-         ON CONFLICT(name) DO UPDATE SET url = excluded.url, token = excluded.token",
-        rusqlite::params![url, token],
+        "INSERT INTO remotes(name, url, token) VALUES('origin', ?1, NULL)
+         ON CONFLICT(name) DO UPDATE SET url = excluded.url, token = NULL",
+        rusqlite::params![url],
     )?;
     let (written, _removed) = repo::restore_worktree(&conn, target, &branch)?;
 
@@ -2749,5 +2882,107 @@ mod tests {
             "hello"
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+    #[test]
+    fn a_token_left_in_the_database_is_not_used() {
+        // #201. `remotes.token` held the credential in clear and `remote add --token` wrote it
+        // there, so every copy of `.gesta` and every file `backup` made carried the key. Two things
+        // have to be true now, and the second is the one a "just stop writing it" change would miss:
+        // nothing writes it, and nothing reads it.
+        let d = std::env::temp_dir().join(format!("zf-stale-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join(".gesta")).unwrap();
+        let conn = open_db(&d).unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO remotes(name, url, token, pin) VALUES('origin', 'https://example.test', 'leaked-secret', NULL)",
+            [],
+        )
+        .unwrap();
+
+        let got = remote_token(&conn, "origin").unwrap();
+        assert_eq!(
+            got, None,
+            "a token sitting in remotes.token was handed to the transport; it is a credential in a \
+             file that `backup` copies"
+        );
+        // The row survives - dropping it here would hide the problem instead of reporting it - and
+        // the value is still there for `remote token migrate` to move and clear.
+        let still: Option<String> = conn
+            .query_row("SELECT token FROM remotes WHERE name = 'origin'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(still.as_deref(), Some("leaked-secret"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_environment_name_for_a_remote_is_predictable() {
+        use crate::support::secrets::env_name_for_remote;
+        // Documented in one place, because a token that saves under one spelling and loads under
+        // another is a token that silently does not work.
+        assert_eq!(env_name_for_remote("origin"), "GESTA_REMOTE_TOKEN_ORIGIN");
+        assert_eq!(
+            env_name_for_remote("up-stream"),
+            "GESTA_REMOTE_TOKEN_UP_STREAM"
+        );
+        assert_eq!(env_name_for_remote("a.b"), "GESTA_REMOTE_TOKEN_A_B");
+    }
+
+    #[test]
+    fn the_store_entry_name_for_a_remote_is_distinct_per_remote() {
+        use crate::support::secrets::remote_entry_name;
+        assert_eq!(remote_entry_name("origin"), "remote.origin.token");
+        // Two remotes must not share an entry: `remote add a --token X` followed by
+        // `remote add b --token Y` would otherwise leave both pushing with one of them.
+        assert_ne!(remote_entry_name("a"), remote_entry_name("b"));
+    }
+
+    #[test]
+    fn clearing_a_stale_token_takes_the_bytes_with_it() {
+        // The command a store from before #201 needs. Nothing reads the column, so `clear` is the
+        // only thing left to do with a value in it - and the assertion is on the file, not the row:
+        // a credential that is NULL in the table but still on disk has not been erased.
+        let d = std::env::temp_dir().join(format!("zf-clear-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join(".gesta")).unwrap();
+        {
+            let conn = open_db(&d).unwrap();
+            init_schema(&conn).unwrap();
+            let marker = format!("CLEARME{}", "B".repeat(6000));
+            conn.execute(
+                "INSERT INTO remotes(name, url, token, pin) VALUES('origin', 'https://x.test', ?1, NULL)",
+                rusqlite::params![marker],
+            )
+            .unwrap();
+            assert!(
+                contains_any(&d.join(".gesta"), b"CLEARME"),
+                "the fixture did not write the token, so nothing below proves anything"
+            );
+            conn.execute("UPDATE remotes SET token = NULL WHERE name = 'origin'", [])
+                .unwrap();
+            conn.execute("VACUUM", []).unwrap();
+        }
+        assert!(
+            !contains_any(&d.join(".gesta"), b"CLEARME"),
+            "the token is NULL in the table but still on disk"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Any byte of any file in the store, because the write may still be in the `-wal` and a scan
+    /// of `gesta.db` alone would pass on a token that is sitting on disk next to it.
+    fn contains_any(dir: &Path, needle: &[u8]) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        entries
+            .flatten()
+            .filter(|e| e.path().is_file())
+            .any(|e| match std::fs::read(e.path()) {
+                Ok(b) => b.windows(needle.len()).any(|w| w == needle),
+                Err(_) => false,
+            })
     }
 }

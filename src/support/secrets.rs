@@ -136,6 +136,41 @@ impl SecretStore {
     }
 }
 
+/// The store entry that holds a remote's token.
+///
+/// One naming rule, in one place, because the entry is written by `remote add` and read by every
+/// push: two spellings would mean a token that saves and never loads.
+pub fn remote_entry_name(remote: &str) -> String {
+    format!("remote.{}.token", remote)
+}
+
+/// `GESTA_REMOTE_TOKEN_<NAME>`, for a build that has no passphrase.
+///
+/// The name is upper-cased and anything that is not a letter or a digit becomes `_`, so `origin` is
+/// `GESTA_REMOTE_TOKEN_ORIGIN` and `up-stream` is `GESTA_REMOTE_TOKEN_UP_STREAM`. Returns `None` for
+/// an empty value, so `VAR=` behaves like unset rather than like an empty token.
+pub fn env_name_for_remote(remote: &str) -> String {
+    let suffix: String = remote
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("GESTA_REMOTE_TOKEN_{}", suffix)
+}
+
+/// The token from the environment, if it is set and non-empty.
+pub fn env_for_remote(remote: &str) -> Option<String> {
+    match std::env::var(env_name_for_remote(remote)) {
+        Ok(v) if !v.trim().is_empty() => Some(v),
+        _ => None,
+    }
+}
+
 /// The default location: a directory next to the user's other config.
 pub fn default_path() -> ZResult<PathBuf> {
     let base = if cfg!(windows) {
