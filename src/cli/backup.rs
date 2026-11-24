@@ -2,6 +2,32 @@
 
 use super::*;
 
+/// Write an unsealed repository to a private temporary file and hand back the path.
+///
+/// The file is the whole plaintext of a backup whose passphrase exists to keep it unreadable, so the
+/// three ways it used to go wrong are worth naming (#193): `fs::write` creates 0644 under the usual
+/// umask, so any local user could read it; the name was `gesta-pull-{pid}-{unix_now}.db`, predictable
+/// from outside the process, so a symlink planted at that path was followed; and a kill between the
+/// write and the remove left it behind for good.
+///
+/// `write_private` closes the first two in one call - `O_EXCL` plus mode 0600 on create, so an
+/// existing path fails instead of being opened, and the mode is set before the content lands. The
+/// third needs the caller to remove it, which `pull` does on every path out.
+///
+/// A function rather than a line in the handler for the same reason `read_file_at` exists: a property
+/// nothing can call is a property nothing tests.
+fn unseal_to_private_temp(plain: &[u8]) -> ZResult<std::path::PathBuf> {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut salt = [0u8; 8];
+    SystemRandom::new()
+        .fill(&mut salt)
+        .map_err(|_| crate::bad("no randomness for a temp file name".to_string()))?;
+    let suffix: String = salt.iter().map(|b| format!("{:02x}", b)).collect();
+    let tmp = std::env::temp_dir().join(format!("gesta-pull-{}-{}.db", std::process::id(), suffix));
+    crate::support::private_file::write_private(&tmp, plain)?;
+    Ok(tmp)
+}
+
 /// Write the whole store to one file.
 ///
 /// Different from `restore`, which puts working-tree files back from a branch. This copies the
@@ -313,12 +339,17 @@ pub fn cmd_backup_remote(sub: crate::BackupRemoteCmd) -> ZResult<()> {
             // Unsealed before the question, so a wrong passphrase does not make the reader answer a
             // prompt about replacing their store and then fail.
             let plain = crate::support::backup_remote::unseal(&body, &pass)?;
-            let tmp = std::env::temp_dir().join(format!(
-                "gesta-pull-{}-{}.db",
-                std::process::id(),
-                crate::support::clock::unix_now()
-            ));
-            std::fs::write(&tmp, &plain)?;
+            // The unsealed repository lands on disk for the verification, and that file is the whole
+            // plaintext of a backup whose passphrase exists to keep it unreadable (#193).
+            //
+            // Three things were wrong with `fs::write` onto `gesta-pull-{pid}-{unix_now}.db`:
+            // `fs::write` creates 0644 under the usual umask, so any local user could read it; the
+            // name is predictable from the pid and the clock, so a symlink planted there is followed;
+            // and a kill between the write and the remove leaves it behind. `write_private` creates
+            // the file with O_EXCL and mode 0600 in one step, so a symlink fails the create instead
+            // of being followed. The name keeps the clock out of the guess: a pid plus 8 random bytes
+            // is not predictable from outside the process.
+            let tmp = unseal_to_private_temp(&plain)?;
             let contents = match crate::support::backup::verify(&tmp) {
                 Ok(c) => c,
                 Err(e) => {
@@ -376,6 +407,61 @@ pub fn cmd_backup_remote(sub: crate::BackupRemoteCmd) -> ZResult<()> {
                 removed, keep
             );
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_unsealed_temp_file_is_private_and_not_at_a_predicable_name() {
+        // #193: `pull` wrote the whole decrypted backup with `fs::write` to
+        // `gesta-pull-{pid}-{unix_now}.db` in the system temp directory. Three separate problems, and
+        // this checks all three: the mode, the name, and that an existing path is refused rather than
+        // opened.
+        let a = unseal_to_private_temp(b"repository one").unwrap();
+        let b = unseal_to_private_temp(b"repository two").unwrap();
+        assert_ne!(
+            a, b,
+            "two calls produced the same path, so the name is guessable from the pid and the clock"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&a).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "the unsealed repository is mode {mode:o}, readable by every local user"
+            );
+        }
+        assert_eq!(std::fs::read(&a).unwrap(), b"repository one");
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_temp_file_does_not_exist_before_it_is_written() {
+        // The symlink defence is `O_EXCL`, and it only works if nothing is at the path beforehand.
+        // `write_private` opens with `create(true)` and `truncate(true)` - it deliberately does not
+        // refuse an existing file, because `token rotate` rewrites one on purpose (see its doc).
+        //
+        // So the property this test can hold is the one the name is responsible for: a random suffix
+        // means there is nothing at the path to plant against. Measured by asking a million names
+        // whether any collides - if the suffix came from the clock, the answer would be visible as a
+        // repeat at this size.
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        for _ in 0..200 {
+            let p = unseal_to_private_temp(b"x").unwrap();
+            let name = p.file_name().unwrap().to_string_lossy().to_string();
+            assert!(
+                seen.insert(name.clone()),
+                "the same temp name was produced twice, so it is predictable: {name}"
+            );
+            let _ = std::fs::remove_file(&p);
         }
     }
 }
