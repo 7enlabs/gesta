@@ -216,6 +216,44 @@ impl Scanner {
             };
             self.merge_allowlist_text(&text);
         }
+        self.warn_if_the_scanner_is_neutered(root);
+    }
+
+    /// Say so when the allowlist has turned the scanner off.
+    ///
+    /// The committed `.secret-allowlist` arrives with a clone, so a repository that lists every rule
+    /// id disables the commit-time check for everyone who works in it, and the refusal that would
+    /// have caught a real key never fires. Nothing about committing that file looks like an act; it
+    /// is a text file in a diff. The scan therefore says how many rules are off, every time, on
+    /// stderr, because a check that is silently not running is worse than one that is absent.
+    fn warn_if_the_scanner_is_neutered(&self, root: &Path) {
+        let total = self.rules.len();
+        let off = self
+            .rules
+            .iter()
+            .filter(|r| self.allowlist.skips_rule(&r.id))
+            .count();
+        if total == 0 || off == 0 {
+            return;
+        }
+        if off == total {
+            eprintln!(
+                "gesta: the secret scanner is off. Every one of its {} rules is named in the \
+                 allowlist under {}. If that was not deliberate, the list is a file that arrived \
+                 with the clone, and the commit-time check has not been running.",
+                total,
+                root.display()
+            );
+        } else {
+            eprintln!(
+                "gesta: the secret scanner is running {} of {} rules; {} are disabled by the \
+                 allowlist under {}",
+                total - off,
+                total,
+                off,
+                root.display()
+            );
+        }
     }
 
     fn merge_allowlist_text(&mut self, text: &str) {
@@ -281,7 +319,7 @@ impl Scanner {
                         rule: rule.id.clone(),
                         path: path.to_string(),
                         line: i + 1,
-                        preview: truncate(line.trim(), 160),
+                        preview: preview_of(line.trim(), secret),
                         redacted: redact(secret),
                         fingerprint: fingerprint(&rule.id, path, secret),
                         entropy: ent,
@@ -336,6 +374,22 @@ pub fn fingerprint(rule: &str, path: &str, secret: &str) -> String {
     h.update(secret.as_bytes());
     let digest = h.finalize();
     format!("{}:{}:{}", rule, path, hex::encode(&digest[..8]))
+}
+
+/// The line that matched, with the secret itself replaced, then truncated.
+///
+/// Truncating the line was the whole of the first version and it removed nothing: a line short
+/// enough to fit inside 160 characters arrived complete, secret and all. The rule for this field is
+/// the same as the rule for `redacted` - a report that prints the secret is a report that leaks it
+/// again - so every occurrence of the secret in the line is replaced before the length is considered.
+fn preview_of(line: &str, secret: &str) -> String {
+    let shown = redact(secret);
+    let hidden = if secret.is_empty() {
+        line.to_string()
+    } else {
+        line.replace(secret, &shown)
+    };
+    truncate(&hidden, 160)
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -700,5 +754,114 @@ mod tests {
         let body = "one\ntwo\nkey = \"AKIA2E4F6G8H0J2K4L6M\"\nfour\n";
         let got = s.scan_text("a.py", body);
         assert_eq!(got[0].line, 3);
+    }
+    #[test]
+    fn the_preview_of_a_finding_does_not_hold_the_secret() {
+        // #74: `preview` was `truncate(line, 160)`, and 160 characters do not remove a secret - a
+        // short line fits whole. The field's own doc says a log is not a place to put a secret.
+        // Nothing printed it yet, which is why this was latent, and latent is how it would have
+        // stayed until somebody added `--verbose` or a JSON field.
+        // A made-up value in the shape the shipped rule matches, the same one as the entropy test.
+        const FAKE: &str = "9f8e7d6c5b4a39281706f5e4d3c2b1a0";
+        let s = scanner();
+        let body = format!("api_key = \"{}\"\n", FAKE);
+        let got = s.scan_text("b.txt", &body);
+        assert_eq!(
+            got.len(),
+            1,
+            "the shipped rule must match, or this tests nothing"
+        );
+        let f = &got[0];
+        assert!(
+            !f.preview.contains(FAKE),
+            "the preview holds the secret: {}",
+            f.preview
+        );
+        assert!(
+            f.preview.contains("api_key"),
+            "the preview must still say where in the line: {}",
+            f.preview
+        );
+        assert!(!f.redacted.contains(FAKE));
+        assert!(
+            !f.to_string().contains(FAKE),
+            "Display must not leak it either"
+        );
+    }
+
+    #[test]
+    fn a_committed_allowlist_that_turns_the_scanner_off_says_so() {
+        // #77: `.secret-allowlist` is committed with the project and arrives with a clone. A repo
+        // that lists every rule id silently disables the commit-time check for everyone working in
+        // it, and the refusal that would have caught a real key never fires - with nothing said.
+        //
+        // stderr is read by re-running this test as a child with `--nocapture`; a test cannot read
+        // its own stderr.
+        if std::env::var("GESTA_LEAK_OFF_PROBE").is_ok() {
+            let dir = std::env::temp_dir().join(format!("gesta-leak-off-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut text = String::new();
+            for r in default_rules() {
+                text.push_str(&format!("rule {}\n", r.id));
+            }
+            std::fs::write(dir.join(".secret-allowlist"), text).unwrap();
+            let mut s = scanner();
+            s.load_allowlist(&dir);
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .args([
+                "support::leak::tests::a_committed_allowlist_that_turns_the_scanner_off_says_so",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("GESTA_LEAK_OFF_PROBE", "1")
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("the secret scanner is off"),
+            "a scanner disabled by a committed file must say so, stderr was: {err}"
+        );
+    }
+
+    #[test]
+    fn a_partial_allowlist_says_how_many_rules_are_left() {
+        // The quieter case: a rule or two disabled is legitimate and common, but the operator should
+        // still be able to see it without reading the allowlist.
+        if std::env::var("GESTA_LEAK_PART_PROBE").is_ok() {
+            let dir = std::env::temp_dir().join(format!("gesta-leak-part-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let first = default_rules()[0].id.clone();
+            std::fs::write(dir.join(".secret-allowlist"), format!("rule {}\n", first)).unwrap();
+            let mut s = scanner();
+            s.load_allowlist(&dir);
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .args([
+                "support::leak::tests::a_partial_allowlist_says_how_many_rules_are_left",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("GESTA_LEAK_PART_PROBE", "1")
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("running") && err.contains("1 are disabled"),
+            "a partial allowlist must be visible, stderr was: {err}"
+        );
+        assert!(
+            !err.contains("the secret scanner is off"),
+            "one disabled rule is not the scanner being off: {err}"
+        );
     }
 }

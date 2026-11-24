@@ -51,12 +51,31 @@ impl Forwarder {
         let c = Arc::clone(&counters);
 
         std::thread::spawn(move || {
+            // Events dropped since the last line that reached the collector. The count lived in a
+            // counter nothing read (#73): the header promised the gap would appear in the record and
+            // no gap ever did, so an outage left a history that looked complete and was not.
+            let mut carried: u64 = 0;
             while let Ok(body) = rx.recv() {
-                match post(&url, token.as_deref(), &body) {
+                // Take the count at delivery time. Anything dropped since the last attempt belongs
+                // to this line, whether or not this line gets through.
+                if let Ok(mut n) = c.lock() {
+                    carried += n.dropped;
+                    n.dropped = 0;
+                }
+                let with_note = if carried > 0 {
+                    format!(
+                        "{body}\n<<gesta audit gap: {carried} event(s) were dropped while the collector was unreachable>>"
+                    )
+                } else {
+                    body
+                };
+                match post(&url, token.as_deref(), &with_note) {
                     Ok(()) => {
                         if let Ok(mut n) = c.lock() {
                             n.delivered += 1;
                         }
+                        // The gap reached the collector inside this line.
+                        carried = 0;
                     }
                     Err(e) => {
                         // The error goes to stderr once per failure rather than per retry: a collector
@@ -65,7 +84,12 @@ impl Forwarder {
                         eprintln!("audit forward failed: {}", e);
                         if let Ok(mut n) = c.lock() {
                             n.failed += 1;
+                            // This line never arrived, so neither did its note. Back in the counter,
+                            // to be added to the next line - otherwise the gap disappears with the
+                            // failure that created it.
+                            n.dropped += carried;
                         }
+                        carried = 0;
                     }
                 }
             }
@@ -257,5 +281,74 @@ mod tests {
         );
         assert!(dropped > 0, "a full queue must be counted, not hidden");
         drop(listener);
+    }
+    /// A collector that fails the first `fail_first` requests, then answers 200. Every request it
+    /// accepts is returned, so a test can read what actually went over the wire.
+    fn flaky_collector(fail_first: usize) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for i in 0..(fail_first + 1) {
+                let (mut s, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 65536];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                if i < fail_first {
+                    let _ = s.write_all(b"HTTP/1.1 500 Nope\r\nContent-Length: 0\r\n\r\n");
+                } else {
+                    let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+                }
+                seen.push(text);
+            }
+            seen
+        });
+        (format!("http://127.0.0.1:{}/audit", port), handle)
+    }
+
+    #[test]
+    fn a_dropped_event_is_reported_in_the_next_line_that_is_delivered() {
+        // #73: `Counters.dropped` was incremented and nothing read it, so a collector outage lost
+        // audit events that were counted in a process nobody could ask. The header promised the
+        // count "goes into the next line that is delivered" and no line ever carried it.
+        let (url, handle) = flaky_collector(1);
+        let f = Forwarder::start(url, None);
+
+        // The queue is 4096 deep, so filling it takes 4096 sends and only the rest are dropped.
+        let mut accepted = 0usize;
+        let mut dropped = 0usize;
+        for _ in 0..(QUEUE_DEPTH + 8) {
+            if f.send("{\"decision\":\"no-token\"}") {
+                accepted += 1;
+            } else {
+                dropped += 1;
+            }
+        }
+        assert!(
+            dropped > 0,
+            "the queue must overflow, or this tests nothing"
+        );
+        assert_eq!(f.stats().2, dropped as u64, "the counter must agree");
+        assert_eq!(
+            accepted + dropped,
+            QUEUE_DEPTH + 8,
+            "every send is either accepted or counted as dropped, never both and never neither"
+        );
+
+        // The first post fails, the second succeeds and must name the gap. Push one more so there is
+        // a line to carry it after the failure.
+        let _ = f.send("{\"decision\":\"allowed\"}");
+        let seen = handle.join().unwrap();
+        let delivered = seen.last().expect("one request must arrive");
+        assert!(
+            delivered.contains("gesta audit gap"),
+            "the line after an outage must name the gap, got: {}",
+            delivered.replace("\\r", "").replace("\\n", "\n")
+        );
+        assert!(
+            delivered.contains(&dropped.to_string()),
+            "it must carry the count ({dropped}), got: {}",
+            delivered
+        );
     }
 }

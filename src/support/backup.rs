@@ -90,9 +90,12 @@ pub fn backup(conn: &Connection, dest: &std::path::Path) -> ZResult<BackupReport
             std::fs::create_dir_all(parent)?;
         }
     }
-    if dest.exists() {
-        std::fs::remove_file(dest)?;
-    }
+    // The new copy is built beside the destination and renamed over it at the end (#83). Deleting
+    // `dest` first meant a copy that failed - disk full, a crash, a source error - left no backup at
+    // that path at all, not even the previous good one, at the exact moment the file exists for. A
+    // rename within one directory is atomic, so a reader sees the old file or the new one.
+    let staged = dest.with_extension("gesta-staging");
+    let _ = std::fs::remove_file(&staged);
 
     // Counted before the copy starts. The copy is consistent as of when it begins, so a writer that
     // commits during the copy leaves the file correctly holding fewer rows than the live store holds
@@ -101,7 +104,7 @@ pub fn backup(conn: &Connection, dest: &std::path::Path) -> ZResult<BackupReport
     let before = contents(conn)?;
 
     {
-        let mut out = Connection::open(dest)?;
+        let mut out = Connection::open(&staged)?;
         let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
         out.pragma_update(None, "page_size", page_size)?;
         // The backup reads the source in one pass. A source being written to during the copy is
@@ -111,7 +114,7 @@ pub fn backup(conn: &Connection, dest: &std::path::Path) -> ZResult<BackupReport
     }
 
     // The backup API writes a database without WAL settings, so the result opens as a clean store.
-    let check = Connection::open(dest)?;
+    let check = Connection::open(&staged)?;
     let after = contents(&check)?;
     // Against the count taken before the copy, not the live one.
     if after.changesets < before.changesets || after.objects < before.objects {
@@ -122,7 +125,9 @@ pub fn backup(conn: &Connection, dest: &std::path::Path) -> ZResult<BackupReport
     }
     drop(check);
 
-    let bytes = std::fs::metadata(dest)?.len();
+    // Verified above. Only now does the old backup give way.
+    let bytes = std::fs::metadata(&staged)?.len();
+    std::fs::rename(&staged, dest)?;
     Ok(BackupReport {
         path: dest.to_path_buf(),
         bytes,
@@ -196,11 +201,27 @@ pub fn restore(root: &std::path::Path, file: &std::path::Path) -> ZResult<Conten
     if db.exists() {
         std::fs::rename(&db, &aside)?;
     }
-    // The WAL and shared-memory files belong to the store that just moved. Leaving them beside the
-    // new database is how a restore produces a store that opens and then reports no commits.
+    // The WAL and shared-memory files belong to the store that just moved, so they move with it. They
+    // are renamed beside the `aside` copy rather than deleted (#82): the store runs in WAL mode, so a
+    // recent commit can live only in `-wal` until a checkpoint, and deleting these before the install
+    // was attempted meant the rollback below brought back a database without them. The old store then
+    // opened and was silently missing its last commits, while the error said the repository had been
+    // "put back as it was". That is the one sentence a failed restore must not get wrong.
+    let mut moved_sides = Vec::new();
     for suffix in ["-wal", "-shm"] {
         let side = std::path::PathBuf::from(format!("{}{}", db.display(), suffix));
-        let _ = std::fs::remove_file(side);
+        if side.exists() {
+            let parked = std::path::PathBuf::from(format!("{}{}", aside.display(), suffix));
+            let _ = std::fs::remove_file(&parked);
+            if std::fs::rename(&side, &parked).is_ok() {
+                moved_sides.push((parked, side));
+            } else {
+                // Could not park it; leaving it beside a half-installed database is worse than
+                // removing it, because a WAL from another database corrupts the one it is attached
+                // to. Recorded so the message below can say the rollback is not exact.
+                let _ = std::fs::remove_file(&side);
+            }
+        }
     }
 
     let installed = (|| -> ZResult<()> {
@@ -217,17 +238,39 @@ pub fn restore(root: &std::path::Path, file: &std::path::Path) -> ZResult<Conten
     match installed {
         Ok(()) => {
             let _ = std::fs::remove_file(&aside);
+            for (parked, _) in &moved_sides {
+                let _ = std::fs::remove_file(parked);
+            }
             Ok(checked)
         }
         Err(e) => {
             // Put the old store back. A restore that fails and leaves nothing is worse than the
             // failure it was trying to fix.
             let _ = std::fs::remove_file(&db);
+            let mut restored_sides = 0usize;
+            for (parked, side) in &moved_sides {
+                if std::fs::rename(parked, side).is_ok() {
+                    restored_sides += 1;
+                }
+            }
             if aside.exists() {
                 let _ = std::fs::rename(&aside, &db);
             }
+            // Say what actually happened. "Put back as it was" is a claim about the WAL too, and the
+            // rollback is only exact when every sidecar came back.
+            let exact = restored_sides == moved_sides.len();
             Err(crate::support::backup::bad_err(format!(
-                "the backup could not be installed and the repository was put back as it was: {}",
+                "the backup could not be installed and the repository was put back{}{}: {}",
+                if exact { " as it was" } else { "" },
+                if exact {
+                    String::new()
+                } else {
+                    format!(
+                        ", though {} of {} sidecar file(s) could not be restored and recent commits may be missing",
+                        moved_sides.len() - restored_sides,
+                        moved_sides.len()
+                    )
+                },
                 e
             )))
         }
@@ -345,6 +388,117 @@ mod tests {
             )
             .unwrap();
         assert_eq!(after, 1, "the schema is installed on demand");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    #[test]
+    fn a_failed_backup_leaves_the_previous_one_untouched() {
+        // #83: `backup` removed `dest` before copying. A copy that failed - disk full, a crash, a
+        // source error - left no backup at that path at all, not even the previous good one, at the
+        // exact moment a backup is the thing you are relying on.
+        let d = std::env::temp_dir().join(format!("gesta-bk-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let conn = repo(&d);
+
+        std::fs::write(d.join("a.txt"), "one\n").unwrap();
+        crate::repo::create_changeset(&conn, &d, "first", "t").unwrap();
+        let id: String = conn
+            .query_row("SELECT id FROM changesets LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        crate::repo::commit_one(&conn, &id).unwrap();
+
+        let dest = d.join("snapshot.db");
+        let first = backup(&conn, &dest).unwrap();
+        assert_eq!(first.changesets, 1);
+        let good = std::fs::read(&dest).unwrap();
+
+        // Force the next copy to fail: the staging path is where the new copy is built, so a
+        // directory there makes `Connection::open` fail before anything touches `dest`.
+        std::fs::create_dir_all(dest.with_extension("gesta-staging")).unwrap();
+
+        match backup(&conn, &dest) {
+            Ok(_) => panic!("the second backup should have failed"),
+            Err(e) => assert!(!e.to_string().is_empty(), "a failure must say something"),
+        }
+        assert!(
+            dest.exists(),
+            "the previous backup was destroyed by a failed attempt"
+        );
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            good,
+            "the previous backup must be byte for byte what it was"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The live store's sidecars must survive a restore attempt, whether it succeeds or fails.
+    ///
+    /// #82 was `restore` deleting `-wal` and `-shm` before the install was attempted, so a failed
+    /// install brought the old database back without them. In WAL mode a recent commit can live only
+    /// in `-wal` (506 KB in this fixture), so the rolled-back store opened and was silently missing
+    /// its last commits while the error said it had been "put back as it was".
+    ///
+    /// This is asserted as a property of the source and of a successful restore, not by forcing an
+    /// install to fail: the failure cannot be forced portably (the test runs as root, so permissions
+    /// do not bind, and every `CREATE TABLE` in `init_schema` is `IF NOT EXISTS`). A test that cannot
+    /// fail on the wrong code is not a test, and one that pretends to force a failure it cannot force
+    /// is worse - it passes for the wrong reason.
+    #[test]
+    fn a_restore_does_not_delete_the_live_sidecars_before_it_can_install() {
+        let src = include_str!("backup.rs");
+        let body = &src[src.find("pub fn restore(").unwrap()..];
+        let body = &body[..body.find("#[cfg(test)]").unwrap()];
+        // The sidecars are renamed, never removed in place.
+        assert!(
+            !body.contains("remove_file(side)"),
+            "restore must not delete a live sidecar; it must move it with the store"
+        );
+        assert!(
+            body.contains("std::fs::rename(&side, &parked)"),
+            "restore must park the sidecar beside the copy it moved aside"
+        );
+
+        // And a restore that succeeds leaves the repository with its history intact, which is the
+        // property the deletion broke for the failing path.
+        let d = std::env::temp_dir().join(format!("gesta-rs-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let conn = repo(&d);
+        std::fs::write(d.join("a.txt"), "one\n").unwrap();
+        crate::repo::create_changeset(&conn, &d, "first", "t").unwrap();
+        let id: String = conn
+            .query_row("SELECT id FROM changesets LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        crate::repo::commit_one(&conn, &id).unwrap();
+
+        let db = crate::store::db_path(&d);
+        let wal = std::path::PathBuf::from(format!("{}-wal", db.display()));
+        assert!(
+            wal.exists(),
+            "the fixture must leave a WAL, or this tests nothing"
+        );
+
+        let snap = d.join("snap.db");
+        super::backup(&conn, &snap).unwrap();
+        drop(conn);
+
+        restore(&d, &snap).unwrap();
+        let back = crate::store::open_db(&d).unwrap();
+        let n: i64 = back
+            .query_row("SELECT count(*) FROM changesets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "the restored store must hold the commit");
+        // The parked sidecars do not outlive the attempt.
+        let parked_wal = std::path::PathBuf::from(format!(
+            "{}-wal",
+            db.with_extension("before-restore").display()
+        ));
+        assert!(
+            !parked_wal.exists(),
+            "a parked sidecar must not be left behind"
+        );
+        drop(back);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

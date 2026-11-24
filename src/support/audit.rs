@@ -7,8 +7,17 @@
 //! worth reading, and a log that only holds successes answers "was it used" but never "was it tried".
 //!
 //! The format is one JSON document per line: a person can read it, `jq` can filter it, and a reader
-//! that does not understand a field can ignore it. It is appended under a lock because two threads
-//! writing one file interleave their lines, and a half line is a document that fails to parse.
+//! that does not understand a field can ignore it.
+//!
+//! A line is written with a single `write_all` to a descriptor opened `O_APPEND`, and the line is
+//! far below `PIPE_BUF`, so the kernel appends it whole: two writers do not interleave a line and a
+//! reader never sees half of one. That is a property of `O_APPEND` on POSIX, not of a lock, and
+//! there is no lock here. An earlier version of this comment claimed one, and gave it as the reason
+//! the code was safe - a guarantee that is described but not implemented is worse than a smaller one
+//! that is, because the next person reads the comment instead of the code.
+//!
+//! What this does not give: atomicity across several lines. A record is one line and one `write`,
+//! and nothing here writes two.
 
 use crate::ZResult;
 use std::io::Write;
@@ -498,5 +507,29 @@ mod tests {
         assert_eq!(rows[1].decision, "unreadable");
         assert_eq!(rows[1].raw, "not json");
         let _ = std::fs::remove_dir_all(&d);
+    }
+    #[test]
+    fn the_module_does_not_claim_a_lock_it_does_not_take() {
+        // #70: the header said lines were appended "under a lock" and gave that as the reason the
+        // log was safe. There is no lock - and none is needed, because one `write_all` to an
+        // `O_APPEND` descriptor is one `write` and the kernel does not interleave it - but a stated
+        // guarantee that does not exist is read instead of the code and trusted.
+        let src = include_str!("audit.rs");
+        let header = &src[..src.find("use crate::ZResult;").unwrap()];
+        assert!(
+            !header.contains("under a lock"),
+            "the header must not claim a lock that is not taken"
+        );
+        assert!(
+            header.contains("O_APPEND"),
+            "the header must name the actual reason a line is not interleaved"
+        );
+        // And there really is no lock, which is what makes the claim wrong. The scan stops at the
+        // test module: this test's own text contains the words it looks for.
+        let start = src.find("pub fn record").unwrap();
+        let end = src.find("#[cfg(test)]").unwrap();
+        let body = &src[start..end];
+        assert!(!body.contains("flock"), "no lock is taken");
+        assert!(!body.contains("lock()"), "no mutex guards the file");
     }
 }

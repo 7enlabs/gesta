@@ -106,6 +106,16 @@ pub fn unseal(sealed: &[u8], passphrase: &str) -> ZResult<Vec<u8>> {
     let mut ct = hex::decode(lines.next().unwrap_or(""))
         .map_err(|_| bad("the ciphertext is not valid hex".to_string()))?;
 
+    // Nothing may follow the ciphertext (#69). Four lines are the whole format, so a fifth is
+    // either corruption or a file that had something appended, and a reader that stops after the
+    // fields it wants treats both as a valid backup. Appended data is evidence, not padding.
+    if lines.next().is_some() {
+        return Err(bad(
+            "the sealed backup has data after the ciphertext; it may have been appended to"
+                .to_string(),
+        ));
+    }
+
     if nonce_bytes.len() != NONCE_LEN {
         return Err(bad("the nonce has the wrong length".to_string()));
     }
@@ -433,5 +443,21 @@ mod tests {
             1,
             "keep 1 deletes the older one"
         );
+    }
+    #[test]
+    fn a_sealed_backup_with_data_appended_is_refused() {
+        // #69, the other half: `unseal` took four lines and ignored the rest, so a backup with
+        // garbage appended after the ciphertext still opened.
+        let plain = b"not a real store".to_vec();
+        let sealed = seal(&plain, "passphrase").unwrap();
+        let mut extended = sealed.clone();
+        extended.extend_from_slice(b"\nappended garbage\n");
+        let err = unseal(&extended, "passphrase").unwrap_err().to_string();
+        assert!(
+            err.contains("after the ciphertext"),
+            "trailing data must be named, got {err}"
+        );
+        // The untouched seal still opens.
+        assert_eq!(unseal(&sealed, "passphrase").unwrap(), plain);
     }
 }
