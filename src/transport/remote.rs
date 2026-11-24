@@ -11,7 +11,7 @@ use flate2::Compression;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashSet;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 
 use crate::store::{branch_head, get_object, hash_content, init_schema, open_db, put_object};
@@ -181,10 +181,12 @@ impl Bundle {
     }
 
     pub fn decode(bytes: &[u8]) -> ZResult<Bundle> {
-        let mut dec = ZlibDecoder::new(bytes);
-        let mut text = String::new();
-        dec.read_to_string(&mut text)
+        // A bundle arrives from a remote. `read_to_string` had no ceiling, so a 4 MiB body could
+        // inflate to gigabytes before the header was even looked at (#156).
+        let raw = crate::store::inflate_capped(ZlibDecoder::new(bytes), crate::store::MAX_INFLATED)
             .map_err(|e| bad(format!("bundle is not valid repository data: {}", e)))?;
+        let text = String::from_utf8(raw)
+            .map_err(|_| bad("bundle is not valid repository data: it is not text".to_string()))?;
 
         let mut lines = text.lines();
         match lines.next() {

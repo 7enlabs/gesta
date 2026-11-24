@@ -755,18 +755,47 @@ pub fn compress_bytes(data: &[u8]) -> ZResult<Vec<u8>> {
     Ok(enc.finish()?)
 }
 
-pub fn decompress_bytes(blob: &[u8]) -> ZResult<Vec<u8>> {
-    let mut dec = ZlibDecoder::new(blob);
+/// The largest an object may inflate to.
+///
+/// zlib's ceiling is roughly 1032:1, so a 4 MiB blob can arrive claiming 4 GiB of plaintext, and
+/// `read_to_end` will happily allocate it before anything looks at the result. Three read paths did
+/// exactly that - `decompress_bytes`, `decompress`, and the pack reader - and each is reachable from a
+/// repository or pack file somebody else wrote (#101, #156). 1 GiB is far above any file this store is
+/// meant to hold and far below what a bomb needs to be useful.
+pub const MAX_INFLATED: usize = 1024 * 1024 * 1024;
+
+/// Inflate with a ceiling, appending at most `cap` bytes.
+///
+/// `read_to_end` has no limit by design: it grows until the decoder says it is done, which for a bomb
+/// is after the whole expansion. `take` bounds the read, and the one byte past the cap is the
+/// difference between "it happened to fit" and "it did not finish", so a stream that ends exactly at
+/// the cap is accepted and one byte more is refused.
+pub fn inflate_capped<R: std::io::Read>(src: R, cap: usize) -> ZResult<Vec<u8>> {
     let mut out = Vec::new();
-    dec.read_to_end(&mut out)?;
+    let mut limited = src.take(cap as u64 + 1);
+    limited
+        .read_to_end(&mut out)
+        .map_err(|e| bad(format!("a compressed object does not decompress: {}", e)))?;
+    if out.len() > cap {
+        return Err(bad(format!(
+            "a compressed object inflates past {} bytes and was refused; it is either corrupt or a \
+             decompression bomb",
+            cap
+        )));
+    }
     Ok(out)
 }
 
+pub fn decompress_bytes(blob: &[u8]) -> ZResult<Vec<u8>> {
+    inflate_capped(ZlibDecoder::new(blob), MAX_INFLATED)
+}
+
 fn decompress(blob: &[u8]) -> ZResult<String> {
-    let mut dec = ZlibDecoder::new(blob);
-    let mut out = String::new();
-    dec.read_to_string(&mut out)?;
-    Ok(out)
+    // Through the capped inflater for the same reason as `decompress_bytes`: the row came from
+    // somewhere, and "it is only a text object" is not a bound (#101).
+    let bytes = inflate_capped(ZlibDecoder::new(blob), MAX_INFLATED)?;
+    String::from_utf8(bytes)
+        .map_err(|_| bad("a compressed object does not hold valid UTF-8".to_string()))
 }
 
 /// Insert content into the object store. Idempotent: identical content maps to
@@ -3619,5 +3648,45 @@ pub(crate) mod tests {
             ),
             Err(bad) => panic!("{bad}"),
         }
+    }
+    #[test]
+    fn a_bomb_is_refused_instead_of_allocated() {
+        // #101, #156: `read_to_end` grows until the decoder says it is done, so a small compressed
+        // body claiming gigabytes is allocated in full before anyone looks at it. This is not
+        // hypothetical: zlib reaches about 1032:1, and the pack reader and the bundle decoder both
+        // take input from other people.
+        //
+        // The fixture is a real bomb at a small ceiling rather than a gigabyte of zeros, so the test
+        // runs in milliseconds. What is being checked is the arithmetic and the refusal, not zlib.
+        use flate2::write::ZlibEncoder;
+        use std::io::Write;
+        let mut enc = ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(&vec![0u8; 8 * 1024 * 1024]).unwrap();
+        let bomb = enc.finish().unwrap();
+        assert!(
+            bomb.len() < 64 * 1024,
+            "the fixture must be small, or it is not a bomb: {} bytes",
+            bomb.len()
+        );
+
+        let err = match inflate_capped(ZlibDecoder::new(&bomb[..]), 1024 * 1024) {
+            Ok(v) => panic!(
+                "a {}-byte body inflated to {} bytes past a 1 MiB ceiling without complaint",
+                bomb.len(),
+                v.len()
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("decompression bomb") || err.contains("inflates past"),
+            "the refusal must say what it thinks happened, got: {err}"
+        );
+
+        // And a body under the ceiling still inflates, or the cap would just be a bug.
+        let small = compress_bytes(b"under the ceiling").unwrap();
+        assert_eq!(
+            decompress_bytes(&small).unwrap(),
+            b"under the ceiling".to_vec()
+        );
     }
 }

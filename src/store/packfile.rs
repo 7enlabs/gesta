@@ -276,12 +276,9 @@ fn ofs_delta_base(bytes: &[u8], mut at: usize) -> ZResult<(u64, usize)> {
 /// Inflate one zlib stream starting at `at`.
 fn inflate_at(bytes: &[u8], at: usize) -> ZResult<Vec<u8>> {
     use flate2::read::ZlibDecoder;
-    use std::io::Read;
-    let mut out = Vec::new();
-    ZlibDecoder::new(&bytes[at..])
-        .read_to_end(&mut out)
-        .map_err(|e| bad(format!("pack entry does not decompress: {}", e)))?;
-    Ok(out)
+    // A pack file arrives from a remote, so its entries get the same ceiling as any other compressed
+    // input (#156). `inflate_at` is the one place a pack entry becomes bytes.
+    crate::store::inflate_capped(ZlibDecoder::new(&bytes[at..]), crate::store::MAX_INFLATED)
 }
 
 /// Apply a git delta to its base.
