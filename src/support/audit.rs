@@ -114,13 +114,23 @@ pub fn record_with(
     );
     let line = format!("{}\n", doc.render());
 
-    if let Ok(mut f) = std::fs::OpenOptions::new()
+    // Both failures are reported. `if let Ok(..)` with no `else` was the shape of the bug: a log
+    // that could not be opened - the directory gone, permissions changed, the disk full - dropped
+    // every event with nothing printed and nothing returned, so an operator reading the file saw an
+    // intact history that silently stopped at some point. A missing write is the one failure in an
+    // audit log that must not be quiet, because the whole value of the log is that it is complete.
+    match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
     {
-        if f.write_all(line.as_bytes()).is_err() {
-            eprintln!("audit log is not writable: {}", path.display());
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(line.as_bytes()) {
+                eprintln!("audit log is not writable: {}: {}", path.display(), e);
+            }
+        }
+        Err(e) => {
+            eprintln!("audit log could not be opened: {}: {}", path.display(), e);
         }
     }
 
@@ -346,6 +356,52 @@ mod tests {
         ));
         std::fs::create_dir_all(d.join(".gesta")).unwrap();
         d
+    }
+
+    #[test]
+    fn an_event_that_cannot_be_written_says_so() {
+        // #76: `if let Ok(f) = ..open(..)` with no `else` meant an unopenable log dropped every event
+        // with nothing printed. An operator reading the file saw a history that silently stopped.
+        //
+        // stderr is captured by re-running this test binary as a child with an env var that makes it
+        // take this branch, because a test cannot read its own stderr.
+        if std::env::var("GESTA_AUDIT_FAIL_PROBE").is_ok() {
+            let d = std::env::temp_dir().join(format!("gesta-audit-probe-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            // `.gesta` is a FILE, so `.gesta/audit.log` cannot be created.
+            std::fs::write(d.join(".gesta"), b"not a directory").unwrap();
+            record(
+                &d,
+                &Event {
+                    who: "anonymous",
+                    decision: Decision::NoToken,
+                    action: "file",
+                    target: "a.txt",
+                    reason: "probe",
+                    remote: None,
+                },
+            );
+            let _ = std::fs::remove_dir_all(&d);
+            return;
+        }
+
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            // `--nocapture`, or the harness swallows the very stderr this test exists to read.
+            .args([
+                "support::audit::tests::an_event_that_cannot_be_written_says_so",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("GESTA_AUDIT_FAIL_PROBE", "1")
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("audit log could not be opened"),
+            "a dropped audit event must be reported, stderr was: {err}"
+        );
     }
 
     #[test]

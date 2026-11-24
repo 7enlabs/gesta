@@ -149,7 +149,14 @@ impl Pattern {
             if before_ok && after_ok {
                 return true;
             }
-            from = start + 1;
+            // Advance past the whole matched character, not one byte. `start + 1` lands inside a
+            // multi-byte character whenever the needle is not ASCII, and slicing `hay[from..]` there
+            // panics with "byte index N is not a char boundary" - a `grep -w` over a file with an
+            // accented word killed the process instead of reporting no match.
+            from = end.max(start + 1);
+            while from < hay.len() && !hay.is_char_boundary(from) {
+                from += 1;
+            }
             if from >= hay.len() {
                 return false;
             }
@@ -264,6 +271,22 @@ pub fn search_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_whole_word_search_with_a_multi_byte_pattern_does_not_panic() {
+        // #79: after a rejected match the scan advanced by one BYTE, `from = start + 1`. When the
+        // needle or the text around it is not ASCII, that lands in the middle of a character and
+        // `hay[from..]` panics with "byte index N is not a char boundary". A `grep -w` over a file
+        // with an accented word crashed the process instead of reporting no match.
+        let m = Pattern::new("é", false, true).unwrap();
+        // "aé" - the match starts at byte 1 and is refused because 'a' is a word character, so the
+        // scan advances one byte into the middle of 'é'.
+        assert!(!m.matches("aé"), "aé does not contain é as a whole word");
+        assert!(m.matches(" é "), "a standalone é is a whole word");
+        // And a multi-byte needle in a longer line, several times over.
+        assert!(!m.matches("aaaéaaa"));
+        assert!(m.matches("aaa é aaa"));
+    }
 
     #[test]
     fn a_plain_string_is_found_on_its_line() {
