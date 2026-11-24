@@ -27,7 +27,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -87,11 +87,13 @@ impl SecretStore {
         if let Some(dir) = self.path.parent() {
             fs::create_dir_all(dir)?;
         }
-        // Create with owner-only permissions where the platform supports it, then
-        // write. The sealed contents are useless without the passphrase, but a
-        // file nobody else can read is one less thing to think about.
-        fs::write(&self.path, sealed)?;
-        restrict_permissions(&self.path)?;
+        // Replaced, not truncated, and created 0600 before its content is written.
+        //
+        // `fs::write` followed by `restrict_permissions` was two defects in two lines: the file
+        // existed at 0644 for the width of the write, which is the window a watcher needs, and it
+        // was truncated in place, so a reader during the write got a file that does not decode and a
+        // write that died partway left the whole credential store gone.
+        crate::support::private_file::replace_private(&self.path, sealed.as_bytes())?;
         Ok(())
     }
 
@@ -129,15 +131,6 @@ pub fn default_path() -> ZResult<PathBuf> {
     };
     let base = base.ok_or_else(|| bad("cannot find a config directory".to_string()))?;
     Ok(base.join("gesta").join("secrets"))
-}
-
-#[cfg(unix)]
-fn restrict_permissions(path: &Path) -> ZResult<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = fs::metadata(path)?.permissions();
-    perms.set_mode(0o600);
-    fs::set_permissions(path, perms)?;
-    Ok(())
 }
 
 #[cfg(not(unix))]
