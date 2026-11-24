@@ -40,8 +40,13 @@ pub struct Rule {
     /// Which paths it matches.
     matcher: Matcher,
     pub text: Option<Text>,
-    /// The line ending to write to the working tree, if the rule names one.
-    pub eol: Option<Eol>,
+    /// The line ending to write to the working tree.
+    ///
+    /// Three states, and the third is why this is not `Option<Eol>`: `None` means the rule says
+    /// nothing about line endings, `Set` gives one, and `Unset` is `!eol` - a rule that clears whatever
+    /// an earlier rule said. Collapsing `Unset` into `None` made `!eol` a no-op, because the earlier
+    /// `eol=crlf` then still won as "the last rule that said something" (#92).
+    pub eol: EolRule,
     /// Whether the body lives beside the database instead of in a row.
     ///
     /// `large` and `-large`, which is what a repository uses to say that a path is big, or will be,
@@ -56,6 +61,17 @@ pub struct Rule {
 pub enum Eol {
     Lf,
     Crlf,
+}
+
+/// What a rule says about line endings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EolRule {
+    /// The rule does not mention line endings.
+    #[default]
+    Unsaid,
+    Set(Eol),
+    /// `!eol`: clear whatever an earlier rule set.
+    Unset,
 }
 
 /// How a pattern matches, kept as an enum so a pattern is not re-parsed per file.
@@ -140,6 +156,14 @@ pub struct Rules {
     pub rules: Vec<Rule>,
     /// The path the rules were read from, so a message can name the file.
     pub source: Option<String>,
+    /// Attribute tokens this parser does not implement, as `pattern\ttoken`.
+    ///
+    /// A typo'd attribute and an unimplemented one both used to fall into `_ => continue`, so a rule
+    /// that did nothing looked exactly like a rule that worked (#92). Nothing broke loudly; the file
+    /// simply kept the checkout the broad rule gave it. Collected rather than warned about from here,
+    /// because a library call during every commit must not write to stderr - `attributes why` is where
+    /// a person asks.
+    pub unknown: Vec<String>,
 }
 
 impl Rules {
@@ -179,7 +203,7 @@ impl Rules {
                 None => continue,
             };
             let mut text_attr = None;
-            let mut eol = None;
+            let mut eol = EolRule::Unsaid;
             let mut large = None;
             let mut saw_any = false;
             for attr in parts {
@@ -188,7 +212,7 @@ impl Rules {
                     "text" | "text=auto" => text_attr = Some(Text::Yes),
                     "-text" | "binary" => text_attr = Some(Text::No),
                     "eol=lf" => {
-                        eol = Some(Eol::Lf);
+                        eol = EolRule::Set(Eol::Lf);
                         if text_attr.is_none() {
                             // Naming an eol implies the file is text; git treats it that way and a
                             // rule that says otherwise is a rule nobody means.
@@ -196,18 +220,33 @@ impl Rules {
                         }
                     }
                     "eol=crlf" => {
-                        eol = Some(Eol::Crlf);
+                        eol = EolRule::Set(Eol::Crlf);
                         if text_attr.is_none() {
                             text_attr = Some(Text::Yes);
                         }
                     }
                     // A `!attr` unsets it, which is how a file opts back out of a broad rule.
                     "!text" => text_attr = Some(Text::Unspecified),
+                    // `!eol` is git's way to unset a line-ending rule, and it was falling through to
+                    // `_ => continue`: a file written `*.txt !eol` to opt out of a broad `eol=crlf`
+                    // kept the CRLF checkout and said nothing (#92). Unsetting means "no rule", which
+                    // is `None` here - not `Some(Eol::...)` of any kind.
+                    "!eol" => {
+                        eol = EolRule::Unset;
+                        // Unsetting eol on a rule that also says `text` would leave the text rule
+                        // applying; git's `!eol` only clears the eol part, so the text part stands.
+                    }
                     // `large` sends the body to the sidecar regardless of size; `-large` keeps it
                     // inline, which is what a file whose name matches a broad rule needs.
                     "large" => large = Some(true),
                     "-large" => large = Some(false),
-                    _ => continue,
+                    // Anything else is a token this parser does not implement. It used to be
+                    // `_ => continue`, which made a misspelled attribute indistinguishable from a
+                    // working one (#92).
+                    other => {
+                        self.unknown.push(format!("{}\t{}", pattern, other));
+                        continue;
+                    }
                 }
             }
             if !saw_any {
@@ -244,9 +283,20 @@ impl Rules {
                 text = t;
                 which = Some(rule.pattern.as_str());
             }
-            if rule.eol.is_some() {
-                eol = rule.eol;
-                if which.is_none() {
+            match rule.eol {
+                // Unsaid leaves whatever an earlier rule set, which is what makes last-match-wins work
+                // over a list where most rules mention only `text`.
+                EolRule::Unsaid => {}
+                EolRule::Set(e) => {
+                    eol = Some(e);
+                    if which.is_none() {
+                        which = Some(rule.pattern.as_str());
+                    }
+                }
+                // `!eol` clears it, and names itself as the deciding rule: a person asking why a file
+                // is written byte-for-byte deserves the line that made it so.
+                EolRule::Unset => {
+                    eol = None;
                     which = Some(rule.pattern.as_str());
                 }
             }
@@ -514,5 +564,56 @@ mod tests {
         assert_eq!(e["text"], "set");
         assert_eq!(e["eol"], "lf");
         assert_eq!(e["rule"], "*.txt");
+    }
+    #[test]
+    fn bang_eol_opts_a_file_back_out_of_a_broad_rule() {
+        // #92: `!eol` fell into `_ => continue`, so a file written `*.txt !eol` to opt out of a broad
+        // `*.txt eol=crlf` kept the CRLF checkout and said nothing about it. Git's `!eol` clears the
+        // line-ending rule; it does not unset `text`.
+        let mut r = Rules::default();
+        r.parse("*.txt eol=crlf\n");
+        let broad = plan_for(&r, "notes.txt");
+        assert_eq!(
+            broad.checkout,
+            Some(Eol::Crlf),
+            "the fixture must start with the broad rule applying, or this tests nothing"
+        );
+
+        r.parse("special.txt !eol\n");
+        let opted_out = plan_for(&r, "special.txt");
+        assert_ne!(
+            opted_out.checkout,
+            Some(Eol::Crlf),
+            "`!eol` must clear the CRLF checkout, got {:?}",
+            opted_out.checkout
+        );
+        // And it must not clear `text`, which is a separate attribute.
+        assert!(
+            opted_out.normalise,
+            "`!eol` unsets the line ending only; the file is still text"
+        );
+        // A different file is unaffected, which is what "the rule is per pattern" means.
+        assert_eq!(plan_for(&r, "other.txt").checkout, Some(Eol::Crlf));
+    }
+
+    #[test]
+    fn an_attribute_this_build_does_not_implement_is_recorded_not_dropped() {
+        // The other half of #92: a misspelled or unimplemented token fell through the same
+        // `_ => continue`, so a rule that did nothing looked exactly like a rule that worked.
+        let mut r = Rules::default();
+        r.parse("*.bin filter=lfs\n*.dat eol=crlf\n");
+        assert_eq!(
+            r.unknown.len(),
+            1,
+            "`filter=lfs` is not implemented here and must be recorded, got {:?}",
+            r.unknown
+        );
+        assert!(
+            r.unknown[0].contains("filter=lfs") && r.unknown[0].contains("*.bin"),
+            "the record must name both the pattern and the token, got {:?}",
+            r.unknown
+        );
+        // The rule that IS understood still applies: one unknown token must not discard the line.
+        assert_eq!(plan_for(&r, "x.dat").checkout, Some(Eol::Crlf));
     }
 }

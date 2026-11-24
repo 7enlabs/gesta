@@ -547,4 +547,29 @@ mod tests {
         assert_eq!(back.get("s3.access_key").map(|s| s.as_str()), Some("v1"));
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[test]
+    fn a_malformed_store_line_names_its_number_and_not_its_content() {
+        // #68: the error printed the offending line, which is decrypted plaintext from the store. If a
+        // stored value ever spanned lines - a PEM key is the obvious case - the continuation line
+        // landed verbatim in stderr, shell history, CI logs and agent transcripts. The one diagnostic
+        // a broken secrets file could give was the material the file exists to protect.
+        let secret = "-----BEGIN PRIVATE KEY-----";
+        let text = format!("good=one\n{secret}\nother=two\n");
+        let err = match parse(&text) {
+            Ok(_) => panic!("a line with no equals sign must fail, not be skipped"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            !err.contains(secret),
+            "the error must not contain the line, got: {err}"
+        );
+        assert!(
+            !err.contains("BEGIN PRIVATE KEY"),
+            "no fragment of the line may leak, got: {err}"
+        );
+        assert!(
+            err.contains("line at 2"),
+            "it must still say where to look, got: {err}"
+        );
+    }
 }

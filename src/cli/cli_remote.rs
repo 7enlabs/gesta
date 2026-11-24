@@ -2192,6 +2192,16 @@ pub fn cmd_attributes_why(path: &str, json: bool) -> ZResult<()> {
                     None => crate::support::json::Json::Null,
                 },
             ),
+            (
+                "unimplemented",
+                crate::support::json::Json::arr(
+                    rules
+                        .unknown
+                        .iter()
+                        .map(|u| crate::support::json::Json::str(u.clone()))
+                        .collect(),
+                ),
+            ),
         ]);
         return Ok(());
     }
@@ -2227,6 +2237,21 @@ pub fn cmd_attributes_why(path: &str, json: bool) -> ZResult<()> {
     }
     if let Some(src) = &rules.source {
         println!("  {} rule(s) from {}", rules.rules.len(), src);
+    }
+    // A rule that did nothing used to be indistinguishable from one that worked (#92): the token fell
+    // through `_ => continue` and the file kept whatever the broad rule gave it. Naming the tokens is
+    // the whole difference between "your `!eol` is honoured" and "your `!eol` was ignored".
+    if !rules.unknown.is_empty() {
+        println!(
+            "  {} attribute(s) this build does not implement, so they did nothing:",
+            rules.unknown.len()
+        );
+        for u in &rules.unknown {
+            match u.split_once('\t') {
+                Some((pattern, token)) => println!("    {} {}", pattern, token),
+                None => println!("    {}", u),
+            }
+        }
     }
     Ok(())
 }
