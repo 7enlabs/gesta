@@ -177,7 +177,7 @@ def main() -> int:
         # still shows a ratio, which is how much of every row is startup.
         print("each figure is a whole command, so it includes process startup.")
         print("read the grep row as the startup floor: whatever it shows is in every other row.")
-        print("bench/merge_base_cost.py takes startup out and reports the walk alone.")
+        print("the ancestry walk is covered by a statement-count test, not a timer.")
         return 0
     finally:
         shutil.rmtree(base, ignore_errors=True)

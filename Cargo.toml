@@ -15,7 +15,7 @@ path = "src/main.rs"
 # `backup` gives a consistent snapshot of a live database: `VACUUM INTO` would work too, but the
 # backup API takes a connection that is already open and reports progress, so a backup of a large
 # store can be interrupted and resumed rather than restarting from zero.
-rusqlite = { version = "0.43", features = ["bundled", "backup"] }
+rusqlite = { version = "0.43", features = ["bundled", "backup", "trace"] }
 clap = { version = "4.5", features = ["derive"] }
 sha2 = "0.10"
 hex = "0.4"

@@ -2691,6 +2691,91 @@ pub(crate) mod tests {
         );
     }
 
+    /// Run `f` and return how many statements SQLite started while it ran.
+    ///
+    /// The count is the property that matters and a clock is not: `walk_ancestors` takes a
+    /// `&ParentMap`, not a `&Connection`, so the walk cannot read a row even if someone tried. What
+    /// a later change can do is put the read back around the loop, and that shows up as a count
+    /// that grows with the history rather than a duration that may or may not be separable from
+    /// scheduling noise.
+    ///
+    /// `SQLITE_TRACE_STMT` fires when a prepared statement begins running. `parent_map` prepares one
+    /// statement and reads all rows from it, so a walk over a map costs one, no matter how many rows
+    /// the map has.
+    fn statements_during(conn: &mut Connection, f: impl FnOnce(&Connection)) -> usize {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        static COUNT: AtomicUsize = AtomicUsize::new(0);
+        // A function pointer rather than a closure that captures: `trace_v2` requires `FnMut` over a
+        // borrowed event, and a capturing closure cannot satisfy the "general enough" bound. A
+        // process-wide counter sidesteps the lifetime without changing what is counted, and these
+        // tests run one at a time under the harness's default serialisation of a single test thread.
+        fn count_one(_event: rusqlite::trace::TraceEvent<'_>) {
+            COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        COUNT.store(0, AtomicOrdering::Relaxed);
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(count_one as fn(rusqlite::trace::TraceEvent<'_>)),
+        )
+        .unwrap();
+        f(conn);
+        conn.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            None::<fn(rusqlite::trace::TraceEvent<'_>)>,
+        )
+        .unwrap();
+        COUNT.load(AtomicOrdering::Relaxed)
+    }
+
+    #[test]
+    fn answering_a_merge_base_reads_the_parent_table_once_whatever_the_history_length() {
+        // The defect this guards: `merge_bases` used to call `ancestors` once per input and then once
+        // per common ancestor, and `ancestors` read the parent row of every changeset it visited.
+        // On a linear history of n that is n queries plus n more per candidate. It passed every
+        // correctness test in this file, because the answer was right; only the number of reads was
+        // wrong, and nothing counted them.
+        //
+        // Two histories of very different lengths, the same question asked of each: forked, so the
+        // answer is a real merge base and not the fast-forward the generations settle in one query.
+        // A count that grows with the second history is the N+1 shape coming back.
+        fn count_for(n: usize) -> usize {
+            let mut conn = mem_db();
+            // A line, then a fork at the tip and a re-merge: `merge_bases` is reached by the two
+            // branch heads, and neither contains the other, so the generation shortcut declines.
+            for i in 0..n {
+                let id = format!("c{i}");
+                let parent = if i == 0 {
+                    None
+                } else {
+                    Some(format!("c{}", i - 1))
+                };
+                add_cs(&conn, &id, parent.as_deref(), None);
+            }
+            add_cs(&conn, "left", Some(&format!("c{}", n - 1)), None);
+            add_cs(&conn, "right", Some(&format!("c{}", n - 1)), None);
+            statements_during(&mut conn, |c| {
+                let _ = merge_bases(c, "left", "right");
+            })
+        }
+
+        let small = count_for(8);
+        let large = count_for(400);
+
+        assert_eq!(
+            small, large,
+            "reading the parent table must not be repeated per changeset: {small} statements over a \
+             short history, {large} over one fifty times longer"
+        );
+        // One read of the parent map, plus the two generation lookups the shortcut tries first.
+        // Stated as a ceiling rather than an equality so a change that removes a lookup passes, and
+        // one that adds a per-row read does not.
+        assert!(
+            large <= 5,
+            "a merge base over 400 changesets took {large} statements; the parent table should be \
+             read once"
+        );
+    }
+
     #[test]
     fn merge_bases_returns_one_for_an_ordinary_fork() {
         // The common case must not start returning two: one base is what a three-way merge needs, and

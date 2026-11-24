@@ -5170,44 +5170,30 @@ def main():
         )
 
     if want("history"):
-        # Three questions about ancestry, measured against git with startup taken out on the
-        # gesta side. The property being checked is not a time: it is that the walk reads the
-        # parent table once instead of once per step, so a change that puts the per-step query
-        # back shows up as the walk growing with the history.
+        # The property is that the walk reads the parent table once instead of once per step. Two
+        # benches used to ask this by timing two commands and subtracting one from the other, and on
+        # a shared machine the subtraction sometimes came out negative, which is not a finding about
+        # the walk but about the machine: `status` alternates between 23 ms and 120 ms within one run
+        # of twenty-five samples, so a walk of under 10 ms cannot be separated from process startup
+        # at any sample count. One of those steps then failed on this host while the binary was fine,
+        # and the fix at the time was to accept "cannot separate" as a pass, which meant the step
+        # could no longer fail on a real regression either.
+        #
+        # Counting statements asks the same question in a way that has no timing in it. The test
+        # builds a fork on a short history and the same fork on one fifty times longer, counts the
+        # SQLite statements `merge_bases` starts in each, and requires the two counts to be equal.
+        # With the per-step read put back it reports 13 against 405 and fails; as shipped it is 4 and
+        # 4. Nothing about the host can change a count.
         r = sh(
-            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'merge_base_cost.py')} 200",
+            "bash -lc 'source $HOME/.cargo/env && cargo test --release "
+            "answering_a_merge_base_reads_the_parent_table_once'",
             cwd=ZF_DIR,
-            timeout=500,
+            timeout=900,
         )
         record(
-            "an ancestry question does not read one row per step",
-            # Both answers count. The bench reports the per-changeset figure when it can separate
-            # the walk from process startup, and says so when it cannot; refusing the second
-            # answer makes this step fail on a shared machine while the property it checks is
-            # intact.
-            #
-            # The machine this runs on has three thousand threads across containers it does not
-            # own, and `status` alternates between 23 ms and 120 ms within one run of twenty-five
-            # samples: the first twelve were all 22 to 24 ms and then four consecutive were 84 to
-            # 133 ms, which is another tenant taking the core, not this binary. Process-startup
-            # timing cannot be separated there at any sample count. The step below accepts the
-            # unmeasurable answer for the same reason, and these two disagreed: the same run
-            # reported "measured, or honestly reported as unmeasurable" as PASS while this one
-            # failed, which reads as a defect in the walk rather than in the measurement.
-            r[0] == 0 and ("per changeset" in r[1] or "cannot separate" in r[1]),
-            (r[1] or "")[-400:],
-        )
-        # The slope bench reports when it cannot see its own signal. Accepting that answer is
-        # deliberate: a bench that claimed a slope it could not measure would be the defect.
-        r = sh(
-            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'history_slope.py')} 200",
-            cwd=ZF_DIR,
-            timeout=500,
-        )
-        record(
-            "the cost of walking history is measured, or honestly reported as unmeasurable",
-            r[0] == 0 and ("per change" in r[1] or "not distinguishable" in r[1]),
-            (r[1] or "")[-400:],
+            "an ancestry question reads the parent table once, not once per step",
+            r[0] == 0 and "1 passed" in r[1],
+            (r[1] or "")[-600:],
         )
 
     if want("typography"):

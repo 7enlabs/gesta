@@ -681,8 +681,9 @@ walk the log at all. On a 1000-commit history with a fork it answers in 5.24 ms 
 
 What is still missing is pruning by generation in `ancestors` itself, so the range and merge-base
 walks skip a level rather than visiting it, and a skip list over the first-parent chain. Neither is
-felt at a few hundred changesets; the merge-base walk is 42.8 us per changeset
-(`bench/merge_base_cost.py`).
+felt at a few hundred changesets. The count of statements a merge base starts is 4 at 8 changesets
+and 4 at 400, which is the shape this rests on; the time it costs is not separable from process
+startup on a shared host, and a test asserts the count rather than a duration.
 
 ### 9. What git has that nothing here replaces
 

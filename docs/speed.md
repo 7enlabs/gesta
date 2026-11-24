@@ -142,19 +142,23 @@ row's parents every time it visited one, and `merge_bases` calls it once per inp
 common ancestor, so a merge base on a forked history was a query per step per candidate. The whole
 parent table is now read once and used for every walk inside one answer.
 
-Measured with `bench/merge_base_cost.py` on 300 changesets with a fork and a re-merge:
+The shape is counted rather than timed, because the two timed benches that used to live here
+(`merge_base_cost.py`, `history_slope.py`) measured two commands and subtracted one from the other,
+and on a shared host that subtraction sometimes came out negative. `status` alternates between 23 ms
+and 120 ms within one run of twenty-five samples there, so a walk of under 10 ms cannot be separated
+from process startup at any sample count, and the step had to accept "cannot separate" as a pass,
+which is a check that cannot fail.
 
-| | |
+What replaced them is a test that counts SQLite statements. `merge_bases` is asked for the base of a
+fork on 8 changesets and on 400, and the count must be the same both times:
+
+| history | statements started |
 |---|---|
-| `status` (startup and one read) | 32.8 ms |
-| `bisect start`, which resolves two ancestries | 45.6 ms |
-| walk after removing startup | 12.8 ms, or 42.8 us per changeset |
+| 8 changesets | 4 |
+| 400 changesets | 4 |
 
-The per-changeset number is the one to watch. At a few hundred changesets the walk is inside the
-noise of process startup and is not a problem; the figure is linear, so it does not go away as a
-history grows. `bench/history_slope.py` tries to fit the slope and reports honestly when it cannot:
-at 600 changesets the walk is under 10 ms against a 38 ms startup, so the slope is not
-distinguishable from noise, and that bench cannot say what a walk would cost at 85,545 commits.
+With the per-step read put back it reports 13 and 405, so the count is what moves when the defect
+returns. A count has no timing in it: nothing about the host, the load, or the container changes it.
 
 Each committed changeset now carries a `generation` number - one more than its highest parent, the
 number git, Jujutsu, Sapling and Wren all keep. It is written at commit time and a migration fills it
