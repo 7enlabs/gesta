@@ -40,7 +40,7 @@ pub struct Pushed {
 /// The layout is `magic salt nonce ciphertext`, all hex after the magic, which is what makes the file
 /// a text file: it can be pasted, diffed and stored in a place that only takes strings. A binary
 /// format would be smaller and would be a second thing to parse on restore.
-pub fn seal(plain: &[u8], passphrase: &str) -> ZResult<Vec<u8>> {
+pub fn seal(mut plain: Vec<u8>, passphrase: &str) -> ZResult<Vec<u8>> {
     use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
     use ring::rand::{SecureRandom, SystemRandom};
 
@@ -66,19 +66,34 @@ pub fn seal(plain: &[u8], passphrase: &str) -> ZResult<Vec<u8>> {
     let key = LessSafeKey::new(unbound);
     let nonce = Nonce::assume_unique_for_key(nonce_bytes);
 
-    let mut buf = plain.to_vec();
-    key.seal_in_place_append_tag(nonce, Aad::empty(), &mut buf)
+    // The ciphertext is built in the buffer the caller already owns, not encoded into another one
+    // (#90).
+    //
+    // The old shape held roughly four copies of the repository at once: `plain` from disk, `buf`
+    // from `plain.to_vec()`, the hex string (twice the size of `buf`, because hex is two characters
+    // per byte), and `out` holding a third copy of everything. A 2 GiB repository wanted 2 + 2 + 4 +
+    // 4 GiB to upload. Now there are two: the caller's `plain`, which becomes the ciphertext in
+    // place, and `out`. That is why `plain` is taken by value - to reuse the allocation rather than
+    // prove it is not modified.
+    //
+    // The two header lines stay hex: they are 40 bytes and readable in a `head` of the file. The body
+    // is raw bytes. `unseal` reads the file as bytes, so a text body bought nothing.
+    key.seal_in_place_append_tag(nonce, Aad::empty(), &mut plain)
         .map_err(|_| bad("sealing the backup failed".to_string()))?;
 
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(plain.len() + 128);
     out.extend_from_slice(MAGIC.as_bytes());
-    out.push(b'\n');
+    out.extend_from_slice(b"\nRAW\n");
     out.extend_from_slice(hex::encode(salt).as_bytes());
     out.push(b'\n');
     out.extend_from_slice(hex::encode(nonce_bytes).as_bytes());
     out.push(b'\n');
-    out.extend_from_slice(hex::encode(&buf).as_bytes());
-    out.push(b'\n');
+    // The body's length, then the body. Without the length a reader cannot tell an appended byte from
+    // a legitimately longer ciphertext: the tag still refuses to open it, but the message it gives -
+    // "wrong passphrase, or truncated or edited" - points at the passphrase, which is the wrong place
+    // to look. #69 asked for trailing data to be *named*, and a length is what names it.
+    out.extend_from_slice(format!("{}\n", plain.len()).as_bytes());
+    out.extend_from_slice(&plain);
     Ok(out)
 }
 
@@ -89,32 +104,74 @@ pub fn seal(plain: &[u8], passphrase: &str) -> ZResult<Vec<u8>> {
 pub fn unseal(sealed: &[u8], passphrase: &str) -> ZResult<Vec<u8>> {
     use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 
-    let text = std::str::from_utf8(sealed).map_err(|_| {
-        bad("the sealed backup is not text, so it is not a gesta backup".to_string())
-    })?;
-    let mut lines = text.lines();
-    let magic = lines.next().unwrap_or("");
-    if magic != MAGIC {
+    // Two layouts, distinguished by the marker the new writer emits (#90). `RAW` means the body is
+    // ciphertext bytes; anything else is the old all-hex form, which is still accepted because a
+    // backup written last week is exactly the file somebody needs to read today. The old form carried
+    // the whole repository twice - once as bytes, once as a hex string twice their size - which is
+    // why new backups do not use it.
+    let head_len = MAGIC.len() + 1;
+    if sealed.len() < head_len || &sealed[..MAGIC.len()] != MAGIC.as_bytes() {
         return Err(bad(format!(
             "the file does not start with {MAGIC}, so it is not a sealed gesta backup"
         )));
     }
-    let salt = hex::decode(lines.next().unwrap_or(""))
-        .map_err(|_| bad("the salt is not valid hex".to_string()))?;
-    let nonce_bytes = hex::decode(lines.next().unwrap_or(""))
-        .map_err(|_| bad("the nonce is not valid hex".to_string()))?;
-    let mut ct = hex::decode(lines.next().unwrap_or(""))
-        .map_err(|_| bad("the ciphertext is not valid hex".to_string()))?;
+    let rest = &sealed[head_len..];
 
-    // Nothing may follow the ciphertext (#69). Four lines are the whole format, so a fifth is
-    // either corruption or a file that had something appended, and a reader that stops after the
-    // fields it wants treats both as a valid backup. Appended data is evidence, not padding.
-    if lines.next().is_some() {
-        return Err(bad(
-            "the sealed backup has data after the ciphertext; it may have been appended to"
-                .to_string(),
-        ));
-    }
+    let (salt, nonce_bytes, mut ct) = if rest.starts_with(b"RAW\n") {
+        // magic \n RAW \n <hex salt> \n <hex nonce> \n <length> \n <raw ciphertext>
+        let body = &rest[4..];
+        let mut parts = body.splitn(4, |b| *b == b'\n');
+        let salt = hex::decode(parts.next().unwrap_or(b""))
+            .map_err(|_| bad("the salt is not valid hex".to_string()))?;
+        let nonce = hex::decode(parts.next().unwrap_or(b""))
+            .map_err(|_| bad("the nonce is not valid hex".to_string()))?;
+        let declared: usize = std::str::from_utf8(parts.next().unwrap_or(b""))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .ok_or_else(|| bad("the sealed backup does not declare its body length".to_string()))?;
+        let ct = parts
+            .next()
+            .ok_or_else(|| bad("the sealed backup ends after the length".to_string()))?;
+        // Nothing may follow the ciphertext (#69), and now it is countable rather than inferred. A
+        // body longer than declared is an append; shorter is a truncation. Both are named here, before
+        // the tag check, so the reader is not told to check the passphrase for a file that was edited.
+        if ct.len() > declared {
+            return Err(bad(format!(
+                "the sealed backup has {} byte(s) after the ciphertext; it may have been appended to",
+                ct.len() - declared
+            )));
+        }
+        if ct.len() < declared {
+            return Err(bad(format!(
+                "the sealed backup is {} byte(s) shorter than it declares; it was truncated",
+                declared - ct.len()
+            )));
+        }
+        (salt, nonce, ct.to_vec())
+    } else {
+        // The old layout: four lines, every field hex.
+        let text = std::str::from_utf8(rest).map_err(|_| {
+            bad("the sealed backup is not text, so it is not a gesta backup".to_string())
+        })?;
+        let mut lines = text.lines();
+        let salt = hex::decode(lines.next().unwrap_or(""))
+            .map_err(|_| bad("the salt is not valid hex".to_string()))?;
+        let nonce = hex::decode(lines.next().unwrap_or(""))
+            .map_err(|_| bad("the nonce is not valid hex".to_string()))?;
+        let ct = hex::decode(lines.next().unwrap_or(""))
+            .map_err(|_| bad("the ciphertext is not valid hex".to_string()))?;
+
+        // Nothing may follow the ciphertext (#69). A fifth line is either corruption or a file
+        // something was appended to, and a reader that stops after the fields it wants treats both as
+        // a valid backup. Appended data is evidence, not padding.
+        if lines.next().is_some() {
+            return Err(bad(
+                "the sealed backup has data after the ciphertext; it may have been appended to"
+                    .to_string(),
+            ));
+        }
+        (salt, nonce, ct)
+    };
 
     if nonce_bytes.len() != NONCE_LEN {
         return Err(bad("the nonce has the wrong length".to_string()));
@@ -197,7 +254,10 @@ pub fn push(
     // Gone before the sealed bytes go anywhere near the network.
     let _ = std::fs::remove_dir_all(&tmp_dir);
 
-    let sealed = seal(&plain, passphrase)?;
+    // The length is taken before the buffer is handed over: `seal` reuses the allocation, so the
+    // plaintext is not there to measure afterwards.
+    let plain_bytes = plain.len() as u64;
+    let sealed = seal(plain, passphrase)?;
     let stamp = utc_stamp(std::time::SystemTime::now());
     let key = format!("{}/gesta-{}.bak", prefix.trim_end_matches('/'), stamp);
 
@@ -210,7 +270,7 @@ pub fn push(
 
     Ok(Pushed {
         key,
-        plain_bytes: plain.len() as u64,
+        plain_bytes,
         sealed_bytes: sealed.len() as u64,
         changesets: report.changesets,
         objects: report.objects,
@@ -449,7 +509,7 @@ mod tests {
         // #69, the other half: `unseal` took four lines and ignored the rest, so a backup with
         // garbage appended after the ciphertext still opened.
         let plain = b"not a real store".to_vec();
-        let sealed = seal(&plain, "passphrase").unwrap();
+        let sealed = seal(plain.clone(), "passphrase").unwrap();
         let mut extended = sealed.clone();
         extended.extend_from_slice(b"\nappended garbage\n");
         let err = unseal(&extended, "passphrase").unwrap_err().to_string();
@@ -459,5 +519,59 @@ mod tests {
         );
         // The untouched seal still opens.
         assert_eq!(unseal(&sealed, "passphrase").unwrap(), plain);
+    }
+    #[test]
+    fn a_sealed_backup_is_not_twice_its_own_size() {
+        // #90: the old `seal` held four copies of the repository at once - `plain`, `buf` from
+        // `to_vec`, the hex string at twice the size of `buf`, and `out` holding all of it again - so
+        // a 2 GiB store wanted 12 GiB to upload. The hex body is what made it worse than double.
+        //
+        // The measurement is the ratio of the sealed file to the plaintext. AEAD adds one tag, and
+        // the header is two hex lines, so a correct format lands just over 1.0x. The old one was over
+        // 2.0x, which is the number this asserts against.
+        let plain = vec![0x42u8; 64 * 1024];
+        let n = plain.len();
+        let sealed = seal(plain, "a passphrase for this test").unwrap();
+        let ratio = sealed.len() as f64 / n as f64;
+        assert!(
+            ratio < 1.05,
+            "a sealed backup took {ratio:.2}x its plaintext ({n} bytes in, {} out); a hex body is \
+             the reason it used to be over 2x, and the memory to build it was four copies",
+            sealed.len()
+        );
+        // And it still opens, which is the only thing the size is worth anything for.
+        let back = unseal(&sealed, "a passphrase for this test").unwrap();
+        assert_eq!(back, vec![0x42u8; 64 * 1024]);
+    }
+
+    #[test]
+    fn a_backup_in_the_old_hex_format_still_opens() {
+        // The new layout must not strand the backups written before it. A backup from last week is
+        // exactly the file somebody needs to read today, so the all-hex form is still accepted.
+        use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
+        let passphrase = "a passphrase for this test";
+        let plain = b"the old body".to_vec();
+        let salt = [7u8; SALT_LEN];
+        let nonce_bytes = [9u8; NONCE_LEN];
+        let key_bytes = crate::support::secrets::derive_key(passphrase, &salt);
+        let key = LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, &key_bytes).unwrap());
+        let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+        let mut ct = plain.clone();
+        key.seal_in_place_append_tag(nonce, Aad::empty(), &mut ct)
+            .unwrap();
+
+        // The old writer's exact output: magic, then three hex lines.
+        let old = format!(
+            "{}\n{}\n{}\n{}\n",
+            MAGIC,
+            hex::encode(salt),
+            hex::encode(nonce_bytes),
+            hex::encode(&ct)
+        );
+        let back = unseal(old.as_bytes(), passphrase).unwrap();
+        assert_eq!(
+            back, plain,
+            "a backup written in the old hex layout must still open"
+        );
     }
 }
