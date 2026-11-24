@@ -2682,6 +2682,41 @@ fn table_exists(conn: &Connection, name: &str) -> ZResult<bool> {
     Ok(n > 0)
 }
 
+/// Count the SQLite statements `f` runs against `conn`.
+///
+/// `write-flat`'s property is about `commit_one`, which lives in `repo`, so that count test has to be
+/// written there. Exposing one counter beats copying it: two copies means two places to get the
+/// `trace_v2` signature wrong, and they drift.
+///
+/// `SQLITE_TRACE_STMT` fires when a prepared statement begins running, so a prepared-and-reused
+/// statement counts once per execution - which is the quantity the claim is about.
+#[cfg(test)]
+pub(crate) fn statements_during_for_test(
+    conn: &mut Connection,
+    f: impl FnOnce(&Connection),
+) -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    // A `fn` item, not a capturing closure: `trace_v2` wants `FnMut` over a borrowed event and a
+    // capturing closure fails the "general enough" bound.
+    fn count_one(_event: rusqlite::trace::TraceEvent<'_>) {
+        COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+    COUNT.store(0, AtomicOrdering::Relaxed);
+    conn.trace_v2(
+        rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+        Some(count_one as fn(rusqlite::trace::TraceEvent<'_>)),
+    )
+    .unwrap();
+    f(conn);
+    conn.trace_v2(
+        rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+        None::<fn(rusqlite::trace::TraceEvent<'_>)>,
+    )
+    .unwrap();
+    COUNT.load(AtomicOrdering::Relaxed)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

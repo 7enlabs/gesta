@@ -3849,4 +3849,65 @@ pub(crate) mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
     }
+    #[test]
+    fn committing_one_edit_reads_the_parent_table_once_whatever_the_tree_size() {
+        // The gate step `write-flat` timed `changeset commit` at 200 and 2000 files and failed about
+        // one run in three on 52 -> 184 ms, which is the host: the same probe measured 36 to 148 ms
+        // for the *identical* size across runs (see A56). A commit that walked the tree per file would
+        // show up as a statement count growing with the tree, and a count does not move when the
+        // machine is busy.
+        //
+        // What the claim is: the cost of a write follows the change, not the tree. So the number of
+        // statements a one-file commit runs must not depend on how many files the tree holds.
+        fn count_commit(files: usize) -> usize {
+            let d = std::env::temp_dir().join(format!(
+                "gesta-write-flat-{}-{}",
+                files,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(d.join(".gesta")).unwrap();
+            let mut conn = crate::store::open_db(&d).unwrap();
+            crate::store::init_schema(&conn).unwrap();
+            crate::store::migrate(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO branches(name, head, created_at, from_branch) VALUES('main', NULL, 0, NULL)",
+                [],
+            )
+            .unwrap();
+
+            for i in 0..files {
+                std::fs::write(d.join(format!("f{i}.txt")), format!("file {i}\n")).unwrap();
+            }
+            let seed = crate::repo::create_changeset(&conn, &d, "seed", "b")
+                .unwrap()
+                .expect("a fresh tree has files to record");
+            crate::repo::commit_one(&conn, &seed.id).unwrap();
+
+            // One edit, then commit through the traced connection.
+            std::fs::write(d.join("f0.txt"), "changed\n").unwrap();
+            let cs = crate::repo::create_changeset(&conn, &d, "edit", "b")
+                .unwrap()
+                .expect("one changed file is a changeset");
+            let id = cs.id.clone();
+            let n = crate::store::statements_during_for_test(&mut conn, |c| {
+                crate::repo::commit_one(c, &id).unwrap();
+            });
+            let _ = std::fs::remove_dir_all(&d);
+            n
+        }
+
+        let small = count_commit(20);
+        let large = count_commit(400);
+        assert_eq!(
+            small, large,
+            "committing one edit ran {small} statements over 20 files and {large} over 400: the \
+             write is reading the tree again"
+        );
+        // A ceiling, so the reader knows what correct looks like rather than only that the two agree.
+        assert!(
+            large <= 60,
+            "a one-file commit took {large} statements, which is a per-file walk"
+        );
+    }
 }

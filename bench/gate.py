@@ -3183,60 +3183,19 @@ def main():
             f"carol recorded {whole_paths}",
         )
 
-    if want("write-flat"):
-        # The claim is that a write costs what the change costs. This checks the shape at two sizes
-        # that the gate can afford, not the 100000 file point, which takes about fifteen minutes.
-        import tempfile as _tf
-
-        measured = []
-        for n in (200, 2000):
-            d = _tf.mkdtemp(prefix=f"gate-flat-{n}-")
-            sh(f"{ZF} init", cwd=d)
-            for i in range(n):
-                with open(os.path.join(d, f"f{i}.txt"), "w") as fh:
-                    fh.write(f"file {i}\n")
-            out = sh_out(f'{ZF} changeset create "seed" --author b --json', cwd=d)[1]
-            seed = _jsonw(out).get("changeset") if _jsonw(out) else None
-            if seed:
-                sh(f"{ZF} changeset commit {seed}", cwd=d)
-            import time as _t
-            vals = []
-            for k in range(7):
-                with open(os.path.join(d, f"f0.txt"), "a") as fh:
-                    fh.write(f"{k}\n")
-                out = sh_out(f'{ZF} changeset create "w{k}" --author b --json', cwd=d)[1]
-                cid = _jsonw(out).get("changeset") if _jsonw(out) else None
-                if cid:
-                    t0 = _t.perf_counter()
-                    sh(f"{ZF} changeset commit {cid}", cwd=d)
-                    vals.append((_t.perf_counter() - t0) * 1000)
-            # The first commit of a freshly built tree pays for a cold page cache on the database
-            # and the binary; measured 117 ms against a warm 34 ms on the same tree. The median of
-            # three could therefore be the cold value, and did fail this step one run in three
-            # while a manual run showed the same 33 to 36 ms shape the step is asserting. Seven
-            # samples, dropping the slowest, keeps a genuinely growing walk visible and stops the
-            # measurement from reporting the cache.
-            vals.sort()
-            if len(vals) > 3:
-                vals = vals[:-1]
-            measured.append((n, vals[len(vals) // 2] if vals else None))
-            import shutil as _sh_wf
-
-            _sh_wf.rmtree(d, ignore_errors=True)
-
-        small, large = measured[0][1], measured[-1][1]
-        record(
-            "a commit can be timed at two tree sizes",
-            small is not None and large is not None,
-            f"{small} ms at 200 files, {large} ms at 2000",
-        )
-        if small and large:
-            ratio = large / small
-            record(
-                "and the write does not follow the size of the tree",
-                ratio <= 2.0,
-                f"{ratio:.2f}x for 10x the files ({small:.1f} -> {large:.1f} ms)",
-            )
+    # `write-flat` used to time `changeset commit` at 200 and 2000 files and assert the ratio was
+    # under 2.0. It failed about one run in three on an idle container, because the number it measured
+    # was the host: the same commit at the identical size read 36 ms and 148 ms on consecutive runs.
+    # Raising the sample count and switching the estimator to a minimum did not fix it, because the
+    # quantity was never separable on this machine.
+    #
+    # The claim is "the cost of a write follows the change, not the tree", and that is a count, not a
+    # duration: a commit that walks the tree runs more SQL. `repo::tests::
+    # committing_one_edit_reads_the_parent_table_once_whatever_the_tree_size` counts the statements a
+    # one-file commit runs at 20 and at 400 files, asserts they are equal, and asserts a ceiling of 60.
+    # Measured 34 statements at both sizes. A count does not move when the machine is busy, and it
+    # fails on the code rather than on the load. The step is gone rather than loosened: two checks of
+    # one property means the flaky one still fails the gate.
 
     if want("status-ratio"):
         # The comparison to git is the project's headline claim, and it was once assembled out of two
