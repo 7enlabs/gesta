@@ -103,7 +103,11 @@ pub fn import(conn: &Connection, git_root: &Path, prefix: Option<&str>) -> ZResu
                 let mut map = HashMap::new();
                 for (path, (git_hash, _mode)) in flatten(&repo, &pc.tree, "", prefix)? {
                     let body = repo.read_object(&git_hash)?;
-                    let ours = store::hash_content(&String::from_utf8_lossy(&body.body));
+                    // Raw bytes, the same bytes `put_object_bytes` stores below. Hashing the lossy
+                    // string gave every binary file a hash of the replacement characters, so two
+                    // different images with the same invalid sequences hashed alike, and the
+                    // comparison against `old_now` agreed with a lie.
+                    let ours = store::hash_bytes(&body.body);
                     map.insert(path, ours);
                 }
                 map
@@ -176,15 +180,23 @@ pub fn import(conn: &Connection, git_root: &Path, prefix: Option<&str>) -> ZResu
             // own hash. When the object is absent the pointer is stored as the text it is, which
             // keeps the round trip lossless and leaves the missing object visible rather than
             // inventing bytes for it.
+            // Raw bytes, not a lossy string. `put_object` took `&str`, so every imported blob went
+            // through `from_utf8_lossy`: each invalid byte became U+FFFD and the object stored was
+            // not the file. Export wrote the corrupted bytes back out, and because the parent-tree
+            // hash was lossy too the round trip compared equal - the corruption was consistent and
+            // therefore invisible. A PNG, an archive or an executable imported as a file of question
+            // marks.
             let our_hash = match crate::transport::lfs::Pointer::parse(&body.body) {
                 Some(pointer) => match crate::store::sidecar::read(
                     &crate::store::root_of(conn).unwrap_or_default(),
                     &pointer.oid,
                 ) {
-                    Some(bytes) => store::put_object(conn, &String::from_utf8_lossy(&bytes))?,
-                    None => store::put_object(conn, &String::from_utf8_lossy(&body.body))?,
+                    // The sidecar holds the real bytes a pointer stands for; those are what the
+                    // object has to be.
+                    Some(bytes) => store::put_object_bytes(conn, &bytes)?,
+                    None => store::put_object_bytes(conn, &body.body)?,
                 },
-                None => store::put_object(conn, &String::from_utf8_lossy(&body.body))?,
+                None => store::put_object_bytes(conn, &body.body)?,
             };
             old_now.insert(path.clone(), our_hash.clone());
             if parent_tree.get(path) == Some(&our_hash) {
@@ -1056,6 +1068,99 @@ mod tests {
         let base_id = id_of(&base);
         let _ = base_id;
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn make_git_repo_with_binary(root: &std::path::Path) -> Vec<u8> {
+        // Bytes that are not valid UTF-8 and not valid Latin-1 either: a real PNG header plus bytes
+        // that `from_utf8_lossy` turns into replacement characters.
+        let payload: Vec<u8> = vec![
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0xFF, 0xFE,
+            0x80, 0x81, 0xC0, 0xC1, 0x00, 0x01,
+        ];
+        let git = root.join(".git");
+        std::fs::create_dir_all(git.join("objects")).unwrap();
+        std::fs::create_dir_all(git.join("refs/heads")).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let repo = Repo::open(root).unwrap();
+
+        let blob = repo.write_object(Kind::Blob, &payload).unwrap();
+        let tree = repo
+            .write_object(
+                Kind::Tree,
+                &gitobj::build_tree_with(
+                    vec![Entry {
+                        mode: "100644".into(),
+                        name: "logo.png".into(),
+                        hash: blob,
+                    }],
+                    HashKind::Sha1,
+                ),
+            )
+            .unwrap();
+        let c1 = repo
+            .write_object(
+                Kind::Commit,
+                &gitobj::build_commit(&tree, &[], "T", "t@e.st", 100, "+0000", "img\n"),
+            )
+            .unwrap();
+        repo.write_ref("refs/heads/main", &c1).unwrap();
+        payload
+    }
+
+    #[test]
+    fn a_binary_file_imports_byte_for_byte() {
+        // #179: every imported blob went through `String::from_utf8_lossy` before `put_object`, so
+        // each invalid byte became U+FFFD. Export wrote the replacement characters back out. The
+        // round trip compared equal because the parent-tree hash was lossy in the same way, which is
+        // why this survived: the corruption was consistent and therefore invisible.
+        let d = temp("binary");
+        let original = make_git_repo_with_binary(&d);
+
+        let conn = crate::store::tests::mem_db();
+        import(&conn, &d, None).unwrap();
+
+        let head: String = conn
+            .query_row(
+                "SELECT cs.id FROM branches b JOIN changesets cs ON cs.id = b.head WHERE b.name = 'main'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let tree = crate::store::tree_at(&conn, &head).unwrap();
+        let (_, hash) = tree
+            .iter()
+            .find(|(p, _)| p == "logo.png")
+            .unwrap_or_else(|| panic!("logo.png is not in the imported tree: {tree:?}"));
+
+        let stored = crate::store::get_object_bytes(&conn, hash).unwrap();
+        assert_eq!(
+            stored,
+            original,
+            "the imported object is not the file's bytes: {} vs {} bytes",
+            stored.len(),
+            original.len()
+        );
+        // And the hash is of those bytes, not of a lossy string.
+        assert_eq!(*hash, crate::store::hash_bytes(&original));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn two_binaries_with_the_same_replacement_characters_stay_distinct() {
+        // The lossy hash made different files hash alike: 0x80 and 0x81 are both U+FFFD. Two images
+        // differing only in such bytes collapsed into one object.
+        assert_ne!(
+            crate::store::hash_bytes(&[0x80]),
+            crate::store::hash_bytes(&[0x81]),
+            "raw bytes must hash apart"
+        );
+        let lossy = String::from_utf8_lossy(&[0x80]);
+        let lossy2 = String::from_utf8_lossy(&[0x81]);
+        assert_eq!(
+            crate::store::hash_content(&lossy),
+            crate::store::hash_content(&lossy2),
+            "and this is the collision the lossy form had"
+        );
     }
 
     #[test]

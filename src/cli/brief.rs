@@ -114,9 +114,13 @@ pub fn brief(conn: &Connection, root: &Path) -> ZResult<Brief> {
         let mut is_stale = false;
         for row in rows {
             let (path, recorded) = row?;
+            // Raw bytes. The scan hashes binary files with `hash_bytes`, and recomputing here as
+            // `hash_content(lossy(bytes))` gave a different value whenever the file was not valid
+            // UTF-8, so a pending snapshot holding an image was always reported stale and never
+            // covered. `brief --fix` then dropped a snapshot that exactly described the disk.
             let on_disk = std::fs::read(root.join(&path))
                 .ok()
-                .map(|b| crate::store::hash_content(&String::from_utf8_lossy(&b)));
+                .map(|b| crate::store::hash_bytes(&b));
             if recorded != on_disk {
                 is_stale = true;
             } else {
@@ -641,5 +645,35 @@ mod tests {
         );
         assert_eq!(brief(&conn, &dir).unwrap().changed, 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn a_binary_file_in_a_pending_snapshot_is_not_stale() {
+        // #181: the scan hashes binary files over the raw bytes, and this recomputed the hash as
+        // `hash_content(lossy(bytes))`. For a file that is not valid UTF-8 the two differ, so a
+        // pending snapshot holding an image was always stale and never covered, and `brief --fix`
+        // dropped a snapshot that exactly described the disk.
+        let d = std::env::temp_dir().join(format!("zf-brief-bin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join(".gesta")).unwrap();
+        let conn = crate::store::tests::mem_db();
+
+        let payload: Vec<u8> = vec![0x89, 0x50, 0x4E, 0x47, 0xFF, 0xFE, 0x80];
+        std::fs::write(d.join("logo.bin"), &payload).unwrap();
+        let cs = crate::repo::create_changeset(&conn, &d, "img", "t")
+            .unwrap()
+            .expect("a new binary file is a changeset");
+
+        let b = brief(&conn, &d).unwrap();
+        assert!(
+            b.pending.contains(&cs.id),
+            "the snapshot should be pending, got {:?}",
+            b.pending
+        );
+        assert!(
+            !b.stale.contains(&cs.id),
+            "a snapshot that matches the disk must not be stale: {:?}",
+            b.stale
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

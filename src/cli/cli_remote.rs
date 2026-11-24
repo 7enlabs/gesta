@@ -871,8 +871,10 @@ pub fn cmd_fsck(prune: bool, worktree: bool) -> ZResult<()> {
                 }
                 match std::fs::read(root.join(path)) {
                     Ok(bytes) => {
-                        let content = String::from_utf8_lossy(&bytes);
-                        let got = crate::store::hash_content(&content);
+                        // Raw bytes. The head's hash came from `hash_bytes`, so hashing the lossy
+                        // string here reported every binary file as differing from the head: an
+                        // image always "differs", and fsck cried wolf about content that was fine.
+                        let got = crate::store::hash_bytes(&bytes);
                         if got != *hash {
                             println!(
                                 "WORKTREE {} differs from the head (disk {}..., history {}...)",

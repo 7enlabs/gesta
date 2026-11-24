@@ -184,7 +184,9 @@ pub(crate) fn pending_out_of_date(
             .optional()?
             .flatten();
         let on_disk = match std::fs::read(root.join(&path)) {
-            Ok(bytes) => Some(crate::store::hash_content(&String::from_utf8_lossy(&bytes))),
+            // The same recomputation as `brief`, and the same bug: a lossy hash never matches what
+            // was recorded for a binary file, so the snapshot is always out of date.
+            Ok(bytes) => Some(crate::store::hash_bytes(&bytes)),
             Err(_) => None,
         };
         if recorded != on_disk {
