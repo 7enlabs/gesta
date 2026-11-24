@@ -9,6 +9,7 @@
 
 use rusqlite::params;
 use rusqlite::Connection;
+use rusqlite::OptionalExtension;
 
 use crate::ZResult;
 
@@ -21,6 +22,13 @@ pub fn set_protected(conn: &Connection, branch: &str, protected: bool) -> ZResul
     Ok(n > 0)
 }
 
+/// Whether a branch is protected.
+///
+/// A database error is an error, not "not protected" (#93). `.ok()` collapsed two different
+/// answers - "the store says this branch is not protected" and "the store could not be asked" -
+/// into the same `false`, so a branch whose protection could not be read was writable. A guard
+/// that fails open on the one path where it is needed is not a guard: the caller here is about to
+/// decide whether to refuse a destructive operation.
 pub fn is_protected(conn: &Connection, branch: &str) -> ZResult<bool> {
     let v: Option<i64> = conn
         .query_row(
@@ -28,7 +36,7 @@ pub fn is_protected(conn: &Connection, branch: &str) -> ZResult<bool> {
             params![branch],
             |r| r.get(0),
         )
-        .ok();
+        .optional()?;
     Ok(v.unwrap_or(0) != 0)
 }
 
@@ -105,4 +113,45 @@ pub fn check_push(conn: &Connection, branch: &str, changeset: &str, pusher: &str
     };
     // ZResult boxes its error, so the message is wrapped rather than returned directly.
     Err(crate::support::error::Error::new(crate::support::error::Code::Auth, why).into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn schema_only() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::store::init_schema(&conn).unwrap();
+        // `protected` arrives through `migrate`, not through the CREATE TABLE, so a fixture that
+        // only calls `init_schema` has a branches table with no such column.
+        crate::store::migrate(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn protection_that_cannot_be_read_is_an_error_not_a_no() {
+        // #93: `.ok()` turned "the store could not be asked" into `false`, so a branch whose
+        // protection was unreadable became writable - on the one path where the answer decides
+        // whether to refuse a destructive operation. A guard that fails open is not a guard.
+        let conn = schema_only();
+        conn.execute("DROP TABLE branches", []).unwrap();
+
+        match is_protected(&conn, "main") {
+            Ok(v) => {
+                panic!("the table is gone, yet is_protected answered {v}; that is failing open")
+            }
+            Err(e) => assert!(
+                e.to_string().contains("branches"),
+                "the error must name what could not be read, got: {e}"
+            ),
+        }
+    }
+
+    #[test]
+    fn a_branch_that_is_not_there_is_still_not_protected() {
+        // The other half: a missing row is a real answer, not an error, or every command against a
+        // branch that does not exist would fail here instead of reporting the branch.
+        let conn = schema_only();
+        assert!(!is_protected(&conn, "no-such-branch").unwrap());
+    }
 }

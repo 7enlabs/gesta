@@ -16,6 +16,57 @@ pub struct RepoSnapshot {
     pub tags: Vec<(String, String)>,
 }
 
+/// Escape a snapshot field so a tab or a newline in a name survives the round trip (#89).
+///
+/// `%` goes first, or `%09` in the input would decode back to a tab.
+fn escape(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for ch in v.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            '\t' => out.push_str("%09"),
+            '\n' => out.push_str("%0A"),
+            '\r' => out.push_str("%0D"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn unescape(v: &str) -> ZResult<String> {
+    let mut out = String::with_capacity(v.len());
+    let bytes = v.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return Err(bad(format!(
+                    "a snapshot field ends inside an escape: {v:?}"
+                )));
+            }
+            let hex = &v[i + 1..i + 3];
+            let ch = match hex {
+                "25" => '%',
+                "09" => '\t',
+                "0A" => '\n',
+                "0D" => '\r',
+                other => {
+                    return Err(bad(format!(
+                        "a snapshot field holds an escape this format does not define: %{other}"
+                    )))
+                }
+            };
+            out.push(ch);
+            i += 3;
+        } else {
+            let ch = v[i..].chars().next().unwrap_or('\u{0}');
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    Ok(out)
+}
+
 impl RepoSnapshot {
     pub fn capture(conn: &Connection) -> ZResult<RepoSnapshot> {
         let branches: Vec<(String, Option<String>)> = {
@@ -81,38 +132,88 @@ impl RepoSnapshot {
     }
 
     fn encode(&self) -> String {
-        let mut s = String::new();
-        s.push_str(&format!("B\t{}\n", self.current_branch));
+        // `V2` first, then every field escaped (#89). The first format wrote names raw into a
+        // tab-separated, line-based text, so a branch named with a tab or a newline produced a line
+        // that could not be parsed; `decode` then dropped it and `restore` deleted every branch it
+        // did not see. A branch is a name a person can type - `$'a\tb'` is a legal one - so the
+        // format has to carry it, not hope it does not appear.
+        let mut s = String::from("V2\n");
+        s.push_str(&format!("B\t{}\n", escape(&self.current_branch)));
         for (n, h) in &self.branches {
             s.push_str(&format!(
                 "R\t{}\t{}\n",
-                n,
-                h.clone().unwrap_or_else(|| "-".into())
+                escape(n),
+                h.as_deref().map(escape).unwrap_or_else(|| "-".into())
             ));
         }
         for (n, c) in &self.tags {
-            s.push_str(&format!("T\t{}\t{}\n", n, c));
+            s.push_str(&format!("T\t{}\t{}\n", escape(n), escape(c)));
         }
         s
     }
 
+    /// Decode a snapshot.
+    ///
+    /// A line this cannot read is an error, never a line to skip (#89). Skipping is what made the
+    /// old format dangerous: `restore` deletes every branch the snapshot does not name, so a branch
+    /// dropped here was a branch deleted - silently, by an undo the user asked for to get their work
+    /// back. `V2` is escaped and strict; anything else is read as V1, also strictly.
     fn decode(s: &str) -> ZResult<RepoSnapshot> {
+        let mut lines = s.lines();
+        let first = lines.next().unwrap_or("");
+        let escaped = first == "V2";
+        if !escaped && !first.starts_with('B') {
+            return Err(bad(format!(
+                "the operation snapshot does not start with a branch line or a V2 marker; the first \
+                 line is {:?}",
+                first
+            )));
+        }
+
         let mut snap = RepoSnapshot {
             branches: Vec::new(),
-            current_branch: "main".into(),
+            current_branch: String::new(),
             tags: Vec::new(),
         };
-        for line in s.lines() {
+        let mut saw_branch = false;
+        let all = if escaped {
+            lines.collect::<Vec<_>>()
+        } else {
+            std::iter::once(first).chain(lines).collect()
+        };
+        for line in all {
             let f: Vec<&str> = line.split('\t').collect();
+            let un = |v: &str| -> ZResult<String> {
+                if escaped {
+                    unescape(v)
+                } else {
+                    Ok(v.to_string())
+                }
+            };
             match f.as_slice() {
-                ["B", b] => snap.current_branch = b.to_string(),
-                ["R", n, h] => snap.branches.push((
-                    n.to_string(),
-                    if *h == "-" { None } else { Some(h.to_string()) },
-                )),
-                ["T", n, c] => snap.tags.push((n.to_string(), c.to_string())),
-                _ => {}
+                ["B", b] => {
+                    snap.current_branch = un(b)?;
+                    saw_branch = true;
+                }
+                ["R", n, h] => snap
+                    .branches
+                    .push((un(n)?, if *h == "-" { None } else { Some(un(h)?) })),
+                ["T", n, c] => snap.tags.push((un(n)?, un(c)?)),
+                other => {
+                    return Err(bad(format!(
+                        "the operation snapshot holds a line this cannot read ({} field(s): {:?});                          refusing rather than skipping it, because `restore` deletes every branch \
+                         the snapshot does not name",
+                        other.len(),
+                        line
+                    )));
+                }
             }
+        }
+        if !saw_branch {
+            return Err(bad(
+                "the operation snapshot has no current-branch line; defaulting it would silently \
+                 move the user onto a branch they were not on",
+            ));
         }
         Ok(snap)
     }
@@ -129,19 +230,54 @@ pub fn record(
     target: Option<&str>,
     detail: Option<&str>,
 ) -> ZResult<i64> {
-    let snap = RepoSnapshot::capture(conn)?;
-    let parent: Option<i64> = conn
+    // Every step inside one transaction (#86). Reading `MAX(id)` and inserting afterwards, on two
+    // connections, lets both read the same parent and insert under it, forking the chain `undo`
+    // walks by id order. Both snapshots survive, so this is not data loss - it is undo returning
+    // operations in an order that is not the order they happened, which is worse than an error
+    // because it looks like an answer.
+    // IMMEDIATE, not the deferred default (#86). Deferred takes the write lock only at the first
+    // write, so two records can both read `MAX(id)` under a shared lock and then both try to
+    // upgrade - which SQLite answers with `database is locked`, not with a wait. Measured: 8 threads
+    // x 5 records gave `DatabaseBusy` on every thread. IMMEDIATE takes the write lock up front, so
+    // the second caller waits and reads the parent the first one committed.
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let outcome = record_in(conn, kind, target, detail);
+    match outcome {
+        Ok(id) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(id)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+/// Record an operation inside a transaction the caller already holds.
+///
+/// A caller that is rewriting history (#85) has its own transaction open, and starting a second one
+/// on the same connection is an error, not a nested savepoint. This is the part that has to be
+/// inside the caller's transaction so the log entry and the change land together.
+pub fn record_in(
+    tx: &rusqlite::Connection,
+    kind: &str,
+    target: Option<&str>,
+    detail: Option<&str>,
+) -> ZResult<i64> {
+    let snap = RepoSnapshot::capture(tx)?;
+    let parent: Option<i64> = tx
         .query_row("SELECT MAX(id) FROM operations", [], |r| {
             r.get::<_, Option<i64>>(0)
         })
         .optional()?
         .flatten();
-    conn.execute(
+    tx.execute(
         "INSERT INTO operations(parent_op, kind, target, detail, snapshot, created_at)
          VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
         params![parent, kind, target, detail, snap.encode(), now()],
     )?;
-    Ok(conn.last_insert_rowid())
+    Ok(tx.last_insert_rowid())
 }
 
 pub struct Operation {
@@ -653,5 +789,139 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn two_records_at_once_do_not_fork_the_chain() {
+        // #86: `record` captured, read MAX(id) and inserted as three separate statements, so two
+        // concurrent records could read the same parent and both insert under it. The chain `undo`
+        // walks by id order then has a fork, and undo order stops being the order things happened.
+        //
+        // The check: record from many threads against one file-backed store (a shared cache would
+        // serialise in memory and hide the race), then assert the operations form one chain - one
+        // root, every other row pointing at an id that exists, and no two rows sharing a parent.
+        let dir = std::env::temp_dir().join(format!("gesta-ops-chain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            crate::store::init_schema(&conn).unwrap();
+        }
+
+        let threads = 8;
+        let mut handles = Vec::new();
+        for t in 0..threads {
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                conn.busy_timeout(std::time::Duration::from_secs(20))
+                    .unwrap();
+                for i in 0..5 {
+                    record(&conn, "commit", Some(&format!("cs-{t}-{i}")), None).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let roots: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM operations WHERE parent_op IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(roots, 1, "one chain has one root, found {roots}");
+
+        // No two operations may share a parent: that is the fork.
+        let shared: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM (
+                   SELECT parent_op FROM operations
+                   WHERE parent_op IS NOT NULL
+                   GROUP BY parent_op HAVING COUNT(*) > 1)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            shared, 0,
+            "{shared} parent(s) have more than one child: the chain forked"
+        );
+
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM operations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, threads * 5, "every record must land");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn a_branch_name_with_a_tab_survives_a_snapshot_round_trip() {
+        // #89: `encode` wrote names raw into a tab-separated, line-based text, and `decode` dropped
+        // any line it could not read. `restore` deletes every branch the snapshot does not name, so a
+        // branch named with a tab was deleted by the undo the user asked for to get their work back.
+        //
+        // A tab is reachable: `gesta branch create $'a\tb'` passes the name through unvalidated.
+        let conn = mem_db();
+        let awkward = "topic\twith\ttabs";
+        // `mem_db` seeds `main`; the awkward name is the only one this test adds.
+        conn.execute(
+            "INSERT INTO branches(name, head, created_at, from_branch) VALUES(?1, NULL, 1, NULL)",
+            params![awkward],
+        )
+        .unwrap();
+
+        let snap = RepoSnapshot::capture(&conn).unwrap();
+        let text = snap.encode();
+        assert!(
+            !text.contains(awkward),
+            "the raw name must not appear in the encoding, or a tab is a field separator again:\n{text}"
+        );
+
+        let back = RepoSnapshot::decode(&text).unwrap();
+        let names: Vec<&str> = back.branches.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&awkward),
+            "the branch must survive the round trip, decoded names were {names:?}"
+        );
+
+        // And through `restore`: the branch must still exist afterwards, not be deleted as unknown.
+        back.restore(&conn).unwrap();
+        let still: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM branches WHERE name = ?1",
+                params![awkward],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            still, 1,
+            "restore deleted the branch it could not decode; that is #89 exactly"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_line_that_cannot_be_read_is_refused_not_skipped() {
+        // The other half of #89: skipping the line is what turned a parse problem into a deletion.
+        let text = "V2\nB\tmain\nR\tbroken-line-with-no-field-separator\n";
+        let err = match RepoSnapshot::decode(text) {
+            Ok(_) => panic!("a line with no field separator must not decode"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("cannot read"),
+            "a line the format cannot read must be an error, got: {err}"
+        );
+
+        let no_branch = match RepoSnapshot::decode("V2\nR\tmain\t-\n") {
+            Ok(_) => panic!("a snapshot with no current branch must not decode"),
+            Err(e) => e,
+        };
+        assert!(
+            no_branch.to_string().contains("no current-branch line"),
+            "a snapshot with no current branch must not default to one, got: {no_branch}"
+        );
     }
 }

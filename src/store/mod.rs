@@ -1227,6 +1227,28 @@ pub fn object_is_sidecar(conn: &Connection, hash: &str) -> bool {
 }
 
 pub fn get_object(conn: &Connection, hash: &str) -> ZResult<String> {
+    get_object_at_depth(conn, hash, 0)
+}
+
+/// `get_object`, with the number of times this read has already re-entered.
+///
+/// The recursive CTE below caps each *query* at `MAX_DELTA_DEPTH` links, but a chain longer than the
+/// cap is finished by calling `get_object` on the far end - and that call had no depth counter, so a
+/// cycle in `deltas` (A -> B -> A, which a corrupt or hand-written database can hold) recursed until
+/// the stack overflowed and took the process with it (#94). A read of one object must never be able
+/// to end the process. The cap is the same limit the CTE uses, so a chain the store is willing to
+/// build is a chain it can read.
+fn get_object_at_depth(conn: &Connection, hash: &str, depth: usize) -> ZResult<String> {
+    if depth * MAX_DELTA_DEPTH > MAX_DELTA_DEPTH * MAX_DELTA_DEPTH {
+        return Err(Box::new(crate::support::error::Error::new(
+            crate::support::error::Code::Corrupt,
+            format!(
+                "the delta chain under {} does not terminate after {} links; the store holds a cycle",
+                hash,
+                MAX_DELTA_DEPTH * MAX_DELTA_DEPTH
+            ),
+        )));
+    }
     // A stored object is either whole, or a delta against another object, and the base may itself
     // be a delta. One query fetches the whole chain below.
     // Read the whole chain in one query, then apply it from the base upwards. This used to be two
@@ -1268,7 +1290,7 @@ pub fn get_object(conn: &Connection, hash: &str) -> ZResult<String> {
         )
         .optional()?;
     let mut body = match base_hash {
-        Some(root) => get_object(conn, &root)?,
+        Some(root) => get_object_at_depth(conn, &root, depth + 1)?,
         None => read_whole(conn, deepest)?,
     };
 
@@ -2132,6 +2154,31 @@ pub fn set_branch_head(conn: &Connection, branch: &str, changeset: &str) -> ZRes
     // The common case is a head that moves forward onto a commit whose parent is
     // the old head. Anything else (a merge, an undo, a remote apply) is not
     // incremental and falls back to a rebuild, which is correct and rare.
+    // The head move and the tree update are one write (#96). A crash between them leaves the head on
+    // a commit whose files are not in `branch_tree`, so `status` reports committed files as new and
+    // `fsck` is clean because it never compares the two. The doc comment above says one function is
+    // the only way to be sure there is no writer that forgets the tree; that guarantee needs the two
+    // statements to land together or not at all.
+    // SAVEPOINT, not BEGIN (#96). Half the callers pass a bare connection and half pass a
+    // transaction they already opened (repo/mod.rs does), and a second BEGIN under an open
+    // transaction is an error, not a nested transaction. A savepoint nests in both cases.
+    conn.execute_batch("SAVEPOINT set_branch_head")?;
+    let outcome = set_branch_head_inner(conn, branch, changeset);
+    match outcome {
+        Ok(()) => {
+            conn.execute_batch("RELEASE set_branch_head")?;
+            Ok(())
+        }
+        Err(e) => {
+            // Put the branch back exactly as it was, tree included.
+            let _ = conn.execute_batch("ROLLBACK TO set_branch_head");
+            let _ = conn.execute_batch("RELEASE set_branch_head");
+            Err(e)
+        }
+    }
+}
+
+fn set_branch_head_inner(conn: &Connection, branch: &str, changeset: &str) -> ZResult<()> {
     let old_head = branch_head(conn, branch)?;
     let parent = conn
         .query_row(
@@ -3320,5 +3367,99 @@ pub(crate) mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&d);
+    }
+    #[test]
+    fn a_head_move_that_cannot_rebuild_the_tree_is_rolled_back() {
+        // #96: the head UPDATE and the tree rebuild were separate statements, so a failure between
+        // them left `branch_tree` drifted from `head` - the head on a commit whose files are not in
+        // the tree. `status` then reports committed files as new, and `fsck` does not catch it
+        // because it never compares the two. The measurement: make the tree rebuild fail, then
+        // assert the head did not move.
+        //
+        // The obstacle is a trigger on `branch_tree`, a data-level failure; a permission trick would
+        // not work because the container runs as root.
+        let conn = mem_db();
+        let dir = std::env::temp_dir().join(format!("gesta-head-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        crate::repo::tests::commit_files(&conn, "cs1", "cs1", &[("a.txt", "one\n")]);
+        set_branch_head(&conn, "main", "cs1").unwrap();
+        crate::repo::tests::commit_files(&conn, "cs2", "cs2", &[("b.txt", "two\n")]);
+        // `commit_files` moves the head itself, so put it back: the point of this test is the move
+        // from cs1 to cs2, not the commits.
+        conn.execute("UPDATE branches SET head = 'cs1' WHERE name = 'main'", [])
+            .unwrap();
+
+        let head_before: String = conn
+            .query_row("SELECT head FROM branches WHERE name = 'main'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            head_before, "cs1",
+            "the fixture must start from a known head"
+        );
+
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_tree BEFORE INSERT ON branch_tree
+             BEGIN SELECT RAISE(ABORT, 'the tree refuses'); END;",
+        )
+        .unwrap();
+
+        let err = set_branch_head(&conn, "main", "cs2").unwrap_err();
+        assert!(
+            err.to_string().contains("the tree refuses"),
+            "the trigger must be the reason, not something else: {err}"
+        );
+
+        let head_after: String = conn
+            .query_row("SELECT head FROM branches WHERE name = 'main'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            head_after, head_before,
+            "a head move whose tree rebuild failed must be undone; head is {head_after}, was \
+             {head_before}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn reading_through_a_delta_cycle_reports_corruption_instead_of_dying() {
+        // #94: the recursive CTE caps each query at MAX_DELTA_DEPTH links, but a longer chain is
+        // finished by calling `get_object` on the far end - and that call had no depth counter. A
+        // cycle in `deltas` then recursed until the stack overflowed and killed the process. The
+        // existing test covers `delta_depth` only, which is why this survived.
+        //
+        // Run on a big-stack thread so that a regression shows up as a failure here rather than as
+        // the whole test binary aborting with no message: a stack overflow cannot be caught, so the
+        // only way to report it is to give it room and let the depth counter be what stops it.
+        let handle = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let conn = mem_db();
+                for (h, b) in [("a", "b"), ("b", "a")] {
+                    conn.execute(
+                        "INSERT INTO deltas(hash, base, payload, created_at) VALUES(?1, ?2, x'', 1)",
+                        rusqlite::params![h, b],
+                    )
+                    .unwrap();
+                }
+                // `ZResult` holds a non-Send error, so the thread hands back a plain String.
+                match get_object(&conn, "a") {
+                    Ok(text) => Err(format!("a two-link cycle has no base, yet the read returned: {text:?}")),
+                    Err(e) => Ok(e.to_string()),
+                }
+            })
+            .unwrap();
+        let out = handle.join().expect("the read must not kill the thread");
+        match out {
+            Ok(msg) => assert!(
+                msg.contains("cycle") || msg.contains("does not terminate"),
+                "the error must name the cycle, got: {msg}"
+            ),
+            Err(bad) => panic!("{bad}"),
+        }
     }
 }

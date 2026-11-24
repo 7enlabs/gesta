@@ -20,6 +20,11 @@ use std::sync::{Arc, Mutex};
 ///
 /// A collector that is down for a minute at a few requests per second is well inside this, and a
 /// collector that is down for an hour is a reason to forget events rather than to grow without limit.
+/// How long a collector gets to accept a connection before the event is counted as dropped.
+///
+/// Two minutes is the kernel's own SYN retry schedule, which is the behaviour this replaces.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 const QUEUE_DEPTH: usize = 4096;
 
 /// What the forwarder has dropped since it started, so the loss is countable.
@@ -171,8 +176,19 @@ fn post(url: &str, token: Option<&str>, body: &str) -> Result<(), String> {
         None => (host_port, 80),
     };
 
-    let mut stream = std::net::TcpStream::connect((host, port))
-        .map_err(|e| format!("connect {}:{}: {}", host, port, e))?;
+    // A timeout on the connect, not only on the reads and writes (#75). `TcpStream::connect` blocks
+    // for the kernel's SYN retry schedule - around two minutes on Linux - so a collector that
+    // black-holes the SYN stalls the drain for that long per event, while the read and write
+    // timeouts set below never come into play because there is no stream yet. The audit path is on
+    // the critical path of every recorded decision, so an unreachable collector must be given up on
+    // in seconds and counted as dropped, which is what the gap note exists to report.
+    let addr = format!("{}:{}", host, port);
+    let sock = std::net::ToSocketAddrs::to_socket_addrs(&addr)
+        .map_err(|e| format!("resolve {}: {}", addr, e))?
+        .next()
+        .ok_or_else(|| format!("resolve {}: no address", addr))?;
+    let mut stream = std::net::TcpStream::connect_timeout(&sock, CONNECT_TIMEOUT)
+        .map_err(|e| format!("connect {}: {}", addr, e))?;
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
 
@@ -386,6 +402,30 @@ mod tests {
         assert!(
             with_gap.contains(&dropped.to_string()),
             "the note must carry the count ({dropped}), got: {with_gap}"
+        );
+    }
+    #[test]
+    fn a_collector_that_never_answers_is_given_up_on_in_seconds() {
+        // #75: `TcpStream::connect` has no timeout of its own and blocks for the kernel's SYN retry
+        // schedule - around two minutes on Linux - so a collector that black-holes the SYN stalls the
+        // drain for that long per event. The read and write timeouts set afterwards never come into
+        // play because there is no stream yet.
+        //
+        // 203.0.113.0/24 is TEST-NET-3: reserved for documentation, never routed, so a connect there
+        // hangs rather than being refused, which is the shape this needs. A refused connection would
+        // return immediately and prove nothing.
+        let started = std::time::Instant::now();
+        let err = post("http://203.0.113.1:9/audit", None, "{}\n").unwrap_err();
+        let took = started.elapsed();
+        assert!(
+            err.contains("connect"),
+            "the failure must be the connect, got: {err}"
+        );
+        assert!(
+            took < std::time::Duration::from_secs(10),
+            "giving up took {:.1}s; without CONNECT_TIMEOUT the kernel retries for about two \
+             minutes, which stalls every recorded decision behind an unreachable collector",
+            took.as_secs_f32()
         );
     }
 }

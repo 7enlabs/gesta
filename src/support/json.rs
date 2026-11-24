@@ -151,10 +151,19 @@ fn escape_into(s: &str, out: &mut String) {
 /// Handles objects, arrays, strings with escapes, numbers, booleans and null.
 /// Returns an error message rather than panicking on malformed input, because
 /// this parses data arriving from another process.
+/// How deep nesting may go.
+///
+/// The parser recurses once per level, so without a cap a body of a few hundred kilobytes of
+/// `[[[[…` overflows the stack and aborts the process (#80). Reachable without a write token: the
+/// MCP path parses one line of stdin per message. 512 is far past any shape this program writes -
+/// a changeset body is an object of arrays of strings - and shallow enough that the frame count
+/// stays inside a default 8 MiB stack.
+pub const MAX_DEPTH: usize = 512;
+
 pub fn parse(input: &str) -> Result<Json, String> {
     let bytes: Vec<char> = input.chars().collect();
     let mut i = 0usize;
-    let v = parse_value(&bytes, &mut i)?;
+    let v = parse_value(&bytes, &mut i, 0)?;
     skip_ws(&bytes, &mut i);
     if i != bytes.len() {
         return Err(format!("trailing input at position {}", i));
@@ -168,14 +177,14 @@ fn skip_ws(b: &[char], i: &mut usize) {
     }
 }
 
-fn parse_value(b: &[char], i: &mut usize) -> Result<Json, String> {
+fn parse_value(b: &[char], i: &mut usize, depth: usize) -> Result<Json, String> {
     skip_ws(b, i);
     if *i >= b.len() {
         return Err("unexpected end of input".into());
     }
     match b[*i] {
-        '{' => parse_object(b, i),
-        '[' => parse_array(b, i),
+        '{' => parse_object(b, i, depth),
+        '[' => parse_array(b, i, depth),
         '"' => Ok(Json::Str(parse_string(b, i)?)),
         't' => expect(b, i, "true").map(|_| Json::Bool(true)),
         'f' => expect(b, i, "false").map(|_| Json::Bool(false)),
@@ -195,7 +204,13 @@ fn expect(b: &[char], i: &mut usize, word: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_object(b: &[char], i: &mut usize) -> Result<Json, String> {
+fn parse_object(b: &[char], i: &mut usize, depth: usize) -> Result<Json, String> {
+    if depth >= MAX_DEPTH {
+        return Err(format!(
+            "nested deeper than {} levels; refusing rather than recursing until the stack runs out",
+            MAX_DEPTH
+        ));
+    }
     *i += 1; // {
     let mut map = BTreeMap::new();
     skip_ws(b, i);
@@ -211,7 +226,7 @@ fn parse_object(b: &[char], i: &mut usize) -> Result<Json, String> {
             return Err("expected ':' after object key".into());
         }
         *i += 1;
-        let val = parse_value(b, i)?;
+        let val = parse_value(b, i, depth + 1)?;
         map.insert(key, val);
         skip_ws(b, i);
         if *i >= b.len() {
@@ -230,7 +245,13 @@ fn parse_object(b: &[char], i: &mut usize) -> Result<Json, String> {
     }
 }
 
-fn parse_array(b: &[char], i: &mut usize) -> Result<Json, String> {
+fn parse_array(b: &[char], i: &mut usize, depth: usize) -> Result<Json, String> {
+    if depth >= MAX_DEPTH {
+        return Err(format!(
+            "nested deeper than {} levels; refusing rather than recursing until the stack runs out",
+            MAX_DEPTH
+        ));
+    }
     *i += 1; // [
     let mut items = Vec::new();
     skip_ws(b, i);
@@ -239,7 +260,7 @@ fn parse_array(b: &[char], i: &mut usize) -> Result<Json, String> {
         return Ok(Json::Arr(items));
     }
     loop {
-        items.push(parse_value(b, i)?);
+        items.push(parse_value(b, i, depth + 1)?);
         skip_ws(b, i);
         if *i >= b.len() {
             return Err("unterminated array".into());
@@ -454,5 +475,44 @@ mod tests {
         let pretty = j.render_pretty();
         assert!(pretty.contains("\n  "));
         assert_eq!(parse(&pretty).unwrap(), j);
+    }
+    #[test]
+    fn deeply_nested_input_is_refused_instead_of_aborting_the_process() {
+        // #80: `parse_value` -> `parse_array` recursed once per level with no cap, so a few hundred
+        // kilobytes of `[[[[...` overflowed the stack and aborted the process. Reachable without a
+        // write token through the MCP path, which parses one line of stdin per message.
+        //
+        // 64 MiB of stack so a regression reports a failure here instead of the test binary dying
+        // with no message - a stack overflow cannot be caught.
+        let handle = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let deep = format!("{}{}", "[".repeat(200_000), "]".repeat(200_000));
+                match parse(&deep) {
+                    Ok(_) => Err("200000 levels parsed; the cap is not in the way".to_string()),
+                    Err(e) => Ok(e),
+                }
+            })
+            .unwrap();
+        match handle.join().expect("parsing must not kill the thread") {
+            Ok(msg) => assert!(
+                msg.contains("nested deeper than"),
+                "the refusal must name the depth, got: {msg}"
+            ),
+            Err(bad) => panic!("{bad}"),
+        }
+    }
+
+    #[test]
+    fn nesting_up_to_the_cap_still_parses() {
+        // The cap must not be so tight that a real document trips it.
+        let ok = format!("{}{}", "[".repeat(MAX_DEPTH - 1), "]".repeat(MAX_DEPTH - 1));
+        assert!(parse(&ok).is_ok(), "{} levels must parse", MAX_DEPTH - 1);
+        let too_deep = format!("{}{}", "[".repeat(MAX_DEPTH + 1), "]".repeat(MAX_DEPTH + 1));
+        assert!(
+            parse(&too_deep).is_err(),
+            "{} must be refused",
+            MAX_DEPTH + 1
+        );
     }
 }

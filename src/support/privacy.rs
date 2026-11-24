@@ -55,7 +55,13 @@ pub fn rewrite_authors(
         )));
     }
 
-    let mut stmt = conn.prepare(
+    // The read, every update and the log entry are one transaction (#85). Outside one, a kill
+    // mid-loop leaves a branch partly anonymised, partly not, with signatures dropped for some
+    // changesets and not others - and no operation-log row, because `record` runs after the loop. A
+    // half-anonymised history is worse than an untouched one: it looks done, and the identities it
+    // still holds are the ones nobody is looking for any more.
+    let tx = conn.unchecked_transaction()?;
+    let mut stmt = tx.prepare(
         "SELECT id, author, signature FROM changesets WHERE branch = ?1 ORDER BY created_at",
     )?;
     let rows: Vec<(String, String, Option<String>)> = stmt
@@ -67,6 +73,8 @@ pub fn rewrite_authors(
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    // The statement holds a borrow of the transaction; drop it before the transaction is consumed.
+    drop(stmt);
 
     let wanted = |author: &str| -> bool {
         if match_these.is_empty() {
@@ -97,7 +105,7 @@ pub fn rewrite_authors(
         if signature.is_some() {
             report.dropped_signatures += 1;
         }
-        conn.execute(
+        tx.execute(
             "UPDATE changesets SET author = ?2, signature = NULL, signer = NULL WHERE id = ?1",
             rusqlite::params![id, replacement],
         )?;
@@ -105,13 +113,16 @@ pub fn rewrite_authors(
     }
 
     if report.rewritten == 0 {
+        // Nothing changed, so nothing to commit. `rollback` rather than `commit` keeps the log clean
+        // and makes the early return honest about having done no work.
+        tx.rollback()?;
         return Ok(report);
     }
 
     // The operation log records the rewrite so that undo can step back over it like any other
     // change. Without this, the rewrite would be the one mutation with no way back.
-    crate::support::ops::record(
-        conn,
+    crate::support::ops::record_in(
+        &tx,
         "rewrite-authors",
         Some(branch),
         Some(&format!(
@@ -119,6 +130,7 @@ pub fn rewrite_authors(
             report.rewritten, replacement, report.dropped_signatures
         )),
     )?;
+    tx.commit()?;
 
     Ok(report)
 }
@@ -198,6 +210,51 @@ mod tests {
         assert_eq!(
             again.rewritten, 0,
             "nothing carries the old string any more"
+        );
+    }
+    #[test]
+    fn a_rewrite_that_fails_partway_leaves_no_changeset_rewritten() {
+        // #85: SELECT, the UPDATEs and `ops::record` ran with no transaction, so a kill mid-loop left
+        // a branch partly anonymised with no operation-log row - and `undo` could not step over it
+        // because there was nothing to step over. The measurement: make one UPDATE fail, then check
+        // that NO changeset was rewritten and NO log row was written.
+        //
+        // The failing update is a trigger on the third row, which is a data-level obstacle: the
+        // container runs as root, so a permission trick would not fail anything.
+        let conn = repo();
+        insert(&conn, "cs1", "a@example.com", None);
+        insert(&conn, "cs2", "b@example.com", None);
+        insert(&conn, "cs3", "c@example.com", None);
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_third BEFORE UPDATE ON changesets
+             WHEN NEW.id = 'cs3'
+             BEGIN SELECT RAISE(ABORT, 'third row refuses'); END;",
+        )
+        .unwrap();
+
+        let err = rewrite_authors(&conn, "main", &[], "anon").unwrap_err();
+        assert!(
+            err.to_string().contains("third row refuses"),
+            "the trigger must be the reason, not something else: {err}"
+        );
+
+        let unchanged: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM changesets WHERE author LIKE '%@example.com'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            unchanged, 3,
+            "a rewrite that could not finish must leave every author untouched, not {unchanged} of 3"
+        );
+        let logged: i64 = conn
+            .query_row("SELECT COUNT(*) FROM operations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            logged, 0,
+            "and no operation-log row: a row here would claim a rewrite that did not happen"
         );
     }
 }
