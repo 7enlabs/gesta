@@ -1418,71 +1418,10 @@ pub fn route(
         }
         ("GET", "/v1/file") => {
             let path = match req.param("path") {
-                Some(p) => crate::normalise(p),
+                Some(p) => p.to_string(),
                 None => return Response::error(400, "Bad Request", "path is required"),
             };
-            let conn = match crate::store::open_db(root) {
-                Ok(c) => c,
-                Err(e) => return Response::error(500, "Internal Server Error", e.to_string()),
-            };
-            let rev = match req.param("rev") {
-                Some(r) => r.to_string(),
-                None => {
-                    // No rev means "what the branch looks like right now", which
-                    // includes changesets still queued. Reading only the head
-                    // would make a file written by an API call invisible until
-                    // somebody committed it.
-                    let branch = match crate::store::current_branch(&conn) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            return Response::error(500, "Internal Server Error", e.to_string())
-                        }
-                    };
-                    let pending: Option<String> = conn
-                        .query_row(
-                            "SELECT id FROM changesets
-                             WHERE branch = ?1 AND status = 'pending'
-                             ORDER BY created_at DESC, rowid DESC LIMIT 1",
-                            rusqlite::params![branch],
-                            |r| r.get(0),
-                        )
-                        .ok();
-                    pending.unwrap_or(branch)
-                }
-            };
-            // A caller may name a branch, a tag or a changeset.
-            let resolved = match crate::store::resolve_rev(&conn, &rev) {
-                Ok(Some(h)) => h,
-                Ok(None) => {
-                    return Response::error(
-                        404,
-                        "Not Found",
-                        format!("no such branch, tag or changeset: {}", rev),
-                    )
-                }
-                Err(e) => return Response::error(500, "Internal Server Error", e.to_string()),
-            };
-            match crate::store::hash_at_point(&conn, &path, &resolved) {
-                Ok(Some(hash)) => match crate::store::get_object(&conn, &hash) {
-                    Ok(content) => {
-                        log_access(
-                            root,
-                            &who,
-                            "file",
-                            &path,
-                            &format!("{} bytes", content.len()),
-                        );
-                        Response::ok_text(content)
-                    }
-                    Err(e) => Response::error(500, "Internal Server Error", e.to_string()),
-                },
-                Ok(None) => Response::error(
-                    404,
-                    "Not Found",
-                    format!("{} does not exist at {}", path, rev),
-                ),
-                Err(e) => Response::error(500, "Internal Server Error", e.to_string()),
-            }
+            read_file_at(root, &path, req.param("rev"), &who, grant.as_ref())
         }
         ("POST", "/v1/changeset") => {
             let body = match req.body_text() {
@@ -1534,6 +1473,95 @@ fn decode_basic_token(value: &str) -> Option<String> {
     Some(token.to_string())
 }
 
+/// `GET /v1/file`: the object at `path` as `rev` names it.
+///
+/// Extracted from the route so the scope check can be tested by calling it. The route used to be one
+/// arm of a match, and the only test of its scope would have been a test of `permits` - which passes
+/// whether or not the handler calls it (#159).
+fn read_file_at(
+    root: &Path,
+    path: &str,
+    rev: Option<&str>,
+    who: &str,
+    grant: Option<&crate::transport::auth::Grant>,
+) -> Response {
+    let path = crate::normalise(path);
+    // The path scope covers reads too (#159).
+    //
+    // `docs/credentials.md` says a read token "is never limited by branch" because "reading is
+    // already covered by the path scope". No GET handler called `permits`, so the second half of
+    // that sentence was false: a token scoped to `docs/**` could read any file. Checked before the
+    // store is opened, so a refused read does not report whether the repository exists.
+    if let Some(g) = grant {
+        if !g.permits(&path) {
+            return Response::error(
+                403,
+                "Forbidden",
+                format!("token {} may not read {}", g.name, path),
+            );
+        }
+    }
+    let conn = match crate::store::open_db(root) {
+        Ok(c) => c,
+        Err(e) => return Response::error(500, "Internal Server Error", e.to_string()),
+    };
+    let rev = match rev {
+        Some(r) => r.to_string(),
+        None => {
+            // No rev means "what the branch looks like right now", which includes changesets still
+            // queued. Reading only the head would make a file written by an API call invisible until
+            // somebody committed it.
+            let branch = match crate::store::current_branch(&conn) {
+                Ok(b) => b,
+                Err(e) => return Response::error(500, "Internal Server Error", e.to_string()),
+            };
+            let pending: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM changesets
+                     WHERE branch = ?1 AND status = 'pending'
+                     ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    rusqlite::params![branch],
+                    |r| r.get(0),
+                )
+                .ok();
+            pending.unwrap_or(branch)
+        }
+    };
+    // A caller may name a branch, a tag or a changeset.
+    let resolved = match crate::store::resolve_rev(&conn, &rev) {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            return Response::error(
+                404,
+                "Not Found",
+                format!("no such branch, tag or changeset: {}", rev),
+            )
+        }
+        Err(e) => return Response::error(500, "Internal Server Error", e.to_string()),
+    };
+    match crate::store::hash_at_point(&conn, &path, &resolved) {
+        Ok(Some(hash)) => match crate::store::get_object(&conn, &hash) {
+            Ok(content) => {
+                log_access(
+                    root,
+                    who,
+                    "file",
+                    &path,
+                    &format!("{} bytes", content.len()),
+                );
+                Response::ok_text(content)
+            }
+            Err(e) => Response::error(500, "Internal Server Error", e.to_string()),
+        },
+        Ok(None) => Response::error(
+            404,
+            "Not Found",
+            format!("{} does not exist at {}", path, rev),
+        ),
+        Err(e) => Response::error(500, "Internal Server Error", e.to_string()),
+    }
+}
+
 /// Why a changeset request was refused.
 enum ChangeErr {
     Bad(String),
@@ -1568,6 +1596,26 @@ fn create_changeset_from_json(
     let branch = field(payload, "branch")
         .and_then(json::as_str)
         .unwrap_or("main");
+    // The branch scope, before anything is written (#155).
+    //
+    // This handler checked `permits` for every path and never checked the branch, so a token scoped
+    // to `main` could create - and with `commit: true`, commit - a changeset on `release`. The push
+    // route had the mirror-image gap (it checked the branch and not the paths), and the comment
+    // there claimed this route "has always checked" the branch, which was the one thing it did not
+    // do. The branch comes straight from the request body, so it is caller-controlled input.
+    if let Some(g) = grant {
+        if !g.permits_branch(branch) {
+            return Err(ChangeErr::Denied(format!(
+                "this token may not write branch {:?}; its scope is {}",
+                branch,
+                if g.branches.is_empty() {
+                    "unrestricted".to_string()
+                } else {
+                    g.branches.join(", ")
+                }
+            )));
+        }
+    }
     let commit = field(payload, "commit")
         .map(|v| matches!(v, Json::Bool(true)))
         .unwrap_or(false);
@@ -2098,6 +2146,94 @@ mod tests {
             expires_at: None,
             branches: branches.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    fn grant_to_paths(paths: &[&str]) -> crate::transport::auth::Grant {
+        let mut g = grant_to(&[]);
+        g.scope = paths.iter().map(|s| s.to_string()).collect();
+        g
+    }
+
+    #[test]
+    fn a_changeset_on_an_unlisted_branch_is_refused() {
+        // #155: this handler checked `permits` for every path and never checked the branch, so a
+        // token scoped to `main` could create - and with `commit: true`, commit - a changeset on
+        // `release`. The branch is read straight from the request body, so it is caller-controlled.
+        let dir = std::env::temp_dir().join(format!("gesta-cs-branch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // `.gesta` exists so a refusal that happened *after* opening the store would get a different
+        // error and be visible as such. With the check first, the store is never opened.
+        std::fs::create_dir_all(dir.join(".gesta")).unwrap();
+
+        let payload = crate::support::json::parse(
+            r#"{"message":"m","branch":"release","files":[{"path":"a.txt","content":"one"}]}"#,
+        )
+        .unwrap();
+        let g = grant_to(&["main"]);
+        let msg = match create_changeset_from_json(&dir, &payload, "t", Some(&g)) {
+            Ok(_) => panic!("a token scoped to main created a changeset on release"),
+            Err(ChangeErr::Denied(m)) => m,
+            Err(ChangeErr::Bad(m)) | Err(ChangeErr::Internal(m)) => {
+                panic!("the branch scope must refuse with Denied, got {m}")
+            }
+        };
+        assert!(
+            msg.contains("may not write branch") && msg.contains("release"),
+            "the refusal must name the branch and the scope it has: {msg}"
+        );
+
+        // The same body on a permitted branch gets past the scope check, which is what tells the two
+        // paths apart rather than a message that would also appear for a malformed payload.
+        let allowed = grant_to(&["release"]);
+        match create_changeset_from_json(&dir, &payload, "t", Some(&allowed)) {
+            Ok(_) => {}
+            Err(ChangeErr::Denied(m)) => panic!("a permitted branch was refused: {m}"),
+            Err(_) => {}
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_read_outside_the_path_scope_is_refused() {
+        // #159: no GET handler called `permits`, so a token scoped to `docs/**` could read any file
+        // through `/v1/file`. The check has to be made by the handler, not by `permits` on its own -
+        // a test that asserts `!g.permits(...)` passes whether or not `read_file_at` ever calls it,
+        // and did pass with the fix removed. So this calls the handler.
+        let dir = std::env::temp_dir().join(format!("gesta-read-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".gesta")).unwrap();
+        {
+            let conn = crate::store::open_db(&dir).unwrap();
+            crate::store::init_schema(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO branches(name, head, created_at, from_branch) VALUES('main', NULL, 0, NULL)",
+                [],
+            )
+            .unwrap();
+            std::fs::create_dir_all(dir.join("docs")).unwrap();
+            std::fs::write(dir.join("docs/readme.md"), "public\n").unwrap();
+            std::fs::write(dir.join("secret.rs"), "key = 1\n").unwrap();
+            let cs = crate::repo::create_changeset(&conn, &dir, "seed", "t")
+                .unwrap()
+                .expect("two files is a changeset");
+            crate::repo::commit_one(&conn, &cs.id).unwrap();
+        }
+
+        let g = grant_to_paths(&["docs/**"]);
+        let denied = read_file_at(&dir, "secret.rs", Some("main"), "t", Some(&g));
+        assert_eq!(
+            denied.status, 403,
+            "a docs-scoped token read a file outside its scope; the handler returned {}",
+            denied.status
+        );
+        // And the file inside the scope still reads, or the check would just be a wall.
+        let allowed = read_file_at(&dir, "docs/readme.md", Some("main"), "t", Some(&g));
+        assert_eq!(
+            allowed.status, 200,
+            "a file inside the scope must still be readable, got {}",
+            allowed.status
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
