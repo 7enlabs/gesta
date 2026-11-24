@@ -1769,6 +1769,129 @@ fn run() -> ZResult<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_subcommand_example_beats_its_parent() {
+        // A lookup keyed on the words before the first flag. `changeset create` and `changeset` both
+        // match `gesta changeset create`, and the longer one is the example a reader needs: the
+        // parent's would print a valid command that does not answer their error.
+        let argv: Vec<String> = ["gesta", "changeset", "create"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            example_for(&argv),
+            Some("gesta changeset create \"what changed, in one line\"")
+        );
+    }
+
+    #[test]
+    fn a_flag_before_the_argument_does_not_change_the_match() {
+        // Flags are dropped before the lookup, so the same example is found whether the caller wrote
+        // `--by alice` before or after the missing argument. A table keyed on raw argv would miss
+        // this and fall through to the parent's example or to none.
+        let argv: Vec<String> = ["gesta", "changeset", "approve", "--by", "alice"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            example_for(&argv),
+            Some("gesta changeset approve cs1234 --by alice")
+        );
+    }
+
+    #[test]
+    fn a_command_with_no_example_returns_none_rather_than_a_wrong_one() {
+        // clap already prints the usage line, so returning nothing leaves the caller no worse off.
+        // Returning a fabricated example would be worse: it would look runnable and fail.
+        let argv: Vec<String> = ["gesta", "fsck", "nonsense"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(example_for(&argv), None);
+    }
+
+    #[test]
+    fn every_example_in_the_table_names_the_command_it_is_filed_under() {
+        // The table is keyed by hand, so a typo in the key or the value is invisible until someone
+        // reads it at the moment they are already stuck. This walks the same table through the same
+        // lookup, so a row that cannot be found by its own key fails here.
+        let keys = [
+            "changeset create",
+            "changeset apply",
+            "changeset diff",
+            "changeset sign",
+            "changeset approve",
+            "changeset approvals",
+            "changeset find",
+            "branch create",
+            "branch switch",
+            "branch delete",
+            "branch info",
+            "branch merge",
+            "branch protect",
+            "branch conflicts",
+            "remote add",
+            "remote clone",
+            "forge push",
+            "secret set",
+            "secret remove",
+            "sub add",
+            "sub pin",
+            "sub remove",
+            "hook install",
+            "hook remove",
+            "ignore add",
+            "ignore remove",
+            "ignore attr",
+            "ignore why",
+            "submodule add",
+            "notes add",
+            "notes show",
+            "notes remove",
+            "worktree add",
+            "worktree remove",
+            "blame",
+            "history",
+            "show",
+            "grep",
+            "backup",
+            "verify-backup",
+            "restore-repo",
+            "cherry-pick",
+            "revert",
+            "land",
+            "landed",
+            "tag",
+            "git export",
+            "git push",
+            "git pull",
+            "backup-remote pull",
+            "bisect start",
+            "bisect run",
+        ];
+        let mut broken = Vec::new();
+        for key in keys {
+            let mut argv = vec!["gesta".to_string()];
+            argv.extend(key.split(' ').map(|s| s.to_string()));
+            match example_for(&argv) {
+                Some(example) => {
+                    // The example must be the command it is filed under, with arguments added.
+                    // Anything else means the row was filed under the wrong key.
+                    let prefix = format!("gesta {key}");
+                    if !example.starts_with(&prefix) {
+                        broken.push(format!("{key} -> {example}"));
+                    }
+                }
+                None => broken.push(format!("{key} -> (none)")),
+            }
+        }
+        assert!(
+            broken.is_empty(),
+            "examples that do not name their own command: {:?}",
+            broken
+        );
+    }
+
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("gesta-root-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&d);

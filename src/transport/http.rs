@@ -616,9 +616,13 @@ pub fn serve(
         }
     });
 
-    if crate::transport::signal::wait_for_stop(std::time::Duration::from_secs(86_400)) {
-        println!("stopping: a stop signal was received");
-    }
+    // Wait until a stop signal arrives, not for a fixed period and then return. The earlier version
+    // passed `from_secs(86_400)`, so a server up for a day fell out of the wait, printed nothing and
+    // returned `Ok(())`: a supervisor reading only the exit status sees a clean shutdown, does not
+    // restart, and the port goes dark. The wait is factored out so the decision is testable without
+    // waiting a day or a minute.
+    crate::transport::signal::wait_until_stopped(crate::transport::signal::wait_for_stop);
+    println!("stopping: a stop signal was received");
     Ok(())
 }
 

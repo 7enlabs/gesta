@@ -69,6 +69,20 @@ pub fn wait_for_stop(timeout: std::time::Duration) -> bool {
     stop_requested()
 }
 
+/// Block until the process is asked to stop, retrying the wait when it times out.
+///
+/// The wait takes a timeout so a caller can wake periodically for its own reasons, and that means it
+/// can return `false` without a stop having been asked for. Treating that return as a stop is the
+/// defect this exists to prevent: a server given a 24-hour wait shut down after a day, printed
+/// nothing, and exited 0, which a supervisor reads as a clean shutdown and does not restart.
+///
+/// The only `true` this can return came from `wait`, which means the flag is set.
+pub fn wait_until_stopped(wait: impl Fn(std::time::Duration) -> bool) {
+    // A minute between retries: long enough that an idle server wakes 1,440 times a day rather than
+    // 86,400, short enough that the flag is noticed promptly after it is set.
+    while !wait(std::time::Duration::from_secs(60)) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +125,29 @@ mod tests {
             "it must return on the flag, not on the timeout"
         );
         STOP.store(false, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn a_finished_wait_does_not_mean_the_server_should_stop() {
+        // The defect this guards: a wait with a deadline returns false when the deadline passes, and
+        // the caller treated any return as a reason to exit. A server up for the length of its
+        // deadline then shut down with status 0 and said nothing, so a supervisor saw a clean stop
+        // and did not restart it.
+        //
+        // The wait is made to time out three times and only then report a stop. A loop that treats
+        // the first timeout as a stop calls it once and returns; a loop that retries calls it four
+        // times. The third timeout is what makes this terminate whatever the loop does, because the
+        // counter is outside the closure rather than the flag.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&calls);
+        wait_until_stopped(move |_| {
+            let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+            n > 3
+        });
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            4,
+            "a timed-out wait must be retried; one call means the timeout was read as a stop"
+        );
     }
 }
