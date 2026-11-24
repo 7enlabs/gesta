@@ -133,13 +133,6 @@ pub fn default_path() -> ZResult<PathBuf> {
     Ok(base.join("gesta").join("secrets"))
 }
 
-#[cfg(not(unix))]
-fn restrict_permissions(_path: &Path) -> ZResult<()> {
-    // Windows inherits the directory ACL, which for a per-user local app data
-    // directory is already limited to that user.
-    Ok(())
-}
-
 /// Derive the 32 byte key from a passphrase and a salt.
 pub(crate) fn derive_key(passphrase: &str, salt: &[u8]) -> [u8; 32] {
     // HMAC-SHA256 with the salt as the key and the passphrase as the message. One
