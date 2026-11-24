@@ -128,6 +128,16 @@ pub fn record_with(
     // every event with nothing printed and nothing returned, so an operator reading the file saw an
     // intact history that silently stopped at some point. A missing write is the one failure in an
     // audit log that must not be quiet, because the whole value of the log is that it is complete.
+    // Rotate before writing, once, when the file is already over the cap (#78). There is no rotation
+    // anywhere in the tree: on a busy server `audit.log` grows forever, and `read` had to load all of
+    // it. One generation is kept, which is what a log needs to survive a look at yesterday without
+    // becoming a disk-filling problem - the file is a record of recent refusals, not an archive.
+    //
+    // The check is a `metadata` on the path the write is about to open, so it costs one stat on a
+    // path already being opened, and it is done here rather than on a timer because a repository that
+    // is quiet should not pay for a clock it does not need.
+    rotate_if_full(&path);
+
     match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -281,15 +291,113 @@ pub struct Entry {
 /// `only_refused` answers the question a person actually asks after an incident: what was tried and
 /// turned away.
 #[allow(dead_code)]
+/// How much of the tail to read per line asked for.
+///
+/// An audit line is a small JSON document - the reason text is the only thing that varies, and it is
+/// written by the program, not by the client. 1 KiB per line leaves room for a long reason and still
+/// reads 200 lines out of a 200 KiB window.
+const TAIL_BYTES_PER_LINE: u64 = 1024;
+
+/// The size at which `audit.log` is rotated.
+///
+/// 32 MiB is roughly 300k refusals - far more history than an operator reads, and small enough that
+/// the file never becomes the reason a disk fills. The cap exists so the log has a bound; what
+/// matters is that the bound is declared, not that it is large.
+pub const MAX_LOG_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Move the log aside when it is over the cap, keeping one generation.
+///
+/// A failure to rotate is reported and then ignored: the write below still appends, and losing the
+/// rotation is a smaller problem than losing the event. That is the opposite of the choice made for a
+/// failed write a few lines down, and deliberately so - a missing event is a hole in the record, a
+/// missed rotation is a large file.
+fn rotate_if_full(path: &std::path::Path) {
+    let size = match std::fs::metadata(path) {
+        Ok(m) => m.len(),
+        Err(_) => return,
+    };
+    if size <= MAX_LOG_BYTES {
+        return;
+    }
+    let old = path.with_extension("log.1");
+    let _ = std::fs::remove_file(&old);
+    if let Err(e) = std::fs::rename(path, &old) {
+        eprintln!(
+            "audit log is over the {} MiB cap but could not be rotated: {}: {}",
+            MAX_LOG_BYTES / (1024 * 1024),
+            path.display(),
+            e
+        );
+    }
+}
+
+/// The last `limit` lines of a file, or the whole file when there is no limit.
+///
+/// `Ok(None)` when the file is not there, which is not an error: a repository that has never refused
+/// anything has no audit log, and the answer is an empty history.
+fn tail_text(path: &std::path::Path, limit: Option<usize>) -> std::io::Result<Option<String>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let len = f.metadata()?.len();
+
+    let want = match limit {
+        None => {
+            let mut s = String::new();
+            f.read_to_string(&mut s)?;
+            return Ok(Some(s));
+        }
+        // A limit of zero asks for nothing, and reading nothing is the honest answer.
+        Some(0) => return Ok(Some(String::new())),
+        Some(n) => n as u64,
+    };
+
+    // The window is a guess at how much text `want` lines occupy. If it yields fewer complete lines
+    // than asked for, read the whole file: returning fewer lines than exist would read as "the log is
+    // short", which is a wrong answer about the thing the log exists to prove.
+    let window = (want * TAIL_BYTES_PER_LINE).min(len);
+    let start = len - window;
+    f.seek(SeekFrom::Start(start))?;
+    let mut buf = String::new();
+    f.read_to_string(&mut buf)?;
+
+    let text = if start == 0 {
+        buf
+    } else {
+        // The window began mid-line, so the first fragment is not a line.
+        match buf.find('\n') {
+            Some(i) => buf[i + 1..].to_string(),
+            None => String::new(),
+        }
+    };
+    if start > 0 && text.lines().filter(|l| !l.trim().is_empty()).count() < want as usize {
+        let mut all = String::new();
+        f.seek(SeekFrom::Start(0))?;
+        f.read_to_string(&mut all)?;
+        return Ok(Some(all));
+    }
+    Ok(Some(text))
+}
+
 pub fn read(
     root: &std::path::Path,
     only_refused: bool,
     limit: Option<usize>,
 ) -> ZResult<Vec<Entry>> {
     let path = crate::repo_dir(root).join("audit.log");
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+    // With a limit, read only the tail (#78). `fs::read_to_string` loaded the whole file and the
+    // limit then trimmed the PARSED output - so `gesta remote audit --limit 20` on a 2 GiB log read
+    // 2 GiB to print 20 lines, which is the opposite of what a limit is for. The window is generous
+    // (limit lines, at `TAIL_BYTES_PER_LINE` each) and widened once if it turns out to hold fewer
+    // complete lines than asked for; a line longer than the window is still reported as unreadable
+    // by the parser, which is what the caller already does with a damaged line.
+    let text = match tail_text(&path, limit) {
+        Ok(Some(t)) => t,
+        Ok(None) => return Ok(Vec::new()),
         Err(e) => {
             return Err(Box::new(crate::support::error::Error::new(
                 crate::support::error::Code::NotFound,
@@ -531,5 +639,115 @@ mod tests {
         let body = &src[start..end];
         assert!(!body.contains("flock"), "no lock is taken");
         assert!(!body.contains("lock()"), "no mutex guards the file");
+    }
+    fn lines_in(path: &std::path::Path) -> usize {
+        match std::fs::read_to_string(path) {
+            Ok(t) => t.lines().filter(|l| !l.trim().is_empty()).count(),
+            Err(_) => 0,
+        }
+    }
+
+    #[test]
+    fn a_limited_read_does_not_load_the_whole_file() {
+        // #78: `read_to_string` loaded the entire log and the `limit` then trimmed the PARSED output,
+        // so `--limit 20` on a 2 GiB log read 2 GiB to print 20 lines.
+        //
+        // Measured on `tail_text`, which is the decision, not on `read`, which is the caller. The
+        // first version of this test went through `read` and asserted on the returned entries - and
+        // stayed green with the whole-file read restored, because the limit trims the output either
+        // way. The bytes that were read are the thing under test, and `tail_text` is where they are
+        // countable: its result must not contain a line from the start of the file.
+        let d = dir();
+        let path = crate::repo_dir(&d).join("audit.log");
+        let mut body = String::from("FIRST-LINE-IS-HERE\n");
+        for i in 0..4000 {
+            body.push_str(&format!("{{\"at\":\"t{}\",\"decision\":\"refused\"}}\n", i));
+        }
+        std::fs::write(&path, body).unwrap();
+
+        let tail = tail_text(&path, Some(3)).unwrap().unwrap();
+        assert!(
+            !tail.contains("FIRST-LINE-IS-HERE"),
+            "the tail read pulled in the start of the file; that is the whole-file read again, and \
+             a 2 GiB log would be held in memory to print 3 lines"
+        );
+        assert!(
+            tail.contains("t3999"),
+            "and the tail must reach the end of the file"
+        );
+        assert!(
+            tail.lines().filter(|l| !l.trim().is_empty()).count() >= 3,
+            "the window must hold at least the lines asked for"
+        );
+
+        // `read` still answers the same thing, which is the contract the callers see.
+        let got = read(&d, false, Some(3)).unwrap();
+        assert_eq!(got.len(), 3, "a limit of 3 must return 3 entries");
+        assert_eq!(got[2].at, "t3999", "the tail must be the END of the log");
+
+        // And no limit still reads everything.
+        let all = read(&d, false, None).unwrap();
+        assert_eq!(
+            all.len(),
+            4001,
+            "no limit must read the whole log, including the marker line"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_limit_larger_than_the_file_returns_every_line() {
+        // The window is a guess; when it is too small to hold the lines asked for, the read must widen
+        // rather than report a short log. Otherwise "limit 100" on a 5-line file would look truncated.
+        let d = dir();
+        let path = crate::repo_dir(&d).join("audit.log");
+        let mut body = String::new();
+        for i in 0..5 {
+            body.push_str(&format!("{{\"at\":\"t{}\"}}\n", i));
+        }
+        std::fs::write(&path, body).unwrap();
+        let got = read(&d, false, Some(100)).unwrap();
+        assert_eq!(
+            got.len(),
+            5,
+            "all five lines must come back, got {}",
+            got.len()
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_oversized_log_is_rotated_and_still_written() {
+        // #78: nothing rotated the log, so it grew without bound. One generation is kept, and the new
+        // event must still land - a rotation that loses the event it was triggered by turns a disk
+        // problem into a hole in the record.
+        let d = dir();
+        let path = crate::repo_dir(&d).join("audit.log");
+        {
+            let f = std::fs::File::create(&path).unwrap();
+            f.set_len(MAX_LOG_BYTES + 1).unwrap();
+        }
+        record(
+            &d,
+            &Event {
+                who: "zen",
+                decision: Decision::NoToken,
+                action: "push",
+                target: "main",
+                reason: "a reason",
+                remote: None,
+            },
+        );
+        let old = path.with_extension("log.1");
+        assert!(
+            old.exists(),
+            "a log over the cap must be moved aside, or it grows forever"
+        );
+        assert_eq!(
+            lines_in(&path),
+            1,
+            "the event that triggered the rotation must still be in the new log"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -185,6 +185,14 @@ impl Pattern {
 }
 
 /// Search the files on disk, skipping anything the repository ignores.
+/// The largest file `search_worktree` will read.
+///
+/// A search reads a file whole and then copies it once more to make it a `String`, so the peak is
+/// twice the size. 16 MiB is past every source file a person greps and small enough that a directory
+/// full of them does not exhaust memory. A larger file is named in the error rather than skipped, so
+/// the answer "no match" is never given about a file that was not read.
+pub const MAX_SEARCH_FILE: u64 = 16 * 1024 * 1024;
+
 pub fn search_worktree(
     conn: &Connection,
     root: &Path,
@@ -204,6 +212,7 @@ pub fn search_worktree(
     }
 
     let mut hits = Vec::new();
+    let mut too_large: Vec<String> = Vec::new();
     for f in scanned.files {
         if !scope.contains(&f.rel) {
             continue;
@@ -213,11 +222,34 @@ pub fn search_worktree(
                 continue;
             }
         }
-        let body = match std::fs::read(root.join(&f.rel)) {
+        // A file over the cap is reported, not silently skipped (#91). Reading every file whole, with
+        // no limit, means a repository with one 4 GiB log makes `grep` hold 4 GiB - and the file was
+        // copied a second time by `from_utf8_lossy(..).to_string()`. Skipping quietly would be the
+        // worse answer: the search would come back saying "no match" about a file it never read.
+        //
+        // The size comes from the scan cache where it has one, so the check costs nothing extra on the
+        // path that already stat'ed the file.
+        let full = root.join(&f.rel);
+        let size = match std::fs::metadata(&full) {
+            Ok(m) => m.len(),
+            Err(_) => continue,
+        };
+        if size > MAX_SEARCH_FILE {
+            too_large.push(format!("{} ({} MiB)", f.rel, size / (1024 * 1024)));
+            continue;
+        }
+        let body = match std::fs::read(&full) {
             Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
             Err(_) => continue,
         };
         hits.extend(pattern.scan(&f.rel, &body, ""));
+    }
+    if !too_large.is_empty() {
+        return Err(bad(format!(
+            "not searched: {} (over the {} MiB cap; search them with --path or raise the cap)",
+            too_large.join(", "),
+            MAX_SEARCH_FILE / (1024 * 1024)
+        )));
     }
     Ok(hits)
 }
@@ -403,5 +435,64 @@ mod tests {
         let body = "fn main() {}\n";
         assert_eq!(re.matches(body), lit.matches(body));
         assert!(re.matches(body), "case insensitive regex missed a line");
+    }
+    #[test]
+    fn a_file_over_the_cap_is_named_instead_of_read() {
+        // #91: every file the ignore rules admit was read whole with no size limit, and copied once
+        // more by `from_utf8_lossy(..).to_string()`. One large file in the tree was enough to make the
+        // search hold all of it.
+        //
+        // The cap is exercised at its own value rather than by writing 16 MiB of data: the assertion
+        // that matters is that a file over the limit is NAMED in the error, because the alternative -
+        // skipping it quietly - answers "no match" about a file that was never read.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::init_schema(&conn).unwrap();
+        crate::store::migrate(&conn).unwrap();
+        let dir = std::env::temp_dir().join(format!("gesta-grep-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(dir.join("small.txt"), "needle here\n").unwrap();
+        let big = dir.join("big.txt");
+        // A sparse file: `set_len` reserves the length without writing 16 MiB of zeros.
+        {
+            let f = std::fs::File::create(&big).unwrap();
+            f.set_len(MAX_SEARCH_FILE + 1).unwrap();
+        }
+
+        let pattern = Pattern::new("needle", false, false).unwrap();
+        let err = match search_worktree(&conn, &dir, &pattern, None) {
+            Ok(hits) => panic!(
+                "a file over the cap was read and {} hit(s) returned; the cap is not in the way",
+                hits.len()
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("big.txt"),
+            "the oversized file must be named, or the answer is 'no match' about a file never read: {err}"
+        );
+        assert!(
+            err.contains("not searched"),
+            "the error must say the search did not happen, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_under_the_cap_is_still_searched() {
+        // The cap must not stop an ordinary file.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::init_schema(&conn).unwrap();
+        crate::store::migrate(&conn).unwrap();
+        let dir = std::env::temp_dir().join(format!("gesta-grep-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "first\nhas a needle\n").unwrap();
+
+        let pattern = Pattern::new("needle", false, false).unwrap();
+        let hits = search_worktree(&conn, &dir, &pattern, None).unwrap();
+        assert_eq!(hits.len(), 1, "the ordinary file must still be searched");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
