@@ -1771,6 +1771,23 @@ pub fn committed_tree(
 
 /// Write every file of `branch` to disk. Used after a push and after a clone so
 /// the working tree never lags behind the branch head.
+/// The file `path` names inside `root`, refusing anything that would land outside it.
+///
+/// The tree entries and bundle paths that reach the writers here arrived from data, and `Path::join`
+/// does not sanitise: an absolute value discards the root. A snapshot entry of `/etc/cron.d/x` was
+/// written outside the repository with the bundle's content, and the same `root.join(path)` followed
+/// by `fs::write` was in `materialise`, `restore_worktree` and the clone's snapshot restore, reached
+/// by `pull` and `clone` after a remote chose the paths.
+fn target_inside(root: &Path, path: &str) -> ZResult<std::path::PathBuf> {
+    if !crate::support::paths::is_repo_relative(path) {
+        return Err(bad(format!(
+            "a tree entry names {} which is not inside the repository (absolute, or climbing out)",
+            path
+        )));
+    }
+    Ok(root.join(path))
+}
+
 pub fn materialise(conn: &Connection, root: &Path, branch: &str) -> ZResult<usize> {
     // An empty branch is a tree with no paths, not a reason to do nothing. Returning early here
     // left every file the repository had tracked sitting on disk after an `undo` moved the head
@@ -1802,7 +1819,10 @@ pub fn materialise(conn: &Connection, root: &Path, branch: &str) -> ZResult<usiz
         if wanted.contains(path.as_str()) {
             continue;
         }
-        let target = root.join(&path);
+        // A path the tree no longer names still came from the tree, so it gets the same rule.
+        let Ok(target) = target_inside(root, &path) else {
+            continue;
+        };
         if target.is_file() {
             let _ = fs::remove_file(&target);
         }
@@ -1824,7 +1844,7 @@ pub fn materialise(conn: &Connection, root: &Path, branch: &str) -> ZResult<usiz
         // The line ending the working tree wants, which is not always the one the object holds.
         let plan = crate::support::attributes::plan_for(&attrs, path);
         let content = plan.checked_out(&content);
-        let target = root.join(path);
+        let target = target_inside(root, path)?;
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -1852,7 +1872,7 @@ pub fn restore_worktree(conn: &Connection, root: &Path, branch: &str) -> ZResult
         let content = crate::store::get_object_bytes(conn, hash)?;
         let plan = crate::support::attributes::plan_for(&attrs, path);
         let content = plan.checked_out(&content);
-        let target = root.join(path);
+        let target = target_inside(root, path)?;
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -1869,7 +1889,9 @@ pub fn restore_worktree(conn: &Connection, root: &Path, branch: &str) -> ZResult
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for path in all {
         if !present.contains(&path) {
-            let target = root.join(&path);
+            let Ok(target) = target_inside(root, &path) else {
+                continue;
+            };
             if target.is_file() {
                 fs::remove_file(&target)?;
                 removed += 1;

@@ -250,7 +250,10 @@ pub fn fix_with(conn: &Connection, root: &Path, opts: Options) -> ZResult<Fixed>
                 Err(e) => out.skipped.push((id.clone(), e.to_string())),
             }
         } else {
-            match crate::repo::commit_one(conn, id) {
+            // `--fix` commits on the user's behalf, so it passes the same gate a hand-typed commit
+            // does. It used to call `commit_one` directly and could commit past a secret the scanner
+            // would have refused.
+            match crate::cli::changeset::commit_checked(conn, root, id) {
                 Ok(_) => out.committed.push(id.clone()),
                 Err(e) => out.skipped.push((id.clone(), e.to_string())),
             }

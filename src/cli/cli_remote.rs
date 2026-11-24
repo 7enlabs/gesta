@@ -1944,10 +1944,15 @@ fn restore_from_snapshot(
 ) -> ZResult<usize> {
     let mut written = 0usize;
     for (path, hash) in snapshot {
-        // The same guard the remote write path uses: a path from a bundle is not
-        // trusted, and `..` in one would write outside the repository.
-        if path.split(['/', '\\']).any(|seg| seg == "..") {
-            return Err(bad(format!("unsafe path in a bundle snapshot: {}", path)));
+        // A path from a bundle is not trusted. The `..` check that stood here missed the other way
+        // out: `Path::join` with an absolute value discards the root, so `/etc/cron.d/x` passed and
+        // was written outside the repository with attacker-chosen content. One rule, the same one the
+        // tree checkout and the empty-content entry use.
+        if !crate::support::paths::is_repo_relative(path) {
+            return Err(bad(format!(
+                "unsafe path in a bundle snapshot: {} (absolute, or climbing out)",
+                path
+            )));
         }
         // Bytes, so a binary file arrives whole. Asking for text refused the clone with a
         // message about UTF-8 from a repository that only held a PNG.
@@ -2657,5 +2662,65 @@ mod tests {
             err.contains("token list"),
             "the refusal must name the command that lists: {err}"
         );
+    }
+    #[test]
+    fn a_snapshot_path_that_leaves_the_repository_is_refused() {
+        // #180: the guard here was `split(['/', '\\']).any(|seg| seg == "..")`, which catches a climb
+        // and misses the other way out entirely: `Path::join` with an absolute value discards the
+        // base, so `/etc/cron.d/x` was written outside the repository with the bundle's content.
+        //
+        // The absolute paths used here are inside a scratch directory this test owns, not `/etc`:
+        // the first version pointed at `/etc/cron.d/zdemo`, so the red run of this very test wrote a
+        // real file into the container and then failed on the leftover. A test for "nothing is
+        // written outside" must be able to see the outside without destroying it.
+        let d = std::env::temp_dir().join(format!("zf-snap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let conn = crate::store::tests::mem_db();
+
+        let outside = d.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        // Absolute, with no `..` anywhere, so only an absolute-path check can refuse it.
+        let absolute = outside.join("escape.txt").to_string_lossy().to_string();
+        assert!(
+            !absolute.contains(".."),
+            "the absolute case must not also climb"
+        );
+
+        for bad_path in [absolute.as_str(), "../../escape.txt", "C:/Windows/zdemo"] {
+            let hash = crate::store::put_object_bytes(&conn, b"content").unwrap();
+            let snapshot = vec![(bad_path.to_string(), hash)];
+            let err = restore_from_snapshot(&conn, &d, &snapshot)
+                .expect_err("an escaping snapshot path must be refused");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("unsafe path"),
+                "the refusal must name the path rule, got {msg} for {bad_path}"
+            );
+        }
+        assert!(
+            !outside.join("escape.txt").exists(),
+            "the absolute path was written: {}",
+            outside.join("escape.txt").display()
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_relative_snapshot_path_is_written_inside_the_repository() {
+        // The guard has to let real paths through, or a clone writes nothing.
+        let d = std::env::temp_dir().join(format!("zf-snap-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let conn = crate::store::tests::mem_db();
+        let hash = crate::store::put_object_bytes(&conn, b"hello").unwrap();
+
+        let n = restore_from_snapshot(&conn, &d, &[("src/deep/a.txt".to_string(), hash)]).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            std::fs::read_to_string(d.join("src/deep/a.txt")).unwrap(),
+            "hello"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

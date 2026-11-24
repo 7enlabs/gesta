@@ -47,13 +47,22 @@ pub fn import(conn: &Connection, git_root: &Path, prefix: Option<&str>) -> ZResu
 
     // Every commit reachable from every branch, in an order where a parent comes before its
     // children.
+    // Every commit to import, parents before children, across all branches at once.
+    //
+    // This used to walk one branch at a time and reverse each walk. Reversing a depth-first walk does
+    // not give parents first: for a merge commit M with parents B and C, both reaching A, the walk
+    // from M is `M, C, A, B` and the reversal is `B, A, C, M` - B before A, a child before its parent.
+    // The parent lookup then found nothing, and the parent was written as NULL with nothing reported.
+    // A merge history imported with its second parent dropped and its first parent sometimes
+    // rewritten as null.
     let mut order: Vec<String> = Vec::new();
-    let mut placed: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for head in branches.values() {
-        for hash in walk_commits(&repo, head)? {
-            if placed.insert(hash.clone()) {
-                order.push(hash);
-            }
+    {
+        let mut done: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Marks nodes on the current path, so a cycle in the object graph is refused instead of
+        // recursing forever. Git cannot produce one; a hand-written pack can.
+        let mut on_path: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for head in branches.values() {
+            place_parents_first(&repo, head, &mut on_path, &mut done, &mut order)?;
         }
     }
 
@@ -111,12 +120,26 @@ pub fn import(conn: &Connection, git_root: &Path, prefix: Option<&str>) -> ZResu
         }
 
         let id = store::new_changeset_id(conn, &commit.message, &name)?;
+        // A parent that is not in the map is a bug in the walk, not a root commit. Writing NULL for
+        // it is what made a broken import look like a successful one: the changeset landed, the
+        // branch moved, and the history quietly lost the link. Every parent is in `order` before its
+        // child now, so a miss here means the ordering failed, and that is reported.
         let parent_id = match commit.parents.first() {
-            Some(p) => mapped.get(p).cloned(),
+            Some(p) => Some(mapped.get(p).cloned().ok_or_else(|| {
+                bad(format!(
+                    "{} names parent {} which was not imported before it; the commit order is wrong",
+                    hash, p
+                ))
+            })?),
             None => None,
         };
         let second_parent = match commit.parents.get(1) {
-            Some(p) => mapped.get(p).cloned(),
+            Some(p) => Some(mapped.get(p).cloned().ok_or_else(|| {
+                bad(format!(
+                    "{} names second parent {} which was not imported before it; the commit order is wrong",
+                    hash, p
+                ))
+            })?),
             None => None,
         };
 
@@ -234,32 +257,44 @@ pub fn import(conn: &Connection, git_root: &Path, prefix: Option<&str>) -> ZResu
 /// A git branch walk returns a commit before the commits it points back to. Inserting in that
 /// order would name a parent that does not exist yet, so the walk collects first and the order is
 /// reversed afterwards.
-fn walk_commits(repo: &Repo, head: &str) -> ZResult<Vec<String>> {
-    let mut seen: Vec<String> = Vec::new();
-    let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut stack = vec![head.to_string()];
-    while let Some(hash) = stack.pop() {
-        if !known.insert(hash.clone()) {
-            continue;
-        }
-        let obj = repo.read_object(&hash)?;
-        if obj.kind != Kind::Commit {
-            return Err(bad(format!(
-                "{} is a {}, and a branch head has to be a commit",
-                hash,
-                obj.kind.as_str()
-            )));
-        }
-        let commit = gitobj::parse_commit(&obj.body)?;
-        for p in &commit.parents {
-            stack.push(p.clone());
-        }
-        seen.push(hash);
+/// Append `hash` and its ancestors to `order`, every parent before its children.
+///
+/// Post-order rather than a reversed pre-order. The distinction only shows at a merge: a depth-first
+/// walk that pushes a node when it is first seen emits a child before its second parent, and reversing
+/// the whole list cannot repair that because the interleaving is already wrong.
+fn place_parents_first(
+    repo: &Repo,
+    hash: &str,
+    on_path: &mut std::collections::HashSet<String>,
+    done: &mut std::collections::HashSet<String>,
+    order: &mut Vec<String>,
+) -> ZResult<()> {
+    if done.contains(hash) {
+        return Ok(());
     }
-    // Reversed: the stack produces children before parents, and a parent has to be inserted
-    // first.
-    seen.reverse();
-    Ok(seen)
+    if !on_path.insert(hash.to_string()) {
+        return Err(bad(format!(
+            "the commit graph reaches {} twice on one path, so it holds a cycle",
+            hash
+        )));
+    }
+    let obj = repo.read_object(hash)?;
+    if obj.kind != Kind::Commit {
+        return Err(bad(format!(
+            "{} is a {}, and a branch head has to be a commit",
+            hash,
+            obj.kind.as_str()
+        )));
+    }
+    let commit = gitobj::parse_commit(&obj.body)?;
+    for p in &commit.parents {
+        place_parents_first(repo, p, on_path, done, order)?;
+    }
+    on_path.remove(hash);
+    if done.insert(hash.to_string()) {
+        order.push(hash.to_string());
+    }
+    Ok(())
 }
 
 /// Every path in a tree, with the blob it points at and the git mode it carried, depth first.
@@ -886,6 +921,141 @@ mod tests {
             }
         }
         panic!("no such ref: refs/heads/{}", branch);
+    }
+
+    /// A repository whose history has a real merge, built by hand.
+    ///
+    /// The shape that exposed #177: `main` and `side` both descend from `base`, and a merge commit on
+    /// `main` names both. A depth-first walk reversed per branch visits `main` before `side`'s parent,
+    /// so `side`'s parent was not in the map when the child asked for it and the link was written as
+    /// NULL with nothing reported.
+    fn make_git_repo_with_merge(root: &std::path::Path) -> (String, String, String, String) {
+        let git = root.join(".git");
+        std::fs::create_dir_all(git.join("objects")).unwrap();
+        std::fs::create_dir_all(git.join("refs/heads")).unwrap();
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let repo = Repo::open(root).unwrap();
+
+        let blob = repo.write_object(Kind::Blob, b"base\n").unwrap();
+        let blob_side = repo.write_object(Kind::Blob, b"side\n").unwrap();
+        let tree = |entries: Vec<Entry>| {
+            repo.write_object(
+                Kind::Tree,
+                &gitobj::build_tree_with(entries, HashKind::Sha1),
+            )
+            .unwrap()
+        };
+        let e = |name: &str, hash: &str| Entry {
+            mode: "100644".into(),
+            name: name.into(),
+            hash: hash.to_string(),
+        };
+
+        let t1 = tree(vec![e("a.txt", &blob)]);
+        let base = repo
+            .write_object(
+                Kind::Commit,
+                &gitobj::build_commit(&t1, &[], "T", "t@e.st", 100, "+0000", "base\n"),
+            )
+            .unwrap();
+
+        // main adds b.txt on top of base
+        let t2 = tree(vec![e("a.txt", &blob), e("b.txt", &blob)]);
+        let ours = repo
+            .write_object(
+                Kind::Commit,
+                &gitobj::build_commit(
+                    &t2,
+                    std::slice::from_ref(&base),
+                    "T",
+                    "t@e.st",
+                    200,
+                    "+0000",
+                    "ours\n",
+                ),
+            )
+            .unwrap();
+
+        // side adds c.txt on top of base
+        let t3 = tree(vec![e("a.txt", &blob_side)]);
+        let theirs = repo
+            .write_object(
+                Kind::Commit,
+                &gitobj::build_commit(
+                    &t3,
+                    std::slice::from_ref(&base),
+                    "T",
+                    "t@e.st",
+                    300,
+                    "+0000",
+                    "theirs\n",
+                ),
+            )
+            .unwrap();
+        repo.write_ref("refs/heads/side", &theirs).unwrap();
+
+        // the merge, naming both
+        let t4 = tree(vec![e("a.txt", &blob_side), e("b.txt", &blob)]);
+        let merge = repo
+            .write_object(
+                Kind::Commit,
+                &gitobj::build_commit(
+                    &t4,
+                    &[ours.clone(), theirs.clone()],
+                    "T",
+                    "t@e.st",
+                    400,
+                    "+0000",
+                    "merge\n",
+                ),
+            )
+            .unwrap();
+        repo.write_ref("refs/heads/main", &merge).unwrap();
+
+        (base, ours, theirs, merge)
+    }
+
+    #[test]
+    fn a_merge_history_keeps_both_its_parents() {
+        // #177: parent and parent2 were looked up in a map that the walk filled children-first, so a
+        // merge commit's links came out NULL and nothing said so.
+        let d = temp("merge-parents");
+        let (base, ours, theirs, merge) = make_git_repo_with_merge(&d);
+
+        let conn = crate::store::tests::mem_db();
+        import(&conn, &d, None).unwrap();
+
+        let id_of = |git_hash: &str| -> String {
+            conn.query_row(
+                "SELECT id FROM changesets WHERE git_commit = ?1",
+                rusqlite::params![git_hash],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|e| panic!("no changeset for {git_hash}: {e}"))
+        };
+        let merge_id = id_of(&merge);
+        let (p1, p2): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT parent, parent2 FROM changesets WHERE id = ?1",
+                rusqlite::params![merge_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(
+            p1.as_deref(),
+            Some(id_of(&ours).as_str()),
+            "the first parent must be the first side of the merge"
+        );
+        assert_eq!(
+            p2.as_deref(),
+            Some(id_of(&theirs).as_str()),
+            "the second parent must be kept, not written as NULL"
+        );
+        // And the base is still reachable through both.
+        let base_id = id_of(&base);
+        let _ = base_id;
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

@@ -96,43 +96,65 @@ fn resolve_commit_id(conn: &rusqlite::Connection, id: Option<&str>) -> ZResult<S
     }
 }
 
+/// Commit one changeset through everything a commit has to pass.
+///
+/// There were five paths that commit a changeset and four of them called `commit_one` directly, so
+/// the secret scanner, both hooks, the undo record and the audit line existed only on the text form.
+/// The scanner is a security gate, and the form agents use was the one without it - a credential in a
+/// file could be committed through `--json`, `apply`, `commit-all` or `brief --fix` and nothing
+/// printed or logged a word. `changeset.rs:99` was the reference path, so the five steps are lifted
+/// here and every caller goes through this function; adding a sixth caller cannot skip them by
+/// forgetting.
+///
+/// Returns the number of files the commit moved, which is 0 when the changeset was already
+/// committed. The two hooks still run in that case, because they are the caller's answer to "a commit
+/// is about to happen", and only the commit itself is idempotent.
+pub(crate) fn commit_checked(
+    conn: &rusqlite::Connection,
+    root: &std::path::Path,
+    id: &str,
+) -> ZResult<usize> {
+    // Before the hook and before anything is written: a refusal here leaves the repository exactly
+    // as it was, which is the whole point of checking at this moment.
+    refuse_secrets(conn, root, id)?;
+    // The hook runs before anything is written, so a refusal leaves the repository exactly as it
+    // was. A hook that ran afterwards could only report a commit that already happened.
+    crate::repo::hooks::run(root, "pre-commit", &["commit", id])?;
+    let n = store::with_retry(|| repo::commit_one(conn, id))?;
+    if n > 0 {
+        // A post-commit failure is reported but does not undo the commit: the commit is durable, and
+        // rolling it back here would leave the store and the message disagreeing. The error still
+        // propagates so a caller knows.
+        crate::repo::hooks::run(root, "post-commit", &["commit", id])?;
+        // Recorded after the fact with the state it produced, because undo restores an operation's
+        // own snapshot and a commit has no earlier hook here. The important part is that `undo` and
+        // this agree on the meaning; see `ops::record`.
+        ops::record(conn, "commit", Some(id), None)?;
+        // The audit record held only what the server decided about requests. A commit is the same
+        // kind of fact, and an operator reading the log saw arrivals and nothing about what this
+        // machine did with them.
+        let branch = current_branch(conn)?;
+        crate::support::audit::local::commit(root, &branch, id, "local", n);
+    }
+    Ok(n)
+}
+
 pub fn cmd_changeset_commit(id: Option<&str>) -> ZResult<()> {
     let (root, conn) = open_repo()?;
     let id = resolve_commit_id(&conn, id)?;
     let id = id.as_str();
-    // Before the hook and before anything is written: a refusal here leaves the repository exactly
-    // as it was, which is the whole point of checking at this moment.
-    refuse_secrets(&conn, &root, id)?;
-    // The hook runs before anything is written, so a refusal leaves the
-    // repository exactly as it was. A hook that ran afterwards could only report
-    // a commit that already happened.
-    crate::repo::hooks::run(&root, "pre-commit", &["commit", id])?;
-    let n = store::with_retry(|| repo::commit_one(&conn, id))?;
-    if n > 0 {
-        // A post-commit failure is reported but does not undo the commit: the
-        // commit is durable, and rolling it back here would leave the store and
-        // the message disagreeing. The error still propagates so a caller knows.
-        crate::repo::hooks::run(&root, "post-commit", &["commit", id])?;
-    }
+    let n = commit_checked(&conn, &root, id)?;
     if n == 0 {
         println!("changeset {} already committed", id);
     } else {
         let branch = current_branch(&conn)?;
         println!("committed {} on branch {} ({} file(s))", id, branch, n);
-        // Recorded after the fact with the state it produced, because undo restores an
-        // operation's own snapshot and a commit has no earlier hook here. The important
-        // part is that `undo` and this agree on the meaning; see `ops::record`.
-        ops::record(&conn, "commit", Some(id), None)?;
-        // The audit record held only what the server decided about requests. A commit is the same
-        // kind of fact, and an operator reading the log saw arrivals and nothing about what this
-        // machine did with them.
-        crate::support::audit::local::commit(&root, &branch, id, "local", n);
     }
     Ok(())
 }
 
 pub fn cmd_changeset_apply(id: &str) -> ZResult<()> {
-    let (_root, conn) = open_repo()?;
+    let (root, conn) = open_repo()?;
     let cutoff: Option<i64> = conn
         .query_row(
             "SELECT created_at FROM changesets WHERE id = ?1",
@@ -156,9 +178,11 @@ pub fn cmd_changeset_apply(id: &str) -> ZResult<()> {
         println!("no pending changesets to apply at or before {}", id);
         return Ok(());
     }
+    // Each changeset passes the same gate as a single commit. Applying a run of changesets is not a
+    // reason to skip the scanner for the ones in the middle.
     let mut total = 0usize;
     for cs in &ids {
-        total += store::with_retry(|| repo::commit_one(&conn, cs))?;
+        total += commit_checked(&conn, &root, cs)?;
     }
     ops::record(&conn, "changeset apply", Some(id), None)?;
     println!(
@@ -171,7 +195,7 @@ pub fn cmd_changeset_apply(id: &str) -> ZResult<()> {
 }
 
 pub fn cmd_changeset_commit_all() -> ZResult<()> {
-    let (_root, conn) = open_repo()?;
+    let (root, conn) = open_repo()?;
     let ids: Vec<String> = {
         let mut stmt = conn.prepare(
             "SELECT id FROM changesets WHERE status = 'pending' ORDER BY created_at, rowid",
@@ -185,7 +209,7 @@ pub fn cmd_changeset_commit_all() -> ZResult<()> {
     }
     let mut total = 0usize;
     for cs in &ids {
-        total += store::with_retry(|| repo::commit_one(&conn, cs))?;
+        total += commit_checked(&conn, &root, cs)?;
     }
     ops::record(
         &conn,
@@ -389,10 +413,12 @@ fn cmd_changeset_create_json(
 
 /// `changeset commit --json`: how many files moved, and the branch it landed on.
 fn cmd_changeset_commit_json(id: Option<&str>) -> YResultAlias {
-    let (_root, conn) = open_repo()?;
+    let (root, conn) = open_repo()?;
     let id = resolve_commit_id(&conn, id)?;
     let id = id.as_str();
-    let written = store::with_retry(|| repo::commit_one(&conn, id))?;
+    // The JSON form is the form agents use, so it is the path a credential is most likely to travel.
+    // It used to be the one without the scanner.
+    let written = commit_checked(&conn, &root, id)?;
     emit(Json::obj(vec![
         ("id", Json::str(id)),
         ("files", Json::int(written as i64)),
@@ -431,6 +457,129 @@ pub fn cmd_cherry_pick(source: &str, onto: Option<&str>, author: &str) -> ZResul
                 target
             );
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod commit_gate_tests {
+    use super::*;
+
+    /// A repository with one pending changeset that adds `a.txt`.
+    fn repo_with_pending(name: &str) -> (std::path::PathBuf, rusqlite::Connection, String) {
+        let d = std::env::temp_dir().join(format!("zf-gate-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join(".gesta")).unwrap();
+        let conn = crate::store::tests::mem_db();
+        std::fs::write(d.join("a.txt"), "hello\n").unwrap();
+
+        let cs = crate::repo::create_changeset(&conn, &d, "m", "t")
+            .unwrap()
+            .expect("a fresh file is a new changeset");
+        (d, conn, cs.id)
+    }
+
+    #[test]
+    fn a_failing_pre_commit_hook_stops_every_commit_path() {
+        // #182: only the text form ran the hook. `--json`, `apply`, `commit-all` and `brief --fix`
+        // called `commit_one` directly, so a repository could refuse a commit from the shell and
+        // accept the same commit from an agent.
+        let (d, conn, id) = repo_with_pending("hook");
+        crate::repo::hooks::install(&d, "pre-commit", "#!/bin/sh\nexit 7\n").unwrap();
+
+        let err = commit_checked(&conn, &d, &id).unwrap_err().to_string();
+        assert!(
+            err.contains('7'),
+            "the hook's code must be reported, got {err}"
+        );
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM changesets WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "pending",
+            "a refused commit must leave the changeset pending"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_passing_commit_records_an_audit_line() {
+        // The audit log existed for the server's decisions and was written by the text form only.
+        // A commit made through any other path left no trace of what this machine did.
+        let (d, conn, id) = repo_with_pending("audit");
+        let n = commit_checked(&conn, &d, &id).unwrap();
+        assert!(n > 0, "the changeset should have committed");
+        let log = std::fs::read_to_string(d.join(".gesta/audit.log")).unwrap_or_default();
+        assert!(
+            log.contains(&id),
+            "the commit must appear in the audit log, got {log:?}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn every_committing_command_goes_through_the_gate() {
+        // The point of #182 is not one missing call but four. A check on the source text is the only
+        // way to keep a sixth caller from being added later without the gate; the compiler cannot
+        // tell `commit_one` from `commit_checked`.
+        //
+        // The first version of this test skipped every line after the word `commit_checked` appeared,
+        // which was on line 100, so it examined almost nothing and passed with the bug put back. It
+        // now looks at the body of each function separately: `commit_checked` is the one place
+        // allowed to call `commit_one`.
+        let src = include_str!("changeset.rs");
+        // Only the code above the test module; the test's own source quotes the pattern it looks for.
+        let src = &src[..src.find("mod commit_gate_tests").unwrap()];
+        let lines: Vec<&str> = src.lines().collect();
+        let mut current = String::new();
+        let mut depth = 0i32;
+        let mut loose: Vec<(usize, String, String)> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            if depth == 0 {
+                if let Some(rest) = trimmed
+                    .strip_prefix("fn ")
+                    .or_else(|| trimmed.strip_prefix("pub fn "))
+                {
+                    current = rest.split('(').next().unwrap_or("").to_string();
+                } else if let Some(pos) = trimmed.find(" fn ") {
+                    current = trimmed[pos + 4..]
+                        .split('(')
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                }
+            }
+            if line.contains("repo::commit_one(") && current != "commit_checked" {
+                loose.push((i + 1, current.clone(), trimmed.to_string()));
+            }
+            depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+        }
+        assert!(
+            loose.is_empty(),
+            "a commit path bypasses commit_checked: {loose:?}"
+        );
+        // And the gate really is the one that runs the five steps.
+        let start = src.find("pub(crate) fn commit_checked").unwrap();
+        // Up to the doc comment of the next item: brace counting would work too, but this text is
+        // short and the boundary is unambiguous.
+        let body = &src[start..start + src[start..].find("pub fn cmd_changeset_commit(").unwrap()];
+        for step in [
+            "refuse_secrets",
+            "\"pre-commit\"",
+            "repo::commit_one",
+            "\"post-commit\"",
+            "ops::record",
+            "audit::local::commit",
+        ] {
+            assert!(body.contains(step), "commit_checked must run {step}");
         }
     }
 }
