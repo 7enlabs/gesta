@@ -228,7 +228,24 @@ pub fn run(root: &Path, name: &str, args: &[&str]) -> ZResult<()> {
         }
     }
 
-    let out = Command::new(&path)
+    // On Windows a hook is a script, and Windows has no shebang: `Command::new` on a file without a
+    // `.exe` extension fails with `%1 is not a valid Win32 application (os error 193)`. So every hook
+    // was unrunnable there - which nobody noticed because every hook test was `#[cfg(unix)]`, so the
+    // path was never executed on the one platform where it could not work. A batch file has to be
+    // handed to the interpreter.
+    //
+    // `cmd /C` is the interpreter Windows always has, and it is what runs a `.bat` or `.cmd` hook.
+    // The path is passed as its own argument so a space in a directory name does not split it.
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = Command::new("cmd");
+        c.arg("/C").arg(&path);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut cmd = Command::new(&path);
+
+    let out = cmd
         .args(args)
         .current_dir(root)
         .output()
@@ -336,30 +353,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    #[cfg(unix)]
+    /// A hook body that succeeds, written in the platform's own language.
+    ///
+    /// These three tests were all `#[cfg(unix)]`, which is why nobody noticed that a hook could not
+    /// run on Windows at all: `Command::new` on a file with no executable extension fails there, and
+    /// the only tests that executed a hook were skipped on that platform. A hook is a script, so each
+    /// platform needs its own spelling.
+    fn ok_hook() -> String {
+        if cfg!(windows) {
+            "@echo off\r\nexit /b 0\r\n".to_string()
+        } else {
+            "#!/bin/sh\nexit 0\n".to_string()
+        }
+    }
+
+    fn fail_hook(code: i32) -> String {
+        if cfg!(windows) {
+            format!("@echo off\r\nexit /b {}\r\n", code)
+        } else {
+            format!("#!/bin/sh\nexit {}\n", code)
+        }
+    }
+
+    /// A hook that writes its two arguments to `args.txt`.
+    fn arg_echo_hook() -> String {
+        if cfg!(windows) {
+            "@echo off\r\necho %1 %2 > args.txt\r\n".to_string()
+        } else {
+            "#!/bin/sh\necho \"$1 $2\" > args.txt\n".to_string()
+        }
+    }
+
     #[test]
     fn a_passing_hook_returns_ok() {
         let d = tmp("pass");
-        install(&d, "pre-commit", "#!/bin/sh\nexit 0\n").unwrap();
+        install(&d, "pre-commit", &ok_hook()).unwrap();
         assert!(run(&d, "pre-commit", &[]).is_ok());
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_failing_hook_reports_its_exit_code() {
         let d = tmp("fail");
-        install(&d, "pre-commit", "#!/bin/sh\nexit 3\n").unwrap();
+        install(&d, "pre-commit", &fail_hook(3)).unwrap();
         let e = run(&d, "pre-commit", &[]).unwrap_err().to_string();
-        assert!(e.contains("3"), "error should name the code, got {}", e);
+        assert!(e.contains('3'), "error should name the code, got {}", e);
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_hook_receives_the_operation_and_the_id() {
         let d = tmp("args");
-        install(&d, "pre-commit", "#!/bin/sh\necho \"$1 $2\" > args.txt\n").unwrap();
+        install(&d, "pre-commit", &arg_echo_hook()).unwrap();
         run(&d, "pre-commit", &["commit", "cs123"]).unwrap();
         let seen = std::fs::read_to_string(d.join("args.txt")).unwrap();
         assert_eq!(seen.trim(), "commit cs123");

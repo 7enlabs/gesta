@@ -479,13 +479,29 @@ mod commit_gate_tests {
         (d, conn, cs.id)
     }
 
+    /// A hook that always fails, written in whatever the platform can actually execute.
+    ///
+    /// The first version was `#!/bin/sh` with `exit 7`, which is right on Linux and produced
+    /// `%1 is not a valid Win32 application (os error 193)` on Windows, where this test then failed
+    /// for a reason that had nothing to do with the commit gate. A test that passes on one platform
+    /// has not been run on the other.
+    fn always_failing_hook() -> String {
+        if cfg!(windows) {
+            // A batch file, because cmd.exe is the interpreter Windows always has. The code has to
+            // reach the caller the same way `exit 7` does on Unix.
+            "@echo off\r\nexit /b 7\r\n".to_string()
+        } else {
+            "#!/bin/sh\nexit 7\n".to_string()
+        }
+    }
+
     #[test]
     fn a_failing_pre_commit_hook_stops_every_commit_path() {
         // #182: only the text form ran the hook. `--json`, `apply`, `commit-all` and `brief --fix`
         // called `commit_one` directly, so a repository could refuse a commit from the shell and
         // accept the same commit from an agent.
         let (d, conn, id) = repo_with_pending("hook");
-        crate::repo::hooks::install(&d, "pre-commit", "#!/bin/sh\nexit 7\n").unwrap();
+        crate::repo::hooks::install(&d, "pre-commit", &always_failing_hook()).unwrap();
 
         let err = commit_checked(&conn, &d, &id).unwrap_err().to_string();
         assert!(
