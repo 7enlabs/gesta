@@ -1271,8 +1271,16 @@ pub fn route(
             });
             let allowed: Option<&dyn Fn(&str) -> bool> =
                 check.as_ref().map(|f| f as &dyn Fn(&str) -> bool);
-            match crate::transport::gitserver::receive_pack_allowing(root, &req.body, allowed, &who)
-            {
+            // The role and the branch scope are the two checks this route used to make. The path
+            // scope is the third, passed through because only `receive_pack` knows which files the
+            // pushed commits touch, and it can only answer that after the import.
+            match crate::transport::gitserver::receive_pack_scoped(
+                root,
+                &req.body,
+                allowed,
+                grant.as_ref(),
+                &who,
+            ) {
                 Ok(bytes) => {
                     log_access(
                         root,

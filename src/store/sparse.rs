@@ -136,8 +136,26 @@ pub fn checkout_sparse(
             kept += 1;
             continue;
         }
+        // The path comes from the tree, and a tree can hold an entry that was written by a push or a
+        // bundle restore rather than by this binary. `root.join(path)` with `../` climbs out of the
+        // repository, so a checkout would write outside it; with an absolute path the root is
+        // discarded outright. Refused before the join rather than after, so the failure names the entry.
+        if !crate::support::paths::is_repo_relative(path) {
+            return Err(crate::bad(format!(
+                "the tree holds an entry that is not a path inside the repository: {:?}",
+                path
+            )));
+        }
         let content = crate::store::get_object_bytes(conn, hash)?;
         let target = root.join(path);
+        // Belt and braces: `join` is the line that would escape, so the result is compared against the
+        // directory it is supposed to be in rather than trusted.
+        if !target.starts_with(root) {
+            return Err(crate::bad(format!(
+                "the tree entry {} resolves outside the repository",
+                path
+            )));
+        }
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -150,6 +168,56 @@ pub fn checkout_sparse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tree_entry_that_is_not_a_repo_path_is_refused_before_the_join() {
+        // #98: `root.join(path)` with an entry read out of the tree. A tree can hold what a push or a
+        // bundle restore put there, so the path is not necessarily one this binary wrote. This runs
+        // the real `checkout_sparse` against a tree whose entry climbs, so the guard is what fails if
+        // it is removed, not a restatement of the rule.
+        use crate::store::tests::mem_db;
+
+        let conn = mem_db();
+        let hash = crate::store::put_object_bytes(&conn, b"owned\n").unwrap();
+        // The row a corrupted or hostile history would carry.
+        conn.execute(
+            "INSERT INTO changesets(id, message, author, created_at, status, parent, parent2, branch)
+             VALUES('cs1', 'x', 'a', 0, 'committed', NULL, NULL, 'main')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO changeset_files(changeset_id, path, old_hash, new_hash)
+             VALUES('cs1', '../../escaped.txt', NULL, ?1)",
+            rusqlite::params![hash],
+        )
+        .unwrap();
+        // `mem_db` already creates `main`, so the head is moved rather than inserted.
+        conn.execute("UPDATE branches SET head = 'cs1' WHERE name = 'main'", [])
+            .unwrap();
+
+        let dir = std::env::temp_dir().join(format!("gesta-sparse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The file the escape would create, one level above the repository root.
+        let escaped = dir
+            .parent()
+            .expect("temp dir has a parent")
+            .join("escaped.txt");
+        let _ = std::fs::remove_file(&escaped);
+
+        let scope = SparseScope::default();
+        let err = match scope.checkout_sparse(&conn, &dir, "main") {
+            Ok(_) => panic!("a climbing tree entry was checked out"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("not a path inside the repository") && err.contains("escaped.txt"),
+            "the refusal must name the entry: {err}"
+        );
+        assert!(!escaped.exists(), "nothing may be written outside the root");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn an_empty_scope_contains_everything() {

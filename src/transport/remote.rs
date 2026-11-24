@@ -88,6 +88,22 @@ pub struct ChangesetRow {
     pub intent: Option<String>,
 }
 
+/// Refuse a path from a bundle that could not name a file inside the repository.
+///
+/// The message names the path and the record kind so a person holding the archive can see which entry
+/// is wrong, rather than reading that the bundle is malformed.
+fn refuse_unsafe_bundle_path(path: &str) -> ZResult<()> {
+    if crate::support::paths::is_repo_relative(path) {
+        Ok(())
+    } else {
+        Err(bad(format!(
+            "bundle holds a path that is not inside the repository: {:?}. \
+             A bundle path must be relative and may not contain `..`.",
+            path
+        )))
+    }
+}
+
 impl Bundle {
     /// Serialise to the wire format: a zlib-compressed line oriented text block.
     /// Text keeps the format inspectable and avoids a JSON dependency.
@@ -295,6 +311,22 @@ impl Bundle {
                 _ => {} // forward compatibility: ignore unknown records
             }
         }
+
+        // Every path a bundle carries is checked here, before any of it reaches a table. The rows this
+        // decoder produces are applied as they are and later used by checkout, which joins them onto
+        // the repository root: a bundle holding `../../etc/x` or an absolute path would write outside
+        // it. Refused as a whole rather than per record, because a bundle that lies about one path is
+        // not a bundle to apply in part.
+        for (path, _, _, _, _) in &b.versions {
+            refuse_unsafe_bundle_path(path)?;
+        }
+        for (_, path, _, _) in &b.files {
+            refuse_unsafe_bundle_path(path)?;
+        }
+        for (path, _) in &b.snapshot {
+            refuse_unsafe_bundle_path(path)?;
+        }
+
         Ok(b)
     }
 }
@@ -895,6 +927,87 @@ mod tests {
     use crate::repo::commit_one;
     use crate::repo::tests::commit_files;
     use crate::store::tests::mem_db;
+
+    #[test]
+    fn a_bundle_holding_a_climbing_path_is_refused_whole() {
+        // #98: the rows a bundle decodes to are applied as they are, and checkout later joins those
+        // paths onto the repository root, so `../../etc/x` writes outside it. Refused at decode, which
+        // is before any table is touched.
+        let b = Bundle {
+            branch: "main".into(),
+            head: None,
+            changesets: Vec::new(),
+            objects: Vec::new(),
+            binaries: Vec::new(),
+            versions: vec![("../../etc/passwd".to_string(), 1, "h".into(), "c".into(), 0)],
+            files: Vec::new(),
+            hashes: Vec::new(),
+            shallow_root: None,
+            snapshot: Vec::new(),
+            deltas: Vec::new(),
+        };
+        let wire = b.encode().unwrap();
+        let err = match Bundle::decode(&wire) {
+            Ok(_) => panic!("a bundle with a climbing path was decoded"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("not inside the repository") && err.contains("../../etc/passwd"),
+            "the refusal must name the path: {err}"
+        );
+
+        // The same for a changeset file row and for a snapshot row, because all three reach checkout.
+        for kind in ["files", "snapshot"] {
+            let mut b2 = Bundle {
+                branch: "main".into(),
+                head: None,
+                changesets: Vec::new(),
+                objects: Vec::new(),
+                binaries: Vec::new(),
+                versions: Vec::new(),
+                files: Vec::new(),
+                hashes: Vec::new(),
+                shallow_root: None,
+                snapshot: Vec::new(),
+                deltas: Vec::new(),
+            };
+            if kind == "files" {
+                b2.files
+                    .push(("c".into(), "/etc/passwd".into(), None, Some("h".into())));
+            } else {
+                b2.snapshot.push(("/etc/passwd".into(), "h".into()));
+            }
+            let w = match b2.encode() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            match Bundle::decode(&w) {
+                Ok(_) => panic!("a bundle with an absolute {} path was decoded", kind),
+                Err(e) => assert!(
+                    e.to_string().contains("not inside the repository"),
+                    "{}: {e}",
+                    kind
+                ),
+            }
+        }
+
+        // An ordinary path is still accepted, so the check does not refuse every bundle.
+        let ok = Bundle {
+            branch: "main".into(),
+            head: None,
+            changesets: Vec::new(),
+            objects: Vec::new(),
+            binaries: Vec::new(),
+            versions: vec![("src/main.rs".to_string(), 1, "h".into(), "c".into(), 0)],
+            files: Vec::new(),
+            hashes: Vec::new(),
+            shallow_root: None,
+            snapshot: Vec::new(),
+            deltas: Vec::new(),
+        };
+        let w = ok.encode().unwrap();
+        assert!(Bundle::decode(&w).is_ok(), "an ordinary bundle must decode");
+    }
 
     #[test]
     fn base64_roundtrips_including_padding_cases() {

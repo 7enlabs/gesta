@@ -77,6 +77,51 @@ fn is_oid(s: &str) -> bool {
     (s.len() == 40 || s.len() == 64) && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// Is this a ref name that can only name a ref?
+///
+/// The server turns a pushed ref into a file under its scratch repository (`refs/heads/<name>`), and
+/// the name arrives in the request body. `Path::join` does not sanitise: a name of `../../../etc/x`
+/// resolves outside the scratch directory, and an absolute name discards the prefix entirely, so a
+/// push could create or overwrite any file the server process can write. That is a remote file write
+/// on a route that is authenticated but scoped only by role.
+///
+/// The rules are git's own (`git check-ref-format`), so anything a real client sends is accepted and
+/// anything that is not a ref is refused here rather than relied on to fail later when the path is
+/// built. Checking at the parse site means the refusal names the offending ref, and nothing is
+/// written before the push is considered.
+fn is_ref_name(name: &str) -> bool {
+    if name.is_empty() || name == "@" {
+        return false;
+    }
+    // `..` anywhere, and `@{` which is revision syntax rather than a name.
+    if name.contains("..") || name.contains("@{") {
+        return false;
+    }
+    // Control characters, and the set git refuses because a shell or a glob would read them.
+    if name.chars().any(|c| {
+        c.is_ascii_control() || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+    }) {
+        return false;
+    }
+    if name.starts_with('/')
+        || name.ends_with('/')
+        || name.ends_with('.')
+        || name.ends_with(".lock")
+    {
+        return false;
+    }
+    if name.contains("//") {
+        return false;
+    }
+    // No component may be empty, start with a dot, or end with `.lock`.
+    for part in name.split('/') {
+        if part.is_empty() || part.starts_with('.') || part.ends_with(".lock") {
+            return false;
+        }
+    }
+    true
+}
+
 /// `git-upload-pack` wants the first ref annotated with the capabilities, and every line terminated
 /// by NUL only on that first one. A client that receives capabilities on the wrong line ignores them
 /// and then asks for a side-band it was never offered.
@@ -555,6 +600,15 @@ pub fn split_push(body: &[u8]) -> ZResult<(Vec<PushCommand>, Vec<u8>)> {
                 line
             )));
         }
+        // Refused before the ref is used to build a path. Without this a name of `../../x` or an
+        // absolute one escapes the scratch repository and the push writes outside it.
+        if !is_ref_name(&name) {
+            return Err(bad(format!(
+                "a push named a ref that is not a ref name: {:?}. It may not be empty, start with a \\
+                 dot or a slash, contain `..` or a control character, or end with `.lock`.",
+                name
+            )));
+        }
         commands.push(PushCommand { old, new, name });
     }
     Ok((commands, body[i..].to_vec()))
@@ -572,10 +626,11 @@ pub fn split_push(body: &[u8]) -> ZResult<(Vec<PushCommand>, Vec<u8>)> {
 /// that ref and leaves the others alone, which is what a push naming three refs expects when one of
 /// them is not its business. The pack is still unpacked: refusing the whole transfer would let one
 /// forbidden branch hide the objects the permitted ones need.
-pub fn receive_pack_allowing(
+pub fn receive_pack_scoped(
     root: &std::path::Path,
     body: &[u8],
     allowed: Option<&dyn Fn(&str) -> bool>,
+    grant: Option<&crate::transport::auth::Grant>,
     pusher: &str,
 ) -> ZResult<Vec<u8>> {
     let (commands, pack) = split_push(body)?;
@@ -763,10 +818,24 @@ pub fn receive_pack_allowing(
 
         // The refs have to be in the scratch repository before the import walks them, because the
         // import starts from branch heads rather than from a list of objects.
+        //
+        // Checked here as well as at the parse site. Two guards for one rule is deliberate: the parse
+        // site is where a bad name is refused with a useful message, and this is the place that would
+        // actually write outside the directory if the rule were ever relaxed or a second caller
+        // appeared. The cost of the second check is one comparison per ref.
+        let branch_dir = scratch.join("refs").join("heads");
         for c in &commands {
-            let branch_dir = scratch.join("refs").join("heads");
+            let short = c.name.strip_prefix("refs/heads/").unwrap_or(&c.name);
+            let ref_file = branch_dir.join(short);
+            // `join` with an absolute path discards the prefix, so the result is compared against the
+            // directory it is supposed to be in rather than trusted.
+            if !ref_file.starts_with(&branch_dir) || !is_ref_name(short) {
+                return Err(bad(format!(
+                    "a push named a ref that would resolve outside the scratch repository: {:?}",
+                    c.name
+                )));
+            }
             std::fs::create_dir_all(&branch_dir)?;
-            let ref_file = branch_dir.join(c.name.strip_prefix("refs/heads/").unwrap_or(&c.name));
             std::fs::write(&ref_file, format!("{}\n", c.new))?;
         }
 
@@ -871,6 +940,54 @@ pub fn receive_pack_allowing(
                     |r| r.get(0),
                 )
                 .ok();
+
+            // A path-scoped token was checked for the branch and never for the paths, so a token that
+            // may write `docs/**` could push any file on any branch it was allowed to name. The paths
+            // only exist once the import has run, which is why this check lands here rather than with
+            // the branch check above; the rollback is the same one a refused branch uses, so a refusal
+            // leaves the branch where it was.
+            if let (Some(g), Some(cs)) = (grant, &changeset) {
+                let written: Vec<String> = {
+                    let mut v = Vec::new();
+                    if let Ok(mut q) =
+                        conn.prepare("SELECT path FROM changeset_files WHERE changeset_id = ?1")
+                    {
+                        if let Ok(rows) =
+                            q.query_map(rusqlite::params![cs], |r| r.get::<_, String>(0))
+                        {
+                            for p in rows.flatten() {
+                                v.push(p);
+                            }
+                        }
+                    }
+                    v
+                };
+                // An empty scope is unrestricted and `permits` answers true for every path, so this
+                // refuses only when the token was actually narrowed.
+                let outside: Vec<String> = written.into_iter().filter(|p| !g.permits(p)).collect();
+                if !outside.is_empty() {
+                    // Put the branch back, otherwise the client reads `ng` while the branch has moved.
+                    if let Some((_, _, Some(head))) = before.iter().find(|(b, _, _)| b == &branch) {
+                        let _ = conn.execute(
+                            "UPDATE branches SET head = ?1 WHERE name = ?2",
+                            rusqlite::params![head, branch],
+                        );
+                    }
+                    out.extend_from_slice(
+                        pkt_line(
+                            format!(
+                                "ng {} this token may not write {} ({} of the pushed files are outside its path scope)\n",
+                                c.name,
+                                outside.first().map(|s| s.as_str()).unwrap_or(""),
+                                outside.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .as_slice(),
+                    );
+                    continue;
+                }
+            }
 
             // A protected branch needs a sign-off from a credential other than the one pushing.
             // Checked here, after the import, because the approval names a changeset and the
@@ -1106,6 +1223,86 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_ref_name_that_would_escape_the_scratch_repository_is_refused() {
+        // #151: the server builds `refs/heads/<name>` from the request body. `Path::join` does not
+        // sanitise, so `../../../x` resolves outside the scratch directory and an absolute name
+        // discards the prefix outright: a push could create or overwrite any file the server can
+        // write.
+        for bad in [
+            "../../../etc/passwd",
+            "/etc/passwd",
+            "..",
+            "a/../../b",
+            "",
+            "@",
+            "refs/heads/x.lock",
+            "a b",
+            "a:b",
+            "a?b",
+            "a*b",
+            "a[b",
+            "a\\b",
+            "a~b",
+            "a^b",
+            "a..b",
+            "a@{0}",
+            ".hidden",
+            "a//b",
+            "a/",
+            "/a",
+        ] {
+            assert!(
+                !is_ref_name(bad),
+                "{bad:?} must not be accepted as a ref name"
+            );
+        }
+        // The names a real client sends are accepted, so the check does not refuse ordinary pushes.
+        for ok in [
+            "main",
+            "feature/x",
+            "refs/heads/main",
+            "release/1.0",
+            "a-b_c.d",
+        ] {
+            assert!(is_ref_name(ok), "{ok} must be accepted as a ref name");
+        }
+    }
+
+    #[test]
+    fn a_push_naming_a_climbing_ref_is_refused_at_the_parse_site() {
+        // Refused while splitting the body, so nothing is written before the decision.
+        let line = format!(
+            "{} {} refs/heads/../../../etc/passwd\0 report-status\n",
+            "a".repeat(40),
+            "b".repeat(40)
+        );
+        let framed = format!("{:04x}{}", line.len() + 4, line);
+        let body = format!("{}0000", framed);
+        let err = match split_push(body.as_bytes()) {
+            Ok(_) => panic!("a climbing ref was accepted"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("not a ref name") && err.contains("../../../etc/passwd"),
+            "the refusal must name the offending ref: {err}"
+        );
+
+        // An ordinary ref still parses.
+        let ok_line = format!(
+            "{} {} refs/heads/feature/x\0 report-status\n",
+            "a".repeat(40),
+            "b".repeat(40)
+        );
+        let ok_body = format!("{:04x}{}0000", ok_line.len() + 4, ok_line);
+        let (cmds, _) = match split_push(ok_body.as_bytes()) {
+            Ok(v) => v,
+            Err(e) => panic!("an ordinary ref must parse: {e}"),
+        };
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].name.as_str(), "refs/heads/feature/x");
+    }
+
+    #[test]
     fn a_delta_pack_still_names_every_object_it_wrote() {
         // The pack writer now replaces a body with a delta against an earlier object. A delta that
         // rebuilds to the wrong bytes makes git reject the whole pack with a message about a bad
@@ -1288,7 +1485,7 @@ mod tests {
         body.extend_from_slice(b"0000");
 
         let reply =
-            receive_pack_allowing(&d, &body, None, "tester").expect("a deletion needs no pack");
+            receive_pack_scoped(&d, &body, None, None, "tester").expect("a deletion needs no pack");
         let text = String::from_utf8_lossy(&reply);
         assert!(text.contains("ok refs/heads/gone"), "reply: {}", text);
 
@@ -1345,7 +1542,7 @@ mod tests {
         body.extend_from_slice(payload);
         body.extend_from_slice(b"0000");
 
-        let reply = receive_pack_allowing(&d, &body, None, "tester").unwrap();
+        let reply = receive_pack_scoped(&d, &body, None, None, "tester").unwrap();
         let text = String::from_utf8_lossy(&reply);
         assert!(text.contains("ng refs/heads/only"), "reply: {}", text);
         assert!(text.contains("last branch"), "reply: {}", text);

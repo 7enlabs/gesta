@@ -1,0 +1,75 @@
+//! Whether a path that arrived from outside can name a file inside a repository.
+//!
+//! Three places take a path from data rather than from the code: a changeset entry with empty content
+//! (the bytes are read from disk), a tree entry being checked out, and a bundle path being restored.
+//! Each of them joined the value onto a root, and `Path::join` does not sanitise: an absolute value
+//! discards the root and `..` climbs out of it. The three answers lived apart, and two of them did not
+//! exist at all. One function, so the rule cannot differ by caller.
+//!
+//! The answer is deliberately about shape, not about the filesystem: it says whether the value could
+//! name a path inside a tree, and says nothing about whether that file exists.
+
+/// Could this value name a file inside a repository?
+///
+/// `src/main.rs` could. `/etc/passwd`, `../../etc/shadow`, `C:/Windows/win.ini` and `a\b` could not.
+/// The empty string could not: it names the root, not a file in it.
+pub fn is_repo_relative(path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    // A leading separator or a drive letter makes it absolute on some platform.
+    if path.starts_with('/') || path.starts_with('\\') {
+        return false;
+    }
+    if path.len() >= 2 && path.as_bytes()[1] == b':' {
+        return false;
+    }
+    // A backslash is a separator on Windows and an ordinary character elsewhere, so a path holding one
+    // means different things on different machines. Refused rather than guessed.
+    if path.contains('\\') {
+        return false;
+    }
+    // No component may climb, and a component that is empty means the value is malformed rather than
+    // merely unusual.
+    for part in path.split('/') {
+        if part == ".." {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tree_path_is_relative_and_does_not_climb() {
+        for ok in [
+            "a.txt",
+            "src/main.rs",
+            "a/b/c.rs",
+            "./a.txt",
+            "assets/x.bin",
+        ] {
+            assert!(is_repo_relative(ok), "{ok} must be accepted");
+        }
+        let backslash = "a\\b";
+        let unc = "\\\\server\\share\\x";
+        for bad in [
+            "/etc/passwd",
+            "../../etc/shadow",
+            "a/../../b",
+            unc,
+            "C:/Windows/win.ini",
+            "..",
+            "",
+            backslash,
+        ] {
+            assert!(
+                !is_repo_relative(bad),
+                "{bad:?} must be refused as a tree path"
+            );
+        }
+    }
+}

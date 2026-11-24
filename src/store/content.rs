@@ -129,7 +129,7 @@ pub fn changeset_from_content(
             // relative and stays inside the repository by definition, so anything that is not is
             // refused. Checked here rather than at the HTTP layer because this is the only place that
             // opens a file on the caller's word, and the CLI reaches it too.
-            if !is_repo_relative(path) {
+            if !crate::support::paths::is_repo_relative(path) {
                 return Err(bad(format!(
                     "{}: an entry with empty content is read from disk, so the path must be relative \
                      and stay inside the repository. Refused: it is absolute or climbs out.",
@@ -197,34 +197,6 @@ pub fn changeset_from_content(
     Ok(ContentChangeset { id, paths, skipped })
 }
 
-/// Is this a path that can name a file inside a repository?
-///
-/// A tree path is relative and has no component that climbs: `src/main.rs` is one, `/etc/passwd` and
-/// `../../etc/shadow` are not. Windows drive-qualified paths and backslash separators are refused too,
-/// so the answer does not depend on which machine the server runs on.
-fn is_repo_relative(path: &str) -> bool {
-    if path.is_empty() {
-        return false;
-    }
-    // A leading separator, a drive letter, or a backslash: absolute or ambiguous on some platform.
-    if path.starts_with('/') || path.starts_with('\\') {
-        return false;
-    }
-    if path.len() >= 2 && path.as_bytes()[1] == b':' {
-        return false;
-    }
-    if path.contains('\\') {
-        return false;
-    }
-    // No component may climb out.
-    for part in path.split('/') {
-        if part == ".." {
-            return false;
-        }
-    }
-    true
-}
-
 /// The repository-relative tail of a path on disk.
 ///
 /// A `.gitattributes` pattern is written against the tree, and the caller holds an absolute path. A
@@ -259,7 +231,10 @@ mod tests {
             "./a.txt",
             "assets/x.bin",
         ] {
-            assert!(is_repo_relative(ok), "{ok} must be accepted");
+            assert!(
+                crate::support::paths::is_repo_relative(ok),
+                "{ok} must be accepted"
+            );
         }
         let backslash = "a\\b";
         let unc = "\\\\server\\share\\x";
@@ -274,7 +249,7 @@ mod tests {
             backslash,
         ] {
             assert!(
-                !is_repo_relative(bad),
+                !crate::support::paths::is_repo_relative(bad),
                 "{bad:?} must be refused as a tree path"
             );
         }
