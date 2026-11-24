@@ -1335,14 +1335,39 @@ pub fn get_object_bytes(conn: &Connection, hash: &str) -> ZResult<Vec<u8>> {
             return Ok(bytes);
         }
     }
-    let row: Option<(Vec<u8>, i64)> = conn
+    let row: Option<(Vec<u8>, i64, i64)> = conn
         .query_row(
-            "SELECT content, compressed FROM objects WHERE hash = ?1",
+            "SELECT content, compressed, sidecar FROM objects WHERE hash = ?1",
             params![hash],
-            |r| Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?)),
+            |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            },
         )
         .optional()?;
-    let (blob, compressed) = row.ok_or_else(|| {
+    // The row says its body is in a sidecar file and the file is not there. Falling through used to
+    // return the row's empty body (#95), so a deleted, moved or never-written sidecar turned a large
+    // object into zero bytes with no error, and every reader - `show`, checkout, status hashing -
+    // then worked on wrong content instead of reporting that the object is gone. A grouped object
+    // whose group row is missing already fails closed, because `decompress_bytes(x'')` errors; this
+    // is the same case and now answers the same way.
+    // The row's own `sidecar` column is the only evidence that matters. An absent file is not
+    // evidence on its own: every inline object on a file-backed store has no sidecar file, and
+    // treating "no file" as "the file is missing" refused every object in the repository. That was
+    // the first version of this fix, and nine tests across pack, gitserver and http said so.
+    if row.as_ref().is_some_and(|(_, _, s)| *s != 0) {
+        return Err(Box::new(crate::support::error::Error::new(
+            crate::support::error::Code::Corrupt,
+            format!(
+                "object {} is marked as living in a sidecar file, and that file is missing; the store is damaged",
+                hash
+            ),
+        )));
+    }
+    let (blob, compressed, _) = row.ok_or_else(|| {
         bad(format!(
             "object {} not found (store may be corrupted)",
             hash
@@ -3255,5 +3280,45 @@ pub(crate) mod tests {
                 i
             );
         }
+    }
+    #[test]
+    fn a_sidecar_object_whose_file_is_gone_is_an_error_not_an_empty_object() {
+        // #95: a sidecar object's row holds `content = x''`, `compressed = 0`, `sidecar = 1`. When
+        // the file was missing, `sidecar::read` returned `None` and the read fell through to the row,
+        // which answered "empty object". A grouped object whose group is missing already fails
+        // closed, because `decompress_bytes(x'')` errors; this is the same case.
+        let d = std::env::temp_dir().join(format!("gesta-sidecar-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join(".gesta")).unwrap();
+        let conn = crate::store::open_db(&d).unwrap();
+        crate::store::init_schema(&conn).unwrap();
+
+        // Above `sidecar::INLINE_LIMIT` (4 MiB), or it stays inline and this tests nothing.
+        let body: Vec<u8> = (0..(crate::store::sidecar::INLINE_LIMIT + 1024))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let hash = put_object_bytes(&conn, &body).unwrap();
+        // The object reads correctly while its file exists.
+        assert_eq!(get_object_bytes(&conn, &hash).unwrap(), body);
+
+        // Remove the sidecar file. The row stays, still saying where the body is.
+        let file = crate::store::sidecar::path_for(&d, &hash).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        assert!(!file.exists());
+
+        match get_object_bytes(&conn, &hash) {
+            Ok(bytes) => panic!(
+                "a missing sidecar must not read as {} byte(s) of content",
+                bytes.len()
+            ),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("sidecar"),
+                    "the error must say what is missing, got: {msg}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

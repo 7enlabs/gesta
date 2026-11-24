@@ -282,24 +282,57 @@ mod tests {
         assert!(dropped > 0, "a full queue must be counted, not hidden");
         drop(listener);
     }
-    /// A collector that fails the first `fail_first` requests, then answers 200. Every request it
-    /// accepts is returned, so a test can read what actually went over the wire.
-    fn flaky_collector(fail_first: usize) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    /// A collector that fails the first `fail_first` requests, then answers 200 and keeps serving
+    /// until it has seen `want_gap`, so the test does not depend on which request happens to be the
+    /// one that carries the note. Every request it reads is returned, so a test can read what
+    /// actually went over the wire.
+    fn collector_until_gap(
+        fail_first: usize,
+        max_requests: usize,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = std::thread::spawn(move || {
-            let mut seen = Vec::new();
-            for i in 0..(fail_first + 1) {
-                let (mut s, _) = listener.accept().unwrap();
-                let mut buf = [0u8; 65536];
-                let n = s.read(&mut buf).unwrap_or(0);
-                let text = String::from_utf8_lossy(&buf[..n]).to_string();
+            let mut seen: Vec<String> = Vec::new();
+            for i in 0..max_requests {
+                let (mut s, _) = match listener.accept() {
+                    Ok(v) => v,
+                    Err(_) => break,
+                };
+                let mut raw = Vec::new();
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match s.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            raw.extend_from_slice(&chunk[..n]);
+                            if let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let head = String::from_utf8_lossy(&raw[..split]).to_lowercase();
+                                let want: Option<usize> = head
+                                    .lines()
+                                    .find_map(|l| l.strip_prefix("content-length:"))
+                                    .and_then(|v| v.trim().parse().ok());
+                                if let Some(want) = want {
+                                    if raw.len() - (split + 4) >= want {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let text = String::from_utf8_lossy(&raw).to_string();
                 if i < fail_first {
                     let _ = s.write_all(b"HTTP/1.1 500 Nope\r\nContent-Length: 0\r\n\r\n");
                 } else {
                     let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
                 }
+                let carries_gap = text.contains("gesta audit gap");
                 seen.push(text);
+                // Stop once the gap has been delivered and acknowledged, so the test can join.
+                if carries_gap && i >= fail_first {
+                    break;
+                }
             }
             seen
         });
@@ -311,10 +344,14 @@ mod tests {
         // #73: `Counters.dropped` was incremented and nothing read it, so a collector outage lost
         // audit events that were counted in a process nobody could ask. The header promised the
         // count "goes into the next line that is delivered" and no line ever carried it.
-        let (url, handle) = flaky_collector(1);
+        //
+        // The collector must be given a real chance to see the note: it fails the first request, and
+        // the queue holds thousands of events, so which request carries the note depends on timing.
+        // The first version of this test assumed the second request was the one and failed 2 runs in
+        // 3; asserting on `seen.last()` was asserting on a race.
+        let (url, handle) = collector_until_gap(1, 64);
         let f = Forwarder::start(url, None);
 
-        // The queue is 4096 deep, so filling it takes 4096 sends and only the rest are dropped.
         let mut accepted = 0usize;
         let mut dropped = 0usize;
         for _ in 0..(QUEUE_DEPTH + 8) {
@@ -335,20 +372,20 @@ mod tests {
             "every send is either accepted or counted as dropped, never both and never neither"
         );
 
-        // The first post fails, the second succeeds and must name the gap. Push one more so there is
-        // a line to carry it after the failure.
-        let _ = f.send("{\"decision\":\"allowed\"}");
         let seen = handle.join().unwrap();
-        let delivered = seen.last().expect("one request must arrive");
+        let with_gap = seen
+            .iter()
+            .find(|r| r.contains("gesta audit gap"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no request among {} carried the gap note; first was: {}",
+                    seen.len(),
+                    seen.first().map(|s| s.as_str()).unwrap_or("<none>")
+                )
+            });
         assert!(
-            delivered.contains("gesta audit gap"),
-            "the line after an outage must name the gap, got: {}",
-            delivered.replace("\\r", "").replace("\\n", "\n")
-        );
-        assert!(
-            delivered.contains(&dropped.to_string()),
-            "it must carry the count ({dropped}), got: {}",
-            delivered
+            with_gap.contains(&dropped.to_string()),
+            "the note must carry the count ({dropped}), got: {with_gap}"
         );
     }
 }

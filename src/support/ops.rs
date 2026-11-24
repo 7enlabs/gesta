@@ -243,8 +243,24 @@ pub fn undo(conn: &Connection, root: &std::path::Path) -> ZResult<String> {
     // The head moved, so the disk has to follow. Skipping this left a file the head claims
     // exists missing from the working tree, and `fsck` was clean because it never looks at
     // the disk.
+    //
+    // A failure here is reported, not swallowed (#88). `unwrap_or(0)` returned success and the
+    // message "undid ... (operation N, 0 file(s) written)" after the head had already moved and the
+    // disk had not: the exact inconsistency this step exists to prevent, announced as a success. The
+    // operation cannot be rolled back at this point - it is committed and the head is on the old
+    // state - so the message says what is true: the log moved, the files did not.
     let branch: String = crate::store::current_branch(conn)?;
-    let written = crate::repo::materialise(conn, root, &branch).unwrap_or(0);
+    let written = match crate::repo::materialise(conn, root, &branch) {
+        Ok(n) => n,
+        Err(e) => {
+            return Err(bad(format!(
+            "operation {} was undone in the log, but the working tree could not be brought back \
+                 to branch '{}' and the files on disk no longer match the head: {}. The undo is in \
+                 the log; run `gesta status` to see what the tree is missing.",
+            id, branch, e
+        )))
+        }
+    };
 
     let what = match &target {
         Some(t) => format!("{} {}", kind, t),
@@ -308,7 +324,15 @@ pub fn redo(conn: &Connection, root: &std::path::Path) -> ZResult<String> {
     tx.commit()?;
 
     let branch: String = crate::store::current_branch(conn)?;
-    let written = crate::repo::materialise(conn, root, &branch).unwrap_or(0);
+    // Reported for the same reason as in `undo` (#88): the redo is already committed, so a silent
+    // failure here leaves the head ahead of the disk and calls it a success.
+    let written = crate::repo::materialise(conn, root, &branch).map_err(|e| {
+        bad(format!(
+            "operation {} was redone in the log, but the working tree could not be brought back to \
+             branch '{}' and the files on disk no longer match the head: {}",
+            id, branch, e
+        ))
+    })?;
     let what = match &target {
         Some(t) => format!("{} {}", kind, t),
         None => kind.clone(),
@@ -558,6 +582,76 @@ mod tests {
             std::fs::read_to_string(dir.join("d").join("b.txt")).unwrap(),
             "v2\n"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn undo_reports_failure_when_the_disk_cannot_follow_the_head() {
+        // #88: `undo` and `redo` committed the head move, then called `materialise(..).unwrap_or(0)`
+        // and reported success - "undid ... (operation N, 0 file(s) written)" - with the head moved
+        // and the disk not following. That is exactly the inconsistency the step exists to prevent,
+        // announced as a success. The undo cannot be rolled back at that point, so the honest answer
+        // is an error that says the log moved and the tree did not.
+        let conn = mem_db();
+        let dir = std::env::temp_dir().join(format!("gesta-undo-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A real tree, through the same path the rest of the code uses, so `materialise` has an
+        // object to write. Writing `changeset_files` by hand leaves `file_versions` empty, the tree
+        // is then empty, and `materialise` returns 0 legitimately - which is what the first version
+        // of this test measured.
+        std::fs::write(dir.join("blocked.txt"), "one\n").unwrap();
+        crate::repo::create_changeset(&conn, &dir, "first", "t").unwrap();
+        let id: String = conn
+            .query_row("SELECT id FROM changesets LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        crate::repo::commit_one(&conn, &id).unwrap();
+        record(&conn, "commit", Some(&id), None).unwrap();
+
+        // A directory where the file must be written makes the write fail.
+        std::fs::remove_file(dir.join("blocked.txt")).unwrap();
+        std::fs::create_dir_all(dir.join("blocked.txt")).unwrap();
+
+        // The undo now has work: the head is on `cs1`, and undoing it puts the branch back to empty,
+        // which means `materialise` must remove `blocked.txt` - and cannot, because a directory is
+        // in its place. Removing a file that is not a file is not an error in `materialise`, so make
+        // the write fail instead: a second commit that ADDS a file, whose path is the directory.
+        conn.execute(
+            "INSERT INTO changesets(id,message,author,created_at,status,parent,branch)
+             VALUES('cs2','m','a',2,'committed',?1,'main')",
+            rusqlite::params![id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO changeset_files(changeset_id, path, old_hash, new_hash)
+             VALUES('cs2','blocked.txt', NULL, 'h-blocked')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO file_versions(path, changeset_id, hash, created_at, version)
+             VALUES('blocked.txt','cs2','h-blocked',2,2)",
+            [],
+        )
+        .unwrap();
+        conn.execute("UPDATE branches SET head = 'cs2' WHERE name = 'main'", [])
+            .unwrap();
+        record(&conn, "commit", Some("cs2"), None).unwrap();
+
+        match undo(&conn, &dir) {
+            Ok(msg) => panic!("the disk could not follow the head, yet undo reported: {msg}"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("working tree could not be brought back"),
+                    "the error must say the tree did not follow, got: {msg}"
+                );
+                assert!(
+                    msg.contains("undone in the log"),
+                    "and that the head did move, or the reader will retry the wrong thing: {msg}"
+                );
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
