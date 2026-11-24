@@ -2398,6 +2398,164 @@ pub fn gc(conn: &Connection) -> ZResult<u64> {
 /// module: `ancestors_bfs`, `in_placeholders`, the changeset_files query. It sat in `repo` instead,
 /// which made `store` call up into `repo` while `repo` called down into `store`. That cycle is
 /// invisible to the compiler, because this is one crate.
+/// The integrity questions `fsck` asks about a store, without a working tree.
+///
+/// `verify` used to promise "the same integrity questions `fsck` runs" and then ask two of them:
+/// `PRAGMA integrity_check` and whether the `changesets` table exists (#81). A backup can pass both
+/// and still be unusable - a `changeset_files` row pointing at an object that is not in the file
+/// restores into a repository that cannot check anything out, and the restore has already moved the
+/// live store aside by then.
+///
+/// This is the part of `fsck` that needs no filesystem: every referenced object exists, every parent
+/// exists (a shallow boundary is not damage), every branch head exists, every sidecar object has its
+/// file, and every branch's stored tree equals a rebuild from history. The working-tree check stays in
+/// `fsck`, because a backup file has no working tree.
+pub fn integrity_problems(
+    conn: &Connection,
+    root: Option<&std::path::Path>,
+) -> ZResult<Vec<String>> {
+    use rusqlite::OptionalExtension;
+    let mut out = Vec::new();
+
+    // Every changeset_file must point at objects that exist.
+    let refs: Vec<(String, String, Option<String>, Option<String>)> = {
+        let mut stmt = conn.prepare(
+            "SELECT changeset_id, path, old_hash, new_hash FROM changeset_files ORDER BY changeset_id, path",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (cs, path, old, new) in &refs {
+        for h in [old, new].into_iter().flatten() {
+            if get_object_bytes(conn, h).is_err() {
+                out.push(format!(
+                    "MISSING object {} referenced by {} ({})",
+                    h, cs, path
+                ));
+            }
+        }
+    }
+
+    // Every parent must exist, except at a shallow boundary.
+    let boundaries: std::collections::HashSet<String> = {
+        let mut stmt = conn.prepare("SELECT changeset_id FROM shallow_roots")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<std::collections::HashSet<_>>>()?
+    };
+    let parents: Vec<(String, Option<String>, Option<String>)> = {
+        let mut stmt = conn.prepare("SELECT id, parent, parent2 FROM changesets")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id, p1, p2) in &parents {
+        for p in [p1, p2].into_iter().flatten() {
+            let exists: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM changesets WHERE id = ?1",
+                    rusqlite::params![p],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if exists.is_none() && !boundaries.contains(id) {
+                out.push(format!("MISSING parent {} referenced by {}", p, id));
+            }
+        }
+    }
+
+    // Every branch head must exist.
+    let branches: Vec<(String, Option<String>)> = {
+        let mut stmt = conn.prepare("SELECT name, head FROM branches")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (name, head) in &branches {
+        if let Some(h) = head {
+            let exists: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM changesets WHERE id = ?1",
+                    rusqlite::params![h],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if exists.is_none() {
+                out.push(format!(
+                    "MISSING changeset {} is the head of branch {}",
+                    h, name
+                ));
+            }
+        }
+    }
+
+    // A sidecar object's file must be beside the database. Without a root there is no place to look,
+    // and a backup file holds every object inside itself, so the check is skipped rather than passed.
+    if let Some(root) = root {
+        let outside: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT hash FROM objects WHERE sidecar = 1")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let gone: Vec<&String> = outside
+            .iter()
+            .filter(|h| !sidecar::holds(root, h))
+            .collect();
+        if !gone.is_empty() {
+            out.push(format!(
+                "MISSING {} of {} sidecar object(s) have no file beside the database",
+                gone.len(),
+                outside.len()
+            ));
+        }
+    }
+
+    // The maintained tree must equal a rebuild from history.
+    let with_heads: Vec<(String, String)> = {
+        let mut stmt = conn.prepare("SELECT name, head FROM branches WHERE head IS NOT NULL")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (name, head) in &with_heads {
+        let mut expected = tree_at(conn, head)?;
+        let mut stored: Vec<(String, String)> = {
+            let mut stmt =
+                conn.prepare("SELECT path, hash FROM branch_tree WHERE branch = ?1 ORDER BY path")?;
+            let rows = stmt.query_map(rusqlite::params![name], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        stored.sort();
+        expected.sort();
+        if stored != expected {
+            let missing = expected.iter().filter(|e| !stored.contains(e)).count();
+            let extra = stored.iter().filter(|s| !expected.contains(s)).count();
+            out.push(format!(
+                "STALE tree for branch {}: {} row(s) stored, {} in history ({} missing, {} extra)",
+                name,
+                stored.len(),
+                expected.len(),
+                missing,
+                extra
+            ));
+        }
+    }
+    Ok(out)
+}
+
 pub fn tree_at(conn: &Connection, changeset: &str) -> ZResult<Vec<(String, String)>> {
     Ok(tree_at_with_mode(conn, changeset)?
         .into_iter()

@@ -182,6 +182,22 @@ pub fn verify(file: &std::path::Path) -> ZResult<Contents> {
         )));
     }
 
+    // The same integrity questions `fsck` asks (#81). The doc above said this and the code asked two
+    // of them, which is the shape of a promise that reads well and does not hold: `PRAGMA
+    // integrity_check` is happy with a file whose `changeset_files` rows point at objects that are not
+    // in it, and the restore has already moved the live store aside before anything notices.
+    //
+    // No root: a backup holds every object inside itself, so there is no sidecar directory to check.
+    let problems = crate::store::integrity_problems(&conn, None)?;
+    if !problems.is_empty() {
+        return Err(crate::support::backup::bad_err(format!(
+            "{} is a readable database but not a usable repository ({} problem(s)):\n  {}",
+            file.display(),
+            problems.len(),
+            problems.join("\n  ")
+        )));
+    }
+
     contents(&conn)
 }
 
@@ -314,11 +330,15 @@ mod tests {
             rusqlite::params![id],
         )
         .unwrap();
+        // Through `set_branch_head`, not a bare INSERT: the bare INSERT left `branch_tree` empty for a
+        // branch that has a head, which is the state `fsck` calls STALE. The backup carried that
+        // staleness, and `verify` only caught it once it asked the same questions `fsck` does (#81).
         conn.execute(
-            "INSERT INTO branches(name, head, created_at, from_branch) VALUES('side', ?1, 0, 'main')",
-            rusqlite::params![id],
+            "INSERT INTO branches(name, head, created_at, from_branch) VALUES('side', NULL, 0, 'main')",
+            [],
         )
         .unwrap();
+        crate::store::set_branch_head(&conn, "side", &id).unwrap();
 
         let dest = d.join("snapshot.db");
         let report = backup(&conn, &dest).unwrap();
@@ -499,6 +519,50 @@ mod tests {
             "a parked sidecar must not be left behind"
         );
         drop(back);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    #[test]
+    fn a_backup_that_points_at_a_missing_object_is_refused() {
+        // #81: `verify` promised "the same integrity questions fsck runs" and asked two of them:
+        // `PRAGMA integrity_check` and whether `changesets` exists. A file can pass both and still be
+        // unusable - a `changeset_files` row naming an object that is not in the file restores into a
+        // repository that cannot check anything out, and by then the live store has been moved aside.
+        let d = std::env::temp_dir().join(format!("gesta-verify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let conn = repo(&d);
+        std::fs::write(d.join("a.txt"), "one\n").unwrap();
+        crate::repo::create_changeset(&conn, &d, "first", "t").unwrap();
+        let id: String = conn
+            .query_row("SELECT id FROM changesets LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        crate::repo::commit_one(&conn, &id).unwrap();
+
+        let dest = d.join("snapshot.db");
+        backup(&conn, &dest).unwrap();
+        // The honest baseline: this backup verifies.
+        verify(&dest).unwrap();
+
+        // Now make it the thing `PRAGMA integrity_check` cannot see: a reference to an object that is
+        // not there. The row is well-formed and the pages are consistent, so the file is a valid
+        // database holding an unusable repository.
+        {
+            let b = Connection::open(&dest).unwrap();
+            b.execute("DELETE FROM objects", []).unwrap();
+        }
+
+        let err = match verify(&dest) {
+            Ok(_) => panic!("the backup names objects it does not hold, yet verify accepted it"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("not a usable repository"),
+            "the refusal must say the file is not usable, got: {err}"
+        );
+        assert!(
+            err.contains("MISSING object"),
+            "and name what is missing, or the operator has to guess: {err}"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 }
