@@ -82,16 +82,40 @@ pub fn git_name(name: &str) -> Option<&'static str> {
 /// guard an author already wrote should not silently never run.
 pub fn git_hook(root: &Path, name: &str) -> Option<PathBuf> {
     let git = git_name(name)?;
-    [
-        root.join(".git").join("hooks").join(git),
-        root.join(".git").join(git),
-    ]
-    .into_iter()
-    .find(|c| c.is_file())
+    // The extension matters here for the same reason it does for an installed hook: on Windows a
+    // `.cmd` next to the plain name is the one that can run, and the plain name is the one that
+    // cannot. Both are offered so a repository written by git for Windows is still found.
+    let mut names = vec![git.to_string()];
+    if cfg!(windows) {
+        names.insert(0, format!("{}.cmd", git));
+    }
+    names
+        .into_iter()
+        .flat_map(|n| {
+            [
+                root.join(".git").join("hooks").join(&n),
+                root.join(".git").join(&n),
+            ]
+        })
+        .find(|c| c.is_file())
+}
+
+/// The file name a hook is stored under.
+///
+/// Windows decides how a file runs by its extension, not by anything inside it, and `cmd /C` will
+/// only run a `.cmd` or `.bat`. So the same hook is `pre-commit` on Unix and `pre-commit.cmd` on
+/// Windows, and one function answers which - otherwise `install`, `run`, `sources` and `remove`
+/// each get to disagree about the name, which is how a hook gets installed and never found.
+fn hook_file_name(name: &str) -> String {
+    if cfg!(windows) {
+        format!("{}.cmd", name)
+    } else {
+        name.to_string()
+    }
 }
 
 pub fn path_of(root: &Path, name: &str) -> PathBuf {
-    hooks_dir(root).join(name)
+    hooks_dir(root).join(hook_file_name(name))
 }
 
 /// What a repository recorded about an installed hook when it was installed.
@@ -288,7 +312,7 @@ pub fn install(root: &Path, name: &str, body: &str) -> ZResult<PathBuf> {
     }
     let dir = hooks_dir(root);
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(name);
+    let path = dir.join(hook_file_name(name));
     std::fs::write(&path, body)?;
     #[cfg(unix)]
     {
