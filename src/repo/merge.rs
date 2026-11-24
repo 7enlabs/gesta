@@ -251,6 +251,66 @@ pub fn merge3(base: &str, ours: &str, theirs: &str) -> MergeResult {
             (None, None) => break,
         };
 
+        // A hunk still to be applied that starts before `bi` covers base lines this walk has already
+        // emitted: the other side's region ended past its start, so the two sides changed the same
+        // base lines. That is a conflict, and it used to be applied as if it sat after the emitted
+        // text, silently dropping the base lines both sides had replaced. Base `1,2,3,4` with ours
+        // changing `1,2` and theirs `2,3` came out as `A,B,X,Y,4` with no conflict reported: both `2`
+        // and `3` were gone.
+        //
+        // The skip loops above only consume a hunk that ends at or before `bi`. One that starts
+        // before it and ends after is exactly this case, and it never was handled.
+        let overlaps = |h: Option<&Hunk>| {
+            h.map(|h| h.old_len > 0 && h.old_start < bi)
+                .unwrap_or(false)
+        };
+        if overlaps(our_hunks.get(oi)) || overlaps(their_hunks.get(ti)) {
+            let (o_start, o_end, o_repl) = match our_hunks.get(oi) {
+                Some(h) => (
+                    h.old_start,
+                    h.old_start + h.old_len,
+                    our_lines[h.new_start..h.new_start + h.new_len]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<String>>(),
+                ),
+                None => (bi, bi, Vec::new()),
+            };
+            let (t_start, t_end, t_repl) = match their_hunks.get(ti) {
+                Some(h) => (
+                    h.old_start,
+                    h.old_start + h.old_len,
+                    their_lines[h.new_start..h.new_start + h.new_len]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<String>>(),
+                ),
+                None => (bi, bi, Vec::new()),
+            };
+            // Whatever base lines sit between what has been emitted and the earlier of the two
+            // regions are untouched by either side and belong in the output before the marker.
+            let mark = next_base.max(bi).max(o_start.min(t_start));
+            while bi < mark && bi < base_lines.len() {
+                out.push(base_lines[bi].to_string());
+                bi += 1;
+            }
+            let marker = format!(
+                "<<<<<<< ours\n{}\n=======\n{}\n>>>>>>> theirs",
+                o_repl.join("\n"),
+                t_repl.join("\n")
+            );
+            conflicts.push(marker.clone());
+            out.push(marker);
+            bi = o_end.max(t_end).max(bi);
+            if o_start <= t_start {
+                oi += 1;
+            }
+            if t_start <= o_start {
+                ti += 1;
+            }
+            continue;
+        }
+
         // Copy untouched base lines up to the next hunk.
         while bi < next_base {
             out.push(base_lines[bi].to_string());
@@ -274,6 +334,8 @@ pub fn merge3(base: &str, ours: &str, theirs: &str) -> MergeResult {
         let mut their_end = bi;
         let mut their_repl: Vec<String> = Vec::new();
         let mut their_changed = false;
+        // At least one of their hunks here adds lines rather than replacing them.
+        let mut their_repl_is_insertion = false;
         while ti < their_hunks.len() && their_hunks[ti].old_start == next_base {
             let h = &their_hunks[ti];
             their_end = h.old_start + h.old_len;
@@ -282,6 +344,9 @@ pub fn merge3(base: &str, ours: &str, theirs: &str) -> MergeResult {
                 .map(|s| s.to_string())
                 .collect();
             their_changed = true;
+            if h.old_len == 0 {
+                their_repl_is_insertion = true;
+            }
             ti += 1;
         }
 
@@ -297,7 +362,13 @@ pub fn merge3(base: &str, ours: &str, theirs: &str) -> MergeResult {
                 // it: two sides that both introduce the same line at slightly different base
                 // positions produced it twice, and a rebase showed the duplicate in the file
                 // while reporting success.
-                let already = !their_repl.is_empty()
+                // The tail comparison answers "is my replacement already the end of the file",
+                // which is only a duplicate when this hunk replaces base lines. A pure insertion
+                // adds lines that were not there: base `a,a` with theirs `a,a,a` appends one `a`,
+                // the file already ends with `a`, and the append was dropped while the merge
+                // reported success. Insertions are therefore never suppressed this way.
+                let already = !their_repl_is_insertion
+                    && !their_repl.is_empty()
                     && out.len() >= their_repl.len()
                     && out[out.len() - their_repl.len()..] == their_repl[..];
                 if !already {
@@ -504,6 +575,66 @@ mod tests {
             "the replacement appeared more than once: {:?}",
             text
         );
+    }
+
+    #[test]
+    fn two_sides_changing_overlapping_base_lines_conflict_instead_of_dropping_them() {
+        // #119: base `1,2,3,4`, ours changes `1,2`, theirs changes `2,3`. Line 2 is changed by both.
+        // This used to come out Clean("A\nB\nX\nY\n4\n"): both `2` and `3` were gone and neither
+        // side's edit to the shared line survived, with no conflict reported.
+        let r = merge3("1\n2\n3\n4\n", "A\nB\n3\n4\n", "1\nX\nY\n4\n");
+        assert!(
+            r.is_conflict(),
+            "overlapping edits must conflict, got {:?}",
+            r.text()
+        );
+        let text = r.text();
+        // Both sides are in the marker, so a person resolving it can see what they are choosing.
+        assert!(text.contains("<<<<<<< ours"), "{text}");
+        assert!(
+            text.contains("A") && text.contains("B"),
+            "our side missing: {text}"
+        );
+        assert!(
+            text.contains("X") && text.contains("Y"),
+            "their side missing: {text}"
+        );
+    }
+
+    #[test]
+    fn a_region_that_merely_touches_the_next_one_does_not_conflict() {
+        // Adjacent, not overlapping: ours changes line 1, theirs changes line 2. The guard must key
+        // on overlap, not on being near.
+        let r = merge3("1\n2\n3\n", "A\n2\n3\n", "1\nB\n3\n");
+        assert!(
+            !r.is_conflict(),
+            "adjacent edits are not a conflict: {:?}",
+            r.text()
+        );
+        let t = r.text();
+        assert!(t.contains("A") && t.contains("B") && t.contains("3"), "{t}");
+    }
+
+    #[test]
+    fn a_one_sided_append_of_a_duplicate_line_is_kept() {
+        // #122: base `a,a`, theirs `a,a,a` appends one `a`. The duplicate check compared the tail of
+        // the output against their replacement, saw the file already ended with `a`, and dropped the
+        // append while reporting success.
+        let r = merge3("a\na\n", "a\na\n", "a\na\na\n");
+        match r {
+            MergeResult::Clean(t) => assert_eq!(
+                t, "a\na\na\n",
+                "a one-sided append of a duplicate line must be kept"
+            ),
+            MergeResult::Conflict { .. } => panic!("a one-sided append is not a conflict"),
+        }
+
+        // The same shape where the repeated line is not at the end of the base.
+        let r2 = merge3("x\ny\n", "x\ny\n", "x\ny\ny\n");
+        match r2 {
+            MergeResult::Clean(t) => assert_eq!(t, "x\ny\ny\n"),
+            MergeResult::Conflict { .. } => panic!("a one-sided append is not a conflict"),
+        }
     }
 
     #[test]

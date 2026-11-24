@@ -1197,28 +1197,73 @@ pub fn merge_branch(
     paths.sort();
 
     let mut merged_files: Vec<(String, String)> = Vec::new();
+    let mut removed: Vec<String> = Vec::new();
     let mut conflicts: Vec<String> = Vec::new();
     let mut reports: Vec<crate::repo::conflict::ConflictReport> = Vec::new();
 
     for path in &paths {
-        let base_text = match &base {
+        // Present or absent is a different question from empty or not empty, and this loop used to
+        // conflate them: every `None` became `String::new()`, so a path one side deleted looked
+        // exactly like a path one side replaced with nothing. A merge of a deletion against an
+        // unchanged file then produced an empty file instead of the deletion, and the caller was told
+        // the merge was clean.
+        //
+        // The three states are kept as `Option<String>` and resolved below, which is what
+        // `cherry_pick` already did by looking at `new_hash` rather than at the text.
+        let base_side: Option<String> = match &base {
             Some(b) => match hash_at_point(conn, path, b)? {
-                Some(h) => get_object(conn, &h)?,
-                None => String::new(),
+                Some(h) => Some(get_object(conn, &h)?),
+                None => None,
             },
-            None => String::new(),
+            None => None,
         };
-        let our_text = match &tgt_head {
+        let our_side: Option<String> = match &tgt_head {
             Some(t) => match hash_at_point(conn, path, t)? {
-                Some(h) => get_object(conn, &h)?,
-                None => String::new(),
+                Some(h) => Some(get_object(conn, &h)?),
+                None => None,
             },
-            None => String::new(),
+            None => None,
         };
-        let their_text = match hash_at_point(conn, path, &src_head)? {
-            Some(h) => get_object(conn, &h)?,
-            None => String::new(),
+        let their_side: Option<String> = match hash_at_point(conn, path, &src_head)? {
+            Some(h) => Some(get_object(conn, &h)?),
+            None => None,
         };
+
+        // One side removed the path and the other left it as the base had it: the answer is the
+        // removal, not an empty file.
+        //
+        // "Left it as the base had it" is the whole condition. If the other side changed the file,
+        // a delete/modify question has two defensible answers and this merges it as a conflict
+        // rather than choosing. If the base did not have the path, the side that has it added it and
+        // there is nothing to remove, which falls through to the ordinary three-way merge.
+        if let Some(b) = &base_side {
+            let ours_same = our_side.as_ref() == Some(b);
+            let theirs_same = their_side.as_ref() == Some(b);
+            if (their_side.is_none() && ours_same) || (our_side.is_none() && theirs_same) {
+                removed.push(path.clone());
+                continue;
+            }
+            if our_side.is_some() != their_side.is_some() && !ours_same && !theirs_same {
+                conflicts.push(path.clone());
+                // Their content, for the copy a person inspects while resolving.
+                if let Some(theirs) = &their_side {
+                    write_conflict_copy(root, path, theirs)?;
+                }
+                if let Some(rep) = crate::repo::conflict::report(
+                    path,
+                    b,
+                    our_side.as_deref().unwrap_or(""),
+                    their_side.as_deref().unwrap_or(""),
+                ) {
+                    reports.push(rep);
+                }
+                continue;
+            }
+        }
+
+        let base_text = base_side.clone().unwrap_or_default();
+        let our_text = our_side.clone().unwrap_or_default();
+        let their_text = their_side.clone().unwrap_or_default();
 
         // A path absent on one side and present on the other is an add.
         let result = merge3(&base_text, &our_text, &their_text);
@@ -1300,6 +1345,24 @@ pub fn merge_branch(
             params![path, next_ver, h, id, now()],
         )?;
     }
+    // A removal is a changeset file row with no new hash, which is how every other delete in this
+    // codebase records one. Without this the path stayed in the tree: the merge reported clean, the
+    // file was still there, and the branch it came from had already deleted it.
+    for path in &removed {
+        let old_hash: Option<String> = tx
+            .query_row(
+                "SELECT new_hash FROM changeset_files WHERE path = ?1 ORDER BY rowid DESC LIMIT 1",
+                params![path],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten();
+        tx.execute(
+            "INSERT INTO changeset_files(changeset_id, path, old_hash, new_hash)
+             VALUES(?1, ?2, ?3, NULL)",
+            params![id, path, old_hash],
+        )?;
+    }
     crate::store::set_branch_head(&tx, target, &id)?;
     tx.commit()?;
 
@@ -1310,6 +1373,15 @@ pub fn merge_branch(
             fs::create_dir_all(parent)?;
         }
         fs::write(&target_path, text)?;
+    }
+    // And take the removed ones off it, or the worktree contradicts the tree the branch now points
+    // at. A missing file is not an error here: the base may have held the path while this worktree
+    // never did.
+    for path in &removed {
+        let target_path = root.join(path);
+        if target_path.exists() {
+            fs::remove_file(&target_path)?;
+        }
     }
 
     let touched: Vec<(String, String)> = merged_files
@@ -2743,6 +2815,126 @@ pub(crate) mod tests {
             vec!["agentA", "agentA", "agentA", "agentB"],
             "the appended duplicate belongs to agentB"
         );
+    }
+
+    #[test]
+    fn a_one_sided_deletion_removes_the_file_instead_of_emptying_it() {
+        // #118: every absent path was read as `String::new()`, so a deletion on one side and an
+        // untouched file on the other merged into an empty file, and the caller was told the merge
+        // was clean. `cherry_pick` handled this by looking at the hash rather than the text; this is
+        // the same question asked of `merge_branch`.
+        let tmp = std::env::temp_dir().join(format!("zf_merge_del_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let conn = mem_db();
+        fs::write(tmp.join("gone.txt"), "keep me\n").unwrap();
+        commit_files(&conn, "cs1", "base", &[("gone.txt", "keep me\n")]);
+        conn.execute(
+            "INSERT INTO branches(name,head,created_at,from_branch) VALUES('dev','cs1',0,'main')",
+            [],
+        )
+        .unwrap();
+
+        // main adds a second file and does not touch gone.txt
+        fs::write(tmp.join("other.txt"), "ours\n").unwrap();
+        commit_files(
+            &conn,
+            "cs2",
+            "ours",
+            &[("gone.txt", "keep me\n"), ("other.txt", "ours\n")],
+        );
+        conn.execute("UPDATE changesets SET parent='cs1' WHERE id='cs2'", [])
+            .unwrap();
+
+        // dev deletes gone.txt
+        conn.execute(
+            "INSERT INTO changesets(id,message,author,created_at,status,parent,branch)
+             VALUES('cs3','delete','a',2,'pending','cs1','dev')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO changeset_files(changeset_id,path,old_hash,new_hash)
+             VALUES('cs3','gone.txt','whatever',NULL)",
+            [],
+        )
+        .unwrap();
+        commit_one(&conn, "cs3").unwrap();
+
+        let out = merge_branch(&conn, &tmp, "dev", "main", "a").unwrap();
+        assert!(
+            out.conflicts.is_empty(),
+            "deletion against an untouched file is not a conflict: {:?}",
+            out.conflicts
+        );
+
+        // The tree no longer holds the path, and neither does the working copy.
+        let tree =
+            crate::store::tree_at(&conn, &branch_head(&conn, "main").unwrap().unwrap()).unwrap();
+        assert!(
+            !tree.iter().any(|(p, _)| p == "gone.txt"),
+            "the merged tree still lists the deleted path: {tree:?}"
+        );
+        assert!(
+            !tmp.join("gone.txt").exists(),
+            "the working copy still holds a file the merge removed"
+        );
+        // And the other side's file survived.
+        assert_eq!(fs::read_to_string(tmp.join("other.txt")).unwrap(), "ours\n");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_deletion_against_a_changed_file_is_a_conflict_not_a_silent_choice() {
+        // The delete/modify question has two defensible answers, so it is reported rather than
+        // chosen. Before, it came out as an empty file with no conflict.
+        let tmp = std::env::temp_dir().join(format!("zf_merge_dm_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let conn = mem_db();
+        fs::write(tmp.join("f.txt"), "base\n").unwrap();
+        commit_files(&conn, "cs1", "base", &[("f.txt", "base\n")]);
+        conn.execute(
+            "INSERT INTO branches(name,head,created_at,from_branch) VALUES('dev','cs1',0,'main')",
+            [],
+        )
+        .unwrap();
+
+        // main changes it
+        fs::write(tmp.join("f.txt"), "changed by main\n").unwrap();
+        commit_files(&conn, "cs2", "ours", &[("f.txt", "changed by main\n")]);
+        conn.execute("UPDATE changesets SET parent='cs1' WHERE id='cs2'", [])
+            .unwrap();
+
+        // dev deletes it
+        conn.execute(
+            "INSERT INTO changesets(id,message,author,created_at,status,parent,branch)
+             VALUES('cs3','delete','a',2,'pending','cs1','dev')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO changeset_files(changeset_id,path,old_hash,new_hash)
+             VALUES('cs3','f.txt','x',NULL)",
+            [],
+        )
+        .unwrap();
+        commit_one(&conn, "cs3").unwrap();
+
+        let out = merge_branch(&conn, &tmp, "dev", "main", "a").unwrap();
+        assert_eq!(
+            out.conflicts,
+            vec!["f.txt".to_string()],
+            "delete against modify must be reported"
+        );
+        assert!(
+            out.merge_changeset.is_none(),
+            "a conflicted merge is not a merge"
+        );
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]

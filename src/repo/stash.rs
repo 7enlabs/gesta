@@ -491,10 +491,24 @@ fn apply_hunk(root: &Path, path: &str, at: usize, body: &str) -> ZResult<()> {
     // Taking a hunk reverted its lines to the OLD text, so the file at `at` holds what used to be
     // there. Restoring means replacing that old span, not inserting beside it: inserting left both
     // the old line and the new one, which is a file that grew by a line every pop.
+    // The hunk was recorded as the lines it added, so its own length says nothing about how many base
+    // lines it displaced. Using that length as the span was wrong for every hunk that adds more lines
+    // than it takes, and a pure insertion has no base lines at all: base `a,b,c` with a stashed `x,y`
+    // came back as `a,x,y`, with `b` and `c` deleted by a pop that reported success.
+    //
+    // An insertion is the case that can be answered without guessing: it takes no base lines, so it
+    // removes none. Anything else needs to know what it replaced, and the entry only carries the new
+    // text, so the replaced span is left in place and the new text goes in front of it. That is a
+    // conservative answer, and it is visible in the file rather than silent.
     let at = at.min(updated.len());
-    let span = body_lines.len().min(updated.len() - at);
-    if span > 0 && !body_lines.contains(&updated[at].as_str()) {
-        updated.drain(at..at + span);
+    if body_lines.iter().all(|l| updated.iter().any(|u| u == l)) {
+        // Everything the hunk carries is already in the file: applied, not an error.
+        return Ok(());
+    }
+    // A hunk whose first line already sits at `at` was applied here; inserting again would duplicate
+    // it.
+    if updated.get(at).map(|s| s.as_str()) == body_lines.first().copied() {
+        return Ok(());
     }
     for (i, line) in body_lines.iter().enumerate() {
         updated.insert(at + i, line.to_string());
@@ -601,6 +615,53 @@ mod tests {
         assert_eq!(std::fs::read_to_string(d.join("f.txt")).unwrap(), "base\n");
         assert!(!d.join("new.txt").exists(), "an added file is removed too");
 
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_pure_addition_does_not_delete_the_lines_below_it() {
+        // #120: the span drained was the hunk's own length, but a hunk is recorded as the lines it
+        // ADDED. A pure addition has no base lines, so draining by its length removed unrelated
+        // lines. Base `a,b,c` with a stashed `x,y` came back as `a,x,y`.
+        let d = std::env::temp_dir().join(format!("zf_hunk_pure_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("f.txt"), "a\nb\nc\n").unwrap();
+
+        apply_hunk(&d, "f.txt", 1, "x\ny").unwrap();
+
+        let got = std::fs::read_to_string(d.join("f.txt")).unwrap();
+        assert_eq!(
+            got, "a\nx\ny\nb\nc\n",
+            "a pure addition must not remove the lines under it"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_stashed_addition_at_the_end_survives_a_pop() {
+        // #120 end to end: append two lines, stash, pop. The base lines must still be there.
+        let d = repo_with_file("hunkappend");
+        let conn = mem_db();
+        commit_files(&conn, "c1", "first", &[("f.txt", "a\nb\nc\n")]);
+
+        std::fs::write(d.join("f.txt"), "a\nb\nc\nx\ny\n").unwrap();
+        save(&conn, &d, "wip", "t").unwrap();
+
+        // Take the hunk back out, which is the state pop starts from.
+        std::fs::write(d.join("f.txt"), "a\nb\nc\n").unwrap();
+
+        let (_s, _written, blocked) = pop(&conn, &d, None).unwrap();
+        assert!(blocked.is_empty(), "{blocked:?}");
+        let got = std::fs::read_to_string(d.join("f.txt")).unwrap();
+        assert!(
+            got.contains("b") && got.contains("c"),
+            "the base lines were deleted by the pop: {got:?}"
+        );
+        assert!(
+            got.contains("x") && got.contains("y"),
+            "the hunk was lost: {got:?}"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
