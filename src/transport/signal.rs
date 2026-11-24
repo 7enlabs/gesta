@@ -87,8 +87,25 @@ pub fn wait_until_stopped(wait: impl Fn(std::time::Duration) -> bool) {
 mod tests {
     use super::*;
 
+    // `STOP` is a process-wide static and cargo runs tests in threads of one binary, so a test that
+    // sets it races every test that reads it. The first version of these tests guarded only the read
+    // path with a save-and-restore and left the waits unguarded: `waiting_returns_true_as_soon_as_the_flag_is_set`
+    // sets the flag 20 ms in, and `waiting_returns_false_when_nothing_asks_it_to_stop` waits 30 ms and
+    // asserts the flag stayed clear. They passed on Linux by scheduling and failed on the Windows
+    // runner, where the flag was set before the wait began. A lock is the only thing that separates
+    // them, because the flag is a static and cannot be threaded through.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        // A panic in one test poisons the lock for the rest. The flag is restored by hand at the end
+        // of each test and the asserts are read-only, so a poisoned lock is not a reason to fail the
+        // others: take it back.
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn the_flag_starts_clear_and_reads_back_what_was_stored() {
+        let _g = serial();
         // The static is shared across tests in the same binary, so this asserts the read path rather
         // than the initial value: another test may have set it.
         let before = stop_requested();
@@ -99,6 +116,7 @@ mod tests {
 
     #[test]
     fn waiting_returns_false_when_nothing_asks_it_to_stop() {
+        let _g = serial();
         STOP.store(false, Ordering::Relaxed);
         let started = std::time::Instant::now();
         let stopped = wait_for_stop(std::time::Duration::from_millis(30));
@@ -111,6 +129,7 @@ mod tests {
 
     #[test]
     fn waiting_returns_true_as_soon_as_the_flag_is_set() {
+        let _g = serial();
         STOP.store(false, Ordering::Relaxed);
         let setter = std::thread::spawn(|| {
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -129,6 +148,7 @@ mod tests {
 
     #[test]
     fn a_finished_wait_does_not_mean_the_server_should_stop() {
+        let _g = serial();
         // The defect this guards: a wait with a deadline returns false when the deadline passes, and
         // the caller treated any return as a reason to exit. A server up for the length of its
         // deadline then shut down with status 0 and said nothing, so a supervisor saw a clean stop
