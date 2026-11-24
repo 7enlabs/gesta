@@ -97,8 +97,13 @@ pub fn save_hunks(
         path: String,
         kept: String,
         original: String,
-        /// (hunk number, line index the hunk starts at in the file as it is now, the hunk's text)
-        taken: Vec<(usize, usize, String)>,
+        /// (hunk number, where the hunk starts now, how many base lines it displaced, its text)
+        ///
+        /// The displaced count is recorded because it cannot be recovered later: the entry holds the
+        /// text the hunk ADDS, and `apply_hunk` has no way to tell from that how many lines it
+        /// replaced. Without it the restore either drained by the hunk's own length - wrong for every
+        /// insertion - or drained nothing, which left the old line behind.
+        taken: Vec<(usize, usize, usize, String)>,
     }
     let mut plans: Vec<Plan> = Vec::new();
     for (path, nums) in &by_path {
@@ -145,7 +150,7 @@ pub fn save_hunks(
             // Store where the hunk starts, not just its number. The number is an ordinal among the
             // hunks of this diff; putting the text back at line `number` was wrong for every hunk
             // that was not the first, and silently inserted the lines at the top of the file.
-            taken.push((*n, h.new_start, body));
+            taken.push((*n, h.new_start, h.old_len, body));
         }
 
         // The file that stays behind: the original with the taken hunks reverted to their old text.
@@ -181,13 +186,21 @@ pub fn save_hunks(
 
     let mut saved = 0usize;
     for plan in &plans {
-        for (n, at, body) in &plan.taken {
-            // The name carries `path#number#line`; the number is what the user asked for and the line
-            // is where the text goes back. Keeping them apart is what stops a hunk from landing at
-            // the top of the file when it belongs in the middle.
+        for (n, at, replaced, body) in &plan.taken {
+            // The name carries `path#number#line#replaced`. The number is what the user asked for,
+            // the line is where the text goes back, and the count is how many base lines it took out.
+            // Keeping the three apart is what stops a hunk from landing at the top of the file when
+            // it belongs in the middle, and what lets the old text be displaced exactly.
+            //
+            // Older entries carry `path#number#line` and are read as "replaced = the hunk's length",
+            // which is what those entries were written under.
             tx.execute(
                 "INSERT INTO stash_files(stash_id, path, hash) VALUES(?1, ?2, ?3)",
-                params![stash_id, format!("{}#{}#{}", plan.path, n, at), body],
+                params![
+                    stash_id,
+                    format!("{}#{}#{}#{}", plan.path, n, at, replaced),
+                    body
+                ],
             )?;
             saved += 1;
         }
@@ -424,14 +437,33 @@ pub fn pop(
         // number is what the caller named. Older entries carry only `path#number`, and for those the
         // number was used as the position, which is wrong for any hunk but the first - falling back
         // to it would restore the bug rather than the text, so the line is taken from the entry.
-        if let Some((rest, line)) = rel.rsplit_once('#') {
-            if let Some((path, _num)) = rest.rsplit_once('#') {
-                if let (Some(body), Ok(at)) = (hash.as_ref(), line.parse::<usize>()) {
-                    apply_hunk(root, path, at, body)?;
-                    written += 1;
-                    continue;
-                }
-            }
+        // `path#number#line#replaced`, or the older `path#number#line`.
+        //
+        // The name is split from the right because a path may itself contain `#`. An entry with three
+        // fields predates the count, and for those the replaced span is taken to be the hunk's own
+        // length, which is the assumption they were written under.
+        // `rsplitn` yields right to left: [replaced, line, number, path].
+        let parts: Vec<&str> = rel.rsplitn(4, '#').collect();
+        let hunk_entry: Option<(String, usize, Option<usize>, String)> =
+            match (hash.as_ref(), parts.as_slice()) {
+                (Some(body), [replaced, line, num, path]) => line
+                    .parse::<usize>()
+                    .ok()
+                    .zip(replaced.parse::<usize>().ok())
+                    .filter(|_| num.parse::<usize>().is_ok())
+                    .map(|(at, rep)| (path.to_string(), at, Some(rep), body.clone())),
+                // An older entry has three fields: [line, number, path].
+                (Some(body), [line, num, path]) => line
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|_| num.parse::<usize>().is_ok())
+                    .map(|at| (path.to_string(), at, None, body.clone())),
+                _ => None,
+            };
+        if let Some((path, at, replaced, body)) = hunk_entry {
+            apply_hunk(root, &path, at, replaced, &body)?;
+            written += 1;
+            continue;
         }
         let target = root.join(rel);
         match hash {
@@ -464,7 +496,13 @@ pub fn pop(
 /// found by looking for where the surrounding context still matches; a file that no longer holds the
 /// context is refused rather than appended to, because a hunk in the wrong place is worse than a
 /// hunk not applied.
-fn apply_hunk(root: &Path, path: &str, at: usize, body: &str) -> ZResult<()> {
+fn apply_hunk(
+    root: &Path,
+    path: &str,
+    at: usize,
+    replaced: Option<usize>,
+    body: &str,
+) -> ZResult<()> {
     let full = root.join(path);
     let current = match read_file(&full) {
         ReadOutcome::Text(c) => c,
@@ -491,24 +529,27 @@ fn apply_hunk(root: &Path, path: &str, at: usize, body: &str) -> ZResult<()> {
     // Taking a hunk reverted its lines to the OLD text, so the file at `at` holds what used to be
     // there. Restoring means replacing that old span, not inserting beside it: inserting left both
     // the old line and the new one, which is a file that grew by a line every pop.
-    // The hunk was recorded as the lines it added, so its own length says nothing about how many base
-    // lines it displaced. Using that length as the span was wrong for every hunk that adds more lines
-    // than it takes, and a pure insertion has no base lines at all: base `a,b,c` with a stashed `x,y`
-    // came back as `a,x,y`, with `b` and `c` deleted by a pop that reported success.
+    // How many base lines this hunk displaced is recorded at stash time, because it cannot be
+    // recovered here: the entry holds the text the hunk ADDS, and no reading of that says how much
+    // it replaced.
     //
-    // An insertion is the case that can be answered without guessing: it takes no base lines, so it
-    // removes none. Anything else needs to know what it replaced, and the entry only carries the new
-    // text, so the replaced span is left in place and the new text goes in front of it. That is a
-    // conservative answer, and it is visible in the file rather than silent.
+    // Two earlier answers were both wrong. Draining by the hunk's own length deleted unrelated lines
+    // for every insertion - base `a,b,c` plus a stashed `x,y` came back as `a,x,y`. Draining nothing
+    // left the old line in place, so a replaced line stayed next to its replacement and a pop did not
+    // restore the file. The count is the only honest source, and an older entry without one is read
+    // as "the hunk's own length", which is what those entries were written under.
     let at = at.min(updated.len());
     if body_lines.iter().all(|l| updated.iter().any(|u| u == l)) {
         // Everything the hunk carries is already in the file: applied, not an error.
         return Ok(());
     }
-    // A hunk whose first line already sits at `at` was applied here; inserting again would duplicate
-    // it.
+    // Already at this position: inserting again would duplicate it.
     if updated.get(at).map(|s| s.as_str()) == body_lines.first().copied() {
         return Ok(());
+    }
+    let span = replaced.unwrap_or(body_lines.len()).min(updated.len() - at);
+    if span > 0 {
+        updated.drain(at..at + span);
     }
     for (i, line) in body_lines.iter().enumerate() {
         updated.insert(at + i, line.to_string());
@@ -628,7 +669,7 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("f.txt"), "a\nb\nc\n").unwrap();
 
-        apply_hunk(&d, "f.txt", 1, "x\ny").unwrap();
+        apply_hunk(&d, "f.txt", 1, Some(0), "x\ny").unwrap();
 
         let got = std::fs::read_to_string(d.join("f.txt")).unwrap();
         assert_eq!(
