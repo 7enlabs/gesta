@@ -756,21 +756,18 @@ fn read_request_generic<S: Read>(stream: &mut S) -> ZResult<Request> {
 
 /// Dispatch one request. Kept separate from socket code so routes and access
 /// control can be tested without a network.
-pub fn route(
-    root: &Path,
-    req: &Request,
-    auth: &Auth,
-    forward: Option<&crate::support::audit_forward::Forwarder>,
-) -> Response {
-    let path = req.path.trim_end_matches('/');
-
-    // Health is open so a monitor can tell the process is alive without a
-    // credential. Every other route needs one when the server has tokens.
-    let needed = match (req.method.as_str(), path) {
+/// Which role a route needs, or `None` when it needs no credential at all.
+///
+/// Pulled out of `route` so the answer can be asserted without a socket. The test that guarded this
+/// before asked only for a status of 400 or more, which a 404 for a path that is not routed also
+/// satisfies, so it passed with the LFS arm deleted: a check that cannot fail on the wrong code is
+/// not worth having.
+fn required_role(method: &str, path: &str) -> Option<Role> {
+    match (method, path) {
         ("GET", "/v1/health") => None,
-        (_, p) if p.starts_with("/v1/bundle") && req.method == "POST" => Some(Role::Write),
-        (_, "/v1/changeset") if req.method == "POST" => Some(Role::Write),
-        (_, "/v1/changeset") if req.method == "GET" || req.method == "HEAD" => Some(Role::Read),
+        (_, p) if p.starts_with("/v1/bundle") && method == "POST" => Some(Role::Write),
+        (_, "/v1/changeset") if method == "POST" => Some(Role::Write),
+        (_, "/v1/changeset") if method == "GET" || method == "HEAD" => Some(Role::Read),
         // A git client sends a path it was given, not one of ours, and it authenticates with Basic
         // while our tokens use Bearer. Both are read, because a clone that cannot authenticate is a
         // clone nobody finishes.
@@ -787,9 +784,28 @@ pub fn route(
         }
         (_, p) if p.ends_with("/git-receive-pack") => Some(Role::Write),
         (_, p) if p.ends_with("/git-upload-pack") => Some(Role::Read),
+        // LFS downloads objects and LFS locks stop two clients writing the same asset, so a write
+        // token is what the whole surface needs. It used to fall through to `_ => None`, which the
+        // matcher reads as "no credential required": a server with tokens configured served every
+        // stored asset and answered every lock request to an anonymous caller, while the same
+        // repository over the JSON routes refused it.
+        (_, p) if p.contains("/info/lfs/") => Some(Role::Write),
         (_, p) if p.starts_with("/v1/") => Some(Role::Read),
         _ => None,
-    };
+    }
+}
+
+pub fn route(
+    root: &Path,
+    req: &Request,
+    auth: &Auth,
+    forward: Option<&crate::support::audit_forward::Forwarder>,
+) -> Response {
+    let path = req.path.trim_end_matches('/');
+
+    // Health is open so a monitor can tell the process is alive without a
+    // credential. Every other route needs one when the server has tokens.
+    let needed = required_role(&req.method, path);
 
     let mut who = "anonymous".to_string();
     // A name for attribution, whether or not this route requires a credential. Locks are the reason:
@@ -805,17 +821,20 @@ pub fn route(
     let mut record_allowed = false;
     if let Some(needed) = needed {
         if auth.required {
-            let presented = req
+            // Held in a local so the decoded token lives as long as this scope. The previous shape
+            // ended the chain with `Box::leak(...)` to get a `&str` out of an owned `String`, which
+            // leaked the credential into the process heap on every authenticated request: a
+            // long-running server grew by one token per request, and the plaintext stayed readable
+            // for the life of the process. A `String` binding has the same lifetime and no leak.
+            let basic = req
                 .authorization
                 .as_deref()
-                .and_then(|v| v.strip_prefix("Bearer "))
-                .or_else(|| {
-                    req.authorization
-                        .as_deref()
-                        .and_then(|v| v.strip_prefix("Basic "))
-                        .and_then(decode_basic_token)
-                        .map(|s| Box::leak(s.into_boxed_str()) as &str)
-                });
+                .and_then(|v| v.strip_prefix("Basic "))
+                .and_then(decode_basic_token);
+            let presented: Option<&str> = match req.authorization.as_deref() {
+                Some(v) if v.starts_with("Bearer ") => v.strip_prefix("Bearer "),
+                _ => basic.as_deref(),
+            };
             let now = crate::support::clock::unix_now();
             match presented.map(|p| auth.authenticate_now(p, now)) {
                 Some(crate::transport::auth::AuthOutcome::Granted(g))
@@ -1485,7 +1504,7 @@ pub fn route(
         }
         ("POST", "/v1/bundle") => {
             let branch = req.param("branch").unwrap_or("main");
-            match receive_bundle(root, branch, &req.body, &who) {
+            match receive_bundle(root, branch, &req.body, &who, grant.as_ref()) {
                 Ok(msg) => Response::ok_text(msg),
                 Err(ApplyError::Rejected(msg)) => Response::error(409, "Conflict", msg),
                 Err(ApplyError::Other(e)) => Response::error(400, "Bad Request", e.to_string()),
@@ -1670,6 +1689,18 @@ pub enum ApplyError {
     Other(Box<dyn std::error::Error>),
 }
 
+/// Without this the message a `Rejected` carries cannot be read at all, so the refusal a caller sees
+/// is whatever the outer layer prints about the type. That is how a scope refusal reached the client
+/// as an unhelpful generic error while the sentence explaining it sat in the variant.
+impl std::fmt::Display for ApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApplyError::Rejected(m) => write!(f, "{m}"),
+            ApplyError::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 impl From<Box<dyn std::error::Error>> for ApplyError {
     fn from(e: Box<dyn std::error::Error>) -> Self {
         ApplyError::Other(e)
@@ -1682,7 +1713,30 @@ impl From<rusqlite::Error> for ApplyError {
     }
 }
 
-fn receive_bundle(root: &Path, branch: &str, body: &[u8], who: &str) -> Result<String, ApplyError> {
+fn receive_bundle(
+    root: &Path,
+    branch: &str,
+    body: &[u8],
+    who: &str,
+    grant: Option<&crate::transport::auth::Grant>,
+) -> Result<String, ApplyError> {
+    // The grant's branch scope, asked before the bundle is decoded or applied. The JSON changeset
+    // route has always checked it; this route checked only the role, so a token scoped to one branch
+    // could push to any other, and the branch is the part a mistake costs the most to undo. Checked
+    // first so a refused push writes nothing, rather than being undone afterwards.
+    if let Some(g) = grant {
+        if !g.permits_branch(branch) {
+            return Err(ApplyError::Rejected(format!(
+                "this token may not write branch {:?}; its scope is {}",
+                branch,
+                if g.branches.is_empty() {
+                    "unrestricted".to_string()
+                } else {
+                    g.branches.join(", ")
+                }
+            )));
+        }
+    }
     let conn = open_db(root)?;
     init_schema(&conn)?;
 
@@ -2027,6 +2081,89 @@ fn parse_response(raw: &[u8]) -> ZResult<(u16, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn grant_to(branches: &[&str]) -> crate::transport::auth::Grant {
+        crate::transport::auth::Grant {
+            name: "t".to_string(),
+            role: crate::transport::auth::Role::Write,
+            scope: Vec::new(),
+            expires_at: None,
+            branches: branches.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_bundle_push_to_an_unlisted_branch_is_refused_before_anything_is_written() {
+        // #149: this route checked the role and nothing else, so a token scoped to one branch could
+        // push to any other. The refusal has to come before `Bundle::decode`, or a refused push has
+        // already written rows.
+        let dir = std::env::temp_dir().join(format!("gesta-bundle-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let g = grant_to(&["release/*"]);
+        let err = receive_bundle(&dir, "main", b"not a bundle", "t", Some(&g)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("may not write branch") && msg.contains("release/*"),
+            "the refusal must name the branch and the scope it has: {msg}"
+        );
+
+        // The empty directory proves nothing was written: a decode of the same bytes with a
+        // permitted branch fails later, which is what tells the two paths apart.
+        let allowed = grant_to(&["release/*"]);
+        let err2 =
+            receive_bundle(&dir, "release/1.0", b"not a bundle", "t", Some(&allowed)).unwrap_err();
+        assert!(
+            !err2.to_string().contains("may not write branch"),
+            "the permitted branch must get past the scope check: {err2}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unscoped_grant_may_push_anywhere() {
+        let dir = std::env::temp_dir().join(format!("gesta-bundle-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let g = grant_to(&[]);
+        let err = receive_bundle(&dir, "anything", b"not a bundle", "t", Some(&g)).unwrap_err();
+        assert!(!err.to_string().contains("may not write branch"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lfs_routes_need_a_credential_when_the_server_has_tokens() {
+        // #153: the LFS surface fell through to `_ => None`, which the matcher reads as "no
+        // credential required", so a server with tokens served every stored asset and answered every
+        // lock request to an anonymous caller. Asked of the decision itself: a route that needs no
+        // role is open, and a 404 for an unrouted path also answers 400-or-more, which is why the
+        // earlier version of this test passed with the fix removed.
+        for path in [
+            "/repo.git/info/lfs/objects/batch",
+            "/repo.git/info/lfs/locks/verify",
+            "/repo.git/info/lfs/objects/abc123",
+            "/repo.git/info/lfs/locks/42/unlock",
+        ] {
+            assert_eq!(
+                required_role("POST", path),
+                Some(Role::Write),
+                "{path} must require a write credential, not be open"
+            );
+        }
+        // The routes that are meant to be open stay open, so the check above is not just
+        // "everything needs a credential".
+        assert_eq!(required_role("GET", "/v1/health"), None);
+        // And git over HTTP still maps the way it did.
+        assert_eq!(
+            required_role("POST", "/r.git/git-receive-pack"),
+            Some(Role::Write)
+        );
+        assert_eq!(
+            required_role("POST", "/r.git/git-upload-pack"),
+            Some(Role::Read)
+        );
+    }
 
     #[test]
     fn dechunk_undoes_chunked_transfer_encoding() {

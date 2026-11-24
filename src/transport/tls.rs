@@ -428,13 +428,10 @@ pub fn generate_self_signed(
     std::fs::write(&cert_path, cert.pem())?;
     std::fs::write(&key_path, key_pair.serialize_pem())?;
 
-    // The key is private. On a shared machine the default permissions are too
-    // generous.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
-    }
+    // The key is private, and the library that wrote it did not choose a mode. The shared helper
+    // fails loudly rather than ignoring the error, which the old inline `let _ =` did: a key left at
+    // 0644 with nothing reported is the state this exists to prevent.
+    crate::support::private_file::tighten(&key_path)?;
 
     let der = cert.der();
     use sha2::{Digest, Sha256};

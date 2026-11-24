@@ -1655,7 +1655,9 @@ pub fn cmd_token_add(
         )
     };
     existing.push(entry);
-    fs::write(&path, existing.join("\n") + "\n")?;
+    // The file holds serve tokens in clear unless `--hashed` was used, so it is written the way
+    // the secret store and the TLS key are written: 0600 from creation, not chmod after.
+    crate::support::private_file::write_private(&path, (existing.join("\n") + "\n").as_bytes())?;
 
     println!("created {} token for {:?}", role, name.trim());
     println!("{}", token);
@@ -1666,6 +1668,94 @@ pub fn cmd_token_add(
     }
     println!("Give it to the client once. `token list` shows only the last four characters.");
     Ok(())
+}
+
+/// Which entries a selector names.
+///
+/// Two commands used to answer this separately and disagreed. `rotate` took the first entry whose
+/// secret ended with the selector, so a one-character selector matched any token ending in that
+/// character; `remove` compared the last four for equality and deleted every match. A selector that
+/// named two tokens therefore rotated one of them and deleted both, and the caller had no way to
+/// know which reading they would get.
+///
+/// Both now ask this function, so they cannot drift again. Two rules:
+///
+/// - The name matches exactly, or the last four characters match exactly. A partial suffix is not a
+///   selector: `token list` prints four characters, which is what a person has in front of them.
+/// - Every match is returned rather than the first, so an ambiguous selector can be refused with the
+///   names listed instead of resolved by file order.
+fn entries_named(entries: &[String], selector: &str) -> Vec<usize> {
+    let mut hits = Vec::new();
+    for (i, line) in entries.iter().enumerate() {
+        let l = line.trim();
+        if l.is_empty() || l.starts_with('#') {
+            continue;
+        }
+        // `sha256:<digest>:<role>:<name>...` puts the name at the same index as the clear form; only
+        // the secret's position differs.
+        let (id, name) = if let Some(rest) = l.strip_prefix("sha256:") {
+            let mut parts = rest.splitn(3, ':');
+            let digest = parts.next().unwrap_or("");
+            let _role = parts.next();
+            let tail = parts.next().unwrap_or("");
+            (
+                digest.to_string(),
+                tail.split(':').next().unwrap_or("").trim().to_string(),
+            )
+        } else {
+            let mut parts = l.splitn(3, ':');
+            let token = parts.next().unwrap_or("").to_string();
+            let _role = parts.next();
+            let tail = parts.next().unwrap_or("");
+            (
+                token,
+                tail.split(':').next().unwrap_or("").trim().to_string(),
+            )
+        };
+        let last4: String = {
+            let chars: Vec<char> = id.chars().collect();
+            let start = chars.len().saturating_sub(4);
+            chars[start..].iter().collect()
+        };
+        if name == selector || last4 == selector {
+            hits.push(i);
+        }
+    }
+    hits
+}
+
+/// The one entry a selector names, or a refusal that says what else it matched.
+///
+/// Rotating the wrong token revokes a credential the caller did not mean to revoke and reports
+/// success, so an ambiguous selector is an error here rather than a choice made by file order.
+fn one_entry_named(entries: &[String], selector: &str, verb: &str) -> ZResult<usize> {
+    let hits = entries_named(entries, selector);
+    match hits.len() {
+        0 => Err(bad(format!(
+            "no token matches {:?}; `gesta remote token list` shows a name and the last four characters",
+            selector
+        ))),
+        1 => Ok(hits[0]),
+        _ => {
+            let names: Vec<String> = hits
+                .iter()
+                .map(|&i| {
+                    let l = entries[i].trim();
+                    let f: Vec<&str> = l.split(':').collect();
+                    let off = if l.starts_with("sha256:") { 1 } else { 0 };
+                    f.get(off + 2).copied().unwrap_or("?").to_string()
+                })
+                .collect();
+            Err(bad(format!(
+                "{:?} matches {} tokens, so `remote token {}` will not guess: {}. \
+                 Use the full name or the full last four characters.",
+                selector,
+                hits.len(),
+                verb,
+                names.join(", ")
+            )))
+        }
+    }
 }
 
 /// Replace a token's secret while keeping its role, scope and name.
@@ -1681,27 +1771,9 @@ pub fn cmd_token_rotate(selector: &str, hashed: bool) -> ZResult<()> {
         return Err(bad("no tokens configured"));
     }
 
-    // Matched the same way removal matches: by name, or by the last four characters a person has in
-    // front of them from `token list`.
-    let mut hit = None;
-    for (i, line) in entries.iter().enumerate() {
-        let f: Vec<&str> = line.split(':').collect();
-        // `sha256:<digest>:<role>:<name>...` puts the name at index 2 like the clear form does; the
-        // secret is the only field whose position differs.
-        let name = f.get(2).copied();
-        let secret = if f.first() == Some(&"sha256") {
-            f.get(1).copied()
-        } else {
-            f.first().copied()
-        };
-        let matches = name.map(|n| n == selector).unwrap_or(false)
-            || secret.map(|s| s.ends_with(selector)).unwrap_or(false);
-        if matches {
-            hit = Some(i);
-            break;
-        }
-    }
-    let idx = hit.ok_or_else(|| bad(format!("no token matches {:?}", selector)))?;
+    // Asked of the shared function so `remove` and `rotate` cannot disagree about what a selector
+    // names, and so an ambiguous selector is refused rather than resolved by file order.
+    let idx = one_entry_named(&entries, selector, "rotate")?;
 
     // The failing entry is parsed before anything is written, so a rotate on a malformed line refuses
     // rather than replacing it with a well-formed but different grant.
@@ -1727,7 +1799,8 @@ pub fn cmd_token_rotate(selector: &str, hashed: bool) -> ZResult<()> {
     let mut parts = vec![secret, role.clone(), name.clone()];
     parts.extend(rest);
     entries[idx] = parts.join(":");
-    fs::write(&path, entries.join("\n") + "\n")?;
+    // Same reason as `token add`: the file is a credential file.
+    crate::support::private_file::write_private(&path, (entries.join("\n") + "\n").as_bytes())?;
 
     println!("rotated the {} token for {:?}", role, name);
     println!("{}", token);
@@ -1739,7 +1812,12 @@ pub fn cmd_token_rotate(selector: &str, hashed: bool) -> ZResult<()> {
     Ok(())
 }
 
-/// Remove a token by name or by its last four characters.
+/// Remove one token by name or by its last four characters.
+///
+/// One, not all. This used to delete every entry the selector matched while `rotate` picked the
+/// first, so a selector naming two tokens deleted both and rotated one, and neither command said
+/// which reading it used. Both now go through `one_entry_named`, so an ambiguous selector is refused
+/// with the names listed and the caller can decide.
 pub fn cmd_token_remove(selector: &str) -> ZResult<()> {
     let (root, _conn) = open_repo()?;
     let path = repo_dir(&root).join("auth");
@@ -1748,59 +1826,22 @@ pub fn cmd_token_remove(selector: &str) -> ZResult<()> {
         return Err(bad("no tokens configured"));
     }
 
+    let idx = one_entry_named(&entries, selector, "remove")?;
+    let hits = entries_named(&entries, selector);
     let mut kept: Vec<String> = Vec::new();
-    let mut removed = 0usize;
-    for line in entries {
-        let l = line.trim();
-        if l.is_empty() || l.starts_with('#') {
-            kept.push(line);
-            continue;
+    for (i, line) in entries.iter().enumerate() {
+        if !hits.contains(&i) {
+            kept.push(line.clone());
         }
-        // The name is the third field, and it is followed by optional scope, expiry and branch
-        // fields. Writing `splitn(3, ':')` and taking the last part returned `name:::main` as the
-        // name, so the entry never matched the name typed and the removal silently kept the token.
-        let (name, id) = if let Some(rest) = l.strip_prefix("sha256:") {
-            let mut parts = rest.splitn(3, ':');
-            let digest = parts.next().unwrap_or("").to_string();
-            let _role = parts.next();
-            let tail = parts.next().unwrap_or("");
-            (
-                tail.split(':').next().unwrap_or("").trim().to_string(),
-                digest,
-            )
-        } else {
-            let mut parts = l.splitn(3, ':');
-            let token = parts.next().unwrap_or("").to_string();
-            let _role = parts.next();
-            let tail = parts.next().unwrap_or("");
-            (
-                tail.split(':').next().unwrap_or("").trim().to_string(),
-                token,
-            )
-        };
-        let tail: String = id
-            .chars()
-            .rev()
-            .take(4)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        if name == selector || tail == selector {
-            removed += 1;
-            continue;
-        }
-        kept.push(line);
     }
+    let _ = idx;
 
-    if removed == 0 {
-        return Err(bad(format!("no token matches {:?}", selector)));
-    }
-    fs::write(
+    // A credential file, so 0600 like `token add` and `token rotate`.
+    crate::support::private_file::write_private(
         &path,
-        kept.join("\n") + if kept.is_empty() { "" } else { "\n" },
+        (kept.join("\n") + if kept.is_empty() { "" } else { "\n" }).as_bytes(),
     )?;
-    println!("removed {} token(s) matching {:?}", removed, selector);
+    println!("removed the token matching {:?}", selector);
     // The running server notices the file changed and rebuilds its table, so a restart is a choice
     // rather than a requirement. Saying "restart" when it is not needed teaches people to trust the
     // wrong sentence.
@@ -2530,4 +2571,91 @@ pub fn cmd_forge_push_all(url: &str, token: Option<&str>, user: &str, json: bool
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(secret: &str, role: &str, name: &str) -> String {
+        format!("{secret}:{role}:{name}")
+    }
+
+    #[test]
+    fn a_selector_matches_the_whole_name_or_the_whole_last_four() {
+        let entries = vec![
+            entry("abcdefghij1111", "read", "alice"),
+            entry("klmnopqrst2222", "write", "bob"),
+        ];
+        assert_eq!(entries_named(&entries, "alice"), vec![0]);
+        assert_eq!(entries_named(&entries, "1111"), vec![0]);
+        assert_eq!(entries_named(&entries, "2222"), vec![1]);
+        // A partial suffix is not a selector. `token list` prints four characters, so that is the
+        // unit a person has in front of them, and one character must not match.
+        assert_eq!(entries_named(&entries, "1"), Vec::<usize>::new());
+        assert_eq!(entries_named(&entries, "al"), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn two_tokens_sharing_a_suffix_are_both_named_so_the_command_can_refuse() {
+        // The defect: `rotate` took the first of these and `remove` deleted both, so the same
+        // selector meant different things depending on the verb.
+        let entries = vec![
+            entry("aaaaaa9999", "read", "one"),
+            entry("bbbbbb9999", "write", "two"),
+        ];
+        let hits = entries_named(&entries, "9999");
+        assert_eq!(
+            hits.len(),
+            2,
+            "both entries share the suffix and both must be reported"
+        );
+
+        // One entry, or a refusal naming what else matched.
+        let err = one_entry_named(&entries, "9999", "rotate")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("matches 2 tokens"), "{err}");
+        assert!(
+            err.contains("one") && err.contains("two"),
+            "the names must be listed: {err}"
+        );
+        // One of them, asked for by name, is unambiguous.
+        assert!(one_entry_named(&entries, "one", "rotate").is_ok());
+    }
+
+    #[test]
+    fn a_hashed_entry_is_matched_by_its_digest_suffix() {
+        let entries = vec![
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef:read:carol"
+                .to_string(),
+        ];
+        assert_eq!(entries_named(&entries, "carol"), vec![0]);
+        assert_eq!(entries_named(&entries, "cdef"), vec![0]);
+        assert_eq!(entries_named(&entries, "0123"), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn comments_and_blank_lines_are_never_named() {
+        let entries = vec![
+            "# a comment".to_string(),
+            String::new(),
+            entry("aaaa1111", "read", "dave"),
+        ];
+        assert_eq!(entries_named(&entries, "# a comment"), Vec::<usize>::new());
+        assert_eq!(entries_named(&entries, ""), Vec::<usize>::new());
+        assert_eq!(entries_named(&entries, "dave"), vec![2]);
+    }
+
+    #[test]
+    fn a_selector_that_names_nothing_says_where_to_look() {
+        let entries = vec![entry("aaaa1111", "read", "erin")];
+        let err = one_entry_named(&entries, "zzzz", "remove")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("token list"),
+            "the refusal must name the command that lists: {err}"
+        );
+    }
 }

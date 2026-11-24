@@ -122,7 +122,27 @@ pub fn changeset_from_content(
         // Binary files arrive with empty content; read bytes from disk and store
         // Raw bytes. Text files use the provided string.
         let new_hash = if content.is_empty() {
-            let bytes = std::fs::read(path)?;
+            // The path comes from the request body, and an empty content entry is the signal to read
+            // the bytes off disk. Reading `path` as given meant a client could name `/etc/passwd` or
+            // `../../../etc/shadow` and have its contents stored as an object, then read back through
+            // the ordinary file routes: the server read whatever the client named. A tree path is
+            // relative and stays inside the repository by definition, so anything that is not is
+            // refused. Checked here rather than at the HTTP layer because this is the only place that
+            // opens a file on the caller's word, and the CLI reaches it too.
+            if !is_repo_relative(path) {
+                return Err(bad(format!(
+                    "{}: an entry with empty content is read from disk, so the path must be relative \
+                     and stay inside the repository. Refused: it is absolute or climbs out.",
+                    path
+                )));
+            }
+            let bytes = std::fs::read(path).map_err(|e| {
+                bad(format!(
+                    "{}: an entry with empty content is read from disk, and it could not be read ({e}). \
+                     Send the content, or a path that exists inside the repository.",
+                    path
+                ))
+            })?;
             // The rule is written against the path inside the repository; the caller passes the
             // path on disk so the bytes can be read. Look the rule up by the tail that the tree
             // knows, which is the last two components - enough for `*.bin` and `vendor/**`, and
@@ -177,6 +197,34 @@ pub fn changeset_from_content(
     Ok(ContentChangeset { id, paths, skipped })
 }
 
+/// Is this a path that can name a file inside a repository?
+///
+/// A tree path is relative and has no component that climbs: `src/main.rs` is one, `/etc/passwd` and
+/// `../../etc/shadow` are not. Windows drive-qualified paths and backslash separators are refused too,
+/// so the answer does not depend on which machine the server runs on.
+fn is_repo_relative(path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    // A leading separator, a drive letter, or a backslash: absolute or ambiguous on some platform.
+    if path.starts_with('/') || path.starts_with('\\') {
+        return false;
+    }
+    if path.len() >= 2 && path.as_bytes()[1] == b':' {
+        return false;
+    }
+    if path.contains('\\') {
+        return false;
+    }
+    // No component may climb out.
+    for part in path.split('/') {
+        if part == ".." {
+            return false;
+        }
+    }
+    true
+}
+
 /// The repository-relative tail of a path on disk.
 ///
 /// A `.gitattributes` pattern is written against the tree, and the caller holds an absolute path. A
@@ -201,6 +249,63 @@ mod tests {
     use super::*;
     use crate::repo::committed_tree;
     use crate::store::tests::mem_db;
+
+    #[test]
+    fn a_repo_relative_path_is_the_only_kind_allowed() {
+        for ok in [
+            "a.txt",
+            "src/main.rs",
+            "a/b/c.rs",
+            "./a.txt",
+            "assets/x.bin",
+        ] {
+            assert!(is_repo_relative(ok), "{ok} must be accepted");
+        }
+        let backslash = "a\\b";
+        let unc = "\\\\server\\share\\x";
+        for bad in [
+            "/etc/passwd",
+            "../../etc/shadow",
+            "a/../../b",
+            unc,
+            "C:/Windows/win.ini",
+            "..",
+            "",
+            backslash,
+        ] {
+            assert!(
+                !is_repo_relative(bad),
+                "{bad:?} must be refused as a tree path"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_content_entry_cannot_make_the_server_read_outside_the_repository() {
+        // #152: an entry with empty content is the signal to read the bytes off disk, and the path
+        // came from the request body. A client could name a file outside the repository and have its
+        // contents stored as an object, then read back through the ordinary file routes.
+        let conn = mem_db();
+        let outside = vec![("/etc/passwd".to_string(), String::new())];
+        let err = match changeset_from_content(&conn, "steal", "agent", "main", &outside, &[], None)
+        {
+            Ok(cs) => panic!("an absolute path was accepted: {}", cs.id),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("must be relative") && err.contains("climbs out"),
+            "the refusal must say the path is not a tree path: {err}"
+        );
+
+        // The climbing form is refused for the same reason.
+        let climb = vec![("../../../etc/shadow".to_string(), String::new())];
+        let err2 = match changeset_from_content(&conn, "steal", "agent", "main", &climb, &[], None)
+        {
+            Ok(cs) => panic!("a climbing path was accepted: {}", cs.id),
+            Err(e) => e.to_string(),
+        };
+        assert!(err2.contains("climbs out"), "{err2}");
+    }
 
     #[test]
     fn a_changeset_records_only_what_differs_from_the_head() {

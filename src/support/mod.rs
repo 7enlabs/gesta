@@ -15,4 +15,5 @@ pub mod json;
 pub mod leak;
 pub mod ops;
 pub mod privacy;
+pub mod private_file;
 pub mod secrets;
