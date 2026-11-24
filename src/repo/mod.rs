@@ -3897,17 +3897,104 @@ pub(crate) mod tests {
             n
         }
 
-        let small = count_commit(20);
-        let large = count_commit(400);
+        // The sizes the gate's `scale` step used, so the count is a drop-in for the timer it
+        // replaced rather than a claim about a smaller tree.
+        let small = count_commit(300);
+        let large = count_commit(3000);
         assert_eq!(
             small, large,
-            "committing one edit ran {small} statements over 20 files and {large} over 400: the \
+            "committing one edit ran {small} statements over 300 files and {large} over 3000: the \
              write is reading the tree again"
         );
         // A ceiling, so the reader knows what correct looks like rather than only that the two agree.
         assert!(
             large <= 60,
             "a one-file commit took {large} statements, which is a per-file walk"
+        );
+    }
+    #[test]
+    fn committing_after_a_long_history_runs_the_same_statements() {
+        // `long_history` timed commits at 3000 of them against 300 and failed about one run in three
+        // on an idle container - the same shape as `write-flat` before it (A56). The claim is "the
+        // cost of a commit stays flat as the history grows", which is a count: a commit that walked
+        // the changeset table would run more SQL, and a count does not move when the machine is busy.
+        //
+        // The history is built first and then reopened, because the CLI does that on every command and
+        // `migrate` was once the thing that grew: a store at 1000 commits paid 31 ms per open against
+        // 6.7 ms at 100, which read as "the cost of a commit grows with the history" (see the comment
+        // in `store::migrate`). So the count covers the open as well as the write.
+        fn count_after(history: usize) -> (usize, usize) {
+            let d = std::env::temp_dir().join(format!(
+                "gesta-hist-flat-{}-{}",
+                history,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(d.join(".gesta")).unwrap();
+            {
+                let conn = crate::store::open_db(&d).unwrap();
+                crate::store::init_schema(&conn).unwrap();
+                // `migrate` is what stamps `user_version`, and the stamp is what lets a later open
+                // skip the DDL body. A fixture that only calls `init_schema` leaves the database at
+                // version 0, so every reopen pays the whole body - 46 statements at 300 changesets
+                // against the 12 this store is supposed to cost once settled. The stamp belongs to
+                // the setup, not to the measurement.
+                crate::store::migrate(&conn).unwrap();
+                conn.execute(
+                    "INSERT INTO branches(name, head, created_at, from_branch) VALUES('main', NULL, 0, NULL)",
+                    [],
+                )
+                .unwrap();
+                std::fs::write(d.join("f.txt"), "line\n").unwrap();
+                for i in 0..history {
+                    std::fs::write(d.join("f.txt"), format!("line {i}\n")).unwrap();
+                    let cs = crate::repo::create_changeset(&conn, &d, &format!("h{i}"), "b")
+                        .unwrap()
+                        .expect("one changed file is a changeset");
+                    crate::repo::commit_one(&conn, &cs.id).unwrap();
+                }
+            }
+
+            // Reopened exactly as the CLI does, and the open is counted apart from the write.
+            //
+            // They are two different claims and mixing them made this measurement incoherent:
+            // `migrate` runs a fixed pile of idempotent DDL only when `user_version` is behind, so a
+            // store built by this build skips it and a store from the fixture's own first commit does
+            // not. The first version of this test read 109 after 10 changesets and 105 after 300 -
+            // *fewer* statements for *more* history, which is the shape of a one-off, not of a walk.
+            let mut conn = crate::store::open_db(&d).unwrap();
+            let opened = crate::store::statements_during_for_test(&mut conn, |c| {
+                let _ = crate::store::migrate(c);
+            });
+            std::fs::write(d.join("f.txt"), "the measured edit\n").unwrap();
+            let written = crate::store::statements_during_for_test(&mut conn, |c| {
+                let cs = crate::repo::create_changeset(c, &d, "measured", "b")
+                    .unwrap()
+                    .expect("one changed file is a changeset");
+                crate::repo::commit_one(c, &cs.id).unwrap();
+            });
+            let _ = std::fs::remove_dir_all(&d);
+            (opened, written)
+        }
+
+        let (short_open, short_write) = count_after(10);
+        let (long_open, long_write) = count_after(300);
+        assert_eq!(
+            short_write, long_write,
+            "the write ran {short_write} statements after 10 changesets and {long_write} after 300: \
+             it is reading the history"
+        );
+        // The open is the other half, and the one `store::migrate` was fixed for: a settled store
+        // must not pay the DDL body. A ceiling rather than equality, because the first open of a
+        // fresh file legitimately runs schema creation.
+        assert!(
+            long_open <= 12,
+            "opening a store at 300 changesets ran {long_open} statements; the DDL body is running \
+             on a store that is already at the current schema"
+        );
+        assert!(
+            short_open <= 12,
+            "opening a store at 10 changesets ran {short_open} statements"
         );
     }
 }

@@ -4473,12 +4473,20 @@ def main():
             scan_small, write_small = small
             scan_large, write_large = large
             grown = write_large / write_small if write_small else float("inf")
-            record(
-                "the cost of a commit does not follow the size of the repository",
-                grown <= 2.0,
-                f"write {sizes[0]} files {write_small:.1f} ms, {sizes[1]} files "
-                f"{write_large:.1f} ms, {grown:.2f}x",
-            )
+            # No assertion on this number, and no always-passing step to hold its place (#A63).
+            #
+            # The claim - the cost of a commit follows the change, not the repository - is a count
+            # now: `repo::tests::committing_one_edit_reads_the_parent_table_once_whatever_the_tree_
+            # size` measures 34 statements at both 300 and 3000 files. The duration above is the host,
+            # and a step that cannot fail would be a lie in the tally rather than a check. Measured
+            # over two rounds of nine writes at each size: min 12.2 vs 14.0 ms, then 18.1 vs 17.6,
+            # with individual samples reaching 144 to 157 ms - an 8 to 12x spread inside one size, so
+            # a burst lasting the sampling window moves the minimum. That is what one run in three
+            # looked like, 38.7 ms against 135.6.
+            #
+            # The write time is still computed and returned in this step's detail below, where a
+            # person reading a gate failure can see it. It just does not decide anything.
+            _ = (write_small, write_large, grown)
             # The scan is the other half of the picture, and it is allowed to grow.
             #
             # This assertion has now been wrong twice in the same way. First it was
@@ -4892,19 +4900,19 @@ def main():
         # never run by anything. `many_writers` was worse than that: it printed the failure and
         # returned 0, so the only signal a caller reads said the run passed.
         #
-        # `long_history` builds a history to time commits against it, and the default 10000 commits
-        # takes over eight minutes. 3000 still spans a tenfold growth twice, which is what the slope
-        # needs, and keeps the step inside a gate run.
-        r = sh(
-            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'long_history.py')} --max 3000",
-            cwd=ZF_DIR,
-            timeout=500,
-        )
-        record(
-            "the cost of a commit stays flat as the history grows",
-            r[0] == 0 and "flat over this range" in r[1],
-            (r[1] or "")[-500:],
-        )
+        # `long_history.py --max 3000` used to time commits at two history lengths and assert the
+        # slope was flat. It failed about one run in three on an idle container, like `write-flat`
+        # before it (A56), because a duration at this scale is the host.
+        #
+        # The claim is a count, and there are two halves to it:
+        # `repo::tests::committing_after_a_long_history_runs_the_same_statements` commits 10 and 300
+        # changesets, counts the SQL of the write and of the reopen, and demands equality. Measured
+        # 59 and 59 statements for the write, 2 and 2 for the open. Its red half is real: an
+        # unstamped fixture reads 46 statements on open instead of 2, because `migrate` re-runs the
+        # DDL body on a store that claims version 0.
+        #
+        # `long_history.py` stays in the repo as a bench somebody can run by hand; the gate no longer
+        # depends on it. Two checks of one property means the flaky one still fails the gate.
         # The companion measurement. `long_history` holds the file at twenty lines so that only the
         # history varies, which is what its name claims to test. This one holds the history at one
         # commit and varies the file, which is the other property `docs/speed.md` records. Keeping
