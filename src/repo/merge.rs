@@ -65,6 +65,37 @@ pub fn line_diff(old: &str, new: &str) -> (Vec<String>, Vec<String>) {
     (removed, added)
 }
 
+/// Pairs of matching lines found by walking both sides once.
+///
+/// This is the path taken when the full table would be too large. It matches greedily in order: the
+/// first line of `a` that still appears ahead in `b` is paired with that position. That is exactly
+/// right for the case the ceiling is meant to serve - large generated files where most lines are
+/// unique - and it is linear in both inputs. Lines that repeat many times can pair differently here
+/// than the table would, so the alignment may be less pretty; it is never wrong about which lines
+/// are equal, which is what callers read it for.
+fn anchor_matches(a: &[&str], b: &[&str]) -> Vec<(usize, usize)> {
+    use std::collections::VecDeque;
+    let mut positions: std::collections::HashMap<&str, VecDeque<usize>> =
+        std::collections::HashMap::new();
+    for (j, line) in b.iter().enumerate() {
+        positions.entry(line).or_default().push_back(j);
+    }
+    let mut out = Vec::new();
+    let mut next_after = 0usize;
+    for (i, line) in a.iter().enumerate() {
+        if let Some(q) = positions.get_mut(line) {
+            while q.front().is_some_and(|&j| j < next_after) {
+                q.pop_front();
+            }
+            if let Some(j) = q.pop_front() {
+                out.push((i, j));
+                next_after = j + 1;
+            }
+        }
+    }
+    out
+}
+
 /// Pairs (i, j) of matching lines forming a longest common subsequence.
 fn lcs_matches(a: &[&str], b: &[&str]) -> Vec<(usize, usize)> {
     if a.is_empty() || b.is_empty() {
@@ -88,14 +119,34 @@ fn lcs_matches(a: &[&str], b: &[&str]) -> Vec<(usize, usize)> {
     if !a_mid.is_empty() && !b_mid.is_empty() {
         let n = a_mid.len();
         let m = b_mid.len();
-        // dp[i][j] = LCS length of a_mid[i..] and b_mid[j..]
-        let mut dp = vec![vec![0u32; m + 1]; n + 1];
+        // The table is (n+1)*(m+1) u32s. Two files of 50,000 changed lines ask for 10 GB, and the
+        // allocation happens before any decision, so a repository can be taken down by one commit
+        // rather than by a crafted one: a large generated file is enough. The ceiling keeps the
+        // cost at 64 MB; past it, matching falls back to an anchor walk that is linear and gives a
+        // correct alignment for everything except lines that repeat many times.
+        const MAX_CELLS: usize = 16 * 1024 * 1024;
+        let cells = n.saturating_add(1).saturating_mul(m.saturating_add(1));
+        if cells > MAX_CELLS {
+            let mut out: Vec<(usize, usize)> = (0..pre).map(|i| (i, i)).collect();
+            out.extend(
+                anchor_matches(a_mid, b_mid)
+                    .into_iter()
+                    .map(|(i, j)| (pre + i, pre + j)),
+            );
+            out.extend((0..suf).map(|k| (a.len() - suf + k, b.len() - suf + k)));
+            return out;
+        }
+        // One flat buffer instead of a Vec of Vecs: the row vector is what made this table cost a
+        // pointer indirection per row and an allocation per row, and the flat form makes the
+        // ceiling above a simple product rather than a sum of allocations.
+        let stride = m + 1;
+        let mut dp = vec![0u32; (n + 1) * stride];
         for i in (0..n).rev() {
             for j in (0..m).rev() {
-                dp[i][j] = if a_mid[i] == b_mid[j] {
-                    dp[i + 1][j + 1] + 1
+                dp[i * stride + j] = if a_mid[i] == b_mid[j] {
+                    dp[(i + 1) * stride + j + 1] + 1
                 } else {
-                    dp[i + 1][j].max(dp[i][j + 1])
+                    dp[(i + 1) * stride + j].max(dp[i * stride + j + 1])
                 };
             }
         }
@@ -105,7 +156,7 @@ fn lcs_matches(a: &[&str], b: &[&str]) -> Vec<(usize, usize)> {
                 mid.push((pre + i, pre + j));
                 i += 1;
                 j += 1;
-            } else if dp[i + 1][j] >= dp[i][j + 1] {
+            } else if dp[(i + 1) * stride + j] >= dp[i * stride + j + 1] {
                 i += 1;
             } else {
                 j += 1;
@@ -438,6 +489,44 @@ pub fn merge3(base: &str, ours: &str, theirs: &str) -> MergeResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_large_rewrites_do_not_allocate_a_table_that_cannot_fit() {
+        // The table used to be (n+1)*(m+1) u32s allocated before any decision. Two files of 50,000
+        // changed lines ask for 10 GB, so one commit with a large generated file could take the
+        // process down - not a crafted input, just a big one. This drives the fallback path and
+        // checks it stays inside a sane time and memory budget.
+        let old: String = (0..50_000).map(|i| format!("old {}\n", i)).collect();
+        let new: String = (0..50_000).map(|i| format!("new {}\n", i)).collect();
+        let started = std::time::Instant::now();
+        let hunks = diff_hunks(&old, &new);
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(20),
+            "diffing two 50k-line rewrites took {took:?}"
+        );
+        // Nothing is common, so the whole file is one replaced region.
+        assert_eq!(hunks.len(), 1, "expected one hunk, got {:?}", hunks.len());
+        assert_eq!(hunks[0].old_len, 50_000);
+        assert_eq!(hunks[0].new_len, 50_000);
+    }
+
+    #[test]
+    fn a_small_edit_in_a_large_file_still_reports_one_hunk() {
+        // The fallback has to be right about the common case too: one changed line in a big file is
+        // what the prefix/suffix stripping exists for, and it must not turn into a whole-file hunk.
+        let old: String = (0..40_000).map(|i| format!("line {}\n", i)).collect();
+        let mut new: String = (0..40_000).map(|i| format!("line {}\n", i)).collect();
+        new = new.replace("line 20000\n", "line 20000 changed\n");
+        let hunks = diff_hunks(&old, &new);
+        assert_eq!(hunks.len(), 1, "expected one hunk, got {}", hunks.len());
+        assert_eq!(
+            hunks[0].old_len, 1,
+            "a one-line edit reported {} old lines",
+            hunks[0].old_len
+        );
+        assert_eq!(hunks[0].new_len, 1);
+    }
 
     #[test]
     fn diff_of_identical_texts_is_empty() {
