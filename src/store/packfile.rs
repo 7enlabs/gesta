@@ -249,7 +249,11 @@ impl Pack {
                 .get(at)
                 .ok_or_else(|| bad("pack entry header is truncated"))?;
             at += 1;
-            size |= ((byte & 0x7f) as usize) << shift;
+            let payload = (byte & 0x7f) as usize;
+            if shift >= usize::BITS || payload > (usize::MAX >> shift) {
+                return Err(bad("pack entry size varint overflows usize"));
+            }
+            size |= payload << shift;
             shift += 7;
         }
         Ok((kind, size, at))
@@ -268,7 +272,11 @@ fn ofs_delta_base(bytes: &[u8], mut at: usize) -> ZResult<(u64, usize)> {
             .get(at)
             .ok_or_else(|| bad("delta base offset is truncated"))?;
         at += 1;
-        value = ((value + 1) << 7) | (byte & 0x7f) as u64;
+        value = value
+            .checked_add(1)
+            .and_then(|v| v.checked_mul(128))
+            .map(|v| v | (byte & 0x7f) as u64)
+            .ok_or_else(|| bad("delta base offset varint overflows u64"))?;
     }
     Ok((value, at))
 }
@@ -377,7 +385,11 @@ fn delta_size(delta: &[u8], mut at: usize) -> ZResult<(usize, usize)> {
             .get(at)
             .ok_or_else(|| bad("delta header is truncated"))?;
         at += 1;
-        value |= ((byte & 0x7f) as usize) << shift;
+        let payload = (byte & 0x7f) as usize;
+        if shift >= usize::BITS || payload > (usize::MAX >> shift) {
+            return Err(bad("delta size varint overflows usize"));
+        }
+        value |= payload << shift;
         shift += 7;
         if byte & 0x80 == 0 {
             break;
@@ -448,6 +460,117 @@ mod tests {
         assert_eq!(Kind::from_code(7), Some(Kind::RefDelta));
         // Five was reserved and never assigned; a file claiming it is damaged.
         assert_eq!(Kind::from_code(5), None);
+    }
+
+    fn encode_entry_size(mut size: usize) -> Vec<u8> {
+        let mut bytes = vec![0x30 | (size & 0x0f) as u8];
+        size >>= 4;
+        while size != 0 {
+            *bytes.last_mut().unwrap() |= 0x80;
+            bytes.push((size & 0x7f) as u8);
+            size >>= 7;
+        }
+        bytes
+    }
+
+    #[test]
+    fn pack_varints_preserve_every_representable_boundary() {
+        let pack = Pack {
+            path: std::path::PathBuf::new(),
+            offsets: HashMap::new(),
+        };
+        for size in [0, 1, 15, 16, 127, 128, usize::MAX] {
+            let bytes = encode_entry_size(size);
+            let (kind, decoded, at) = pack.entry_header(&bytes, 0).unwrap();
+            assert_eq!((kind, decoded, at), (Kind::Blob, size, bytes.len()));
+        }
+        let mut distance = u64::MAX;
+        let mut bytes = vec![(distance & 0x7f) as u8];
+        while distance > 0x7f {
+            distance = (distance >> 7) - 1;
+            bytes.push((distance & 0x7f) as u8 | 0x80);
+        }
+        bytes.reverse();
+        assert_eq!(ofs_delta_base(&bytes, 0).unwrap(), (u64::MAX, bytes.len()));
+        assert_eq!(ofs_delta_base(&[0], 0).unwrap(), (0, 1));
+    }
+
+    #[test]
+    fn pack_varints_refuse_entry_size_overflow() {
+        let pack = Pack {
+            path: std::path::PathBuf::new(),
+            offsets: HashMap::new(),
+        };
+        let mut bytes = encode_entry_size(usize::MAX);
+        let remaining = (usize::BITS - 4) % 7;
+        if remaining == 0 {
+            *bytes.last_mut().unwrap() |= 0x80;
+            bytes.push(1);
+        } else {
+            *bytes.last_mut().unwrap() |= 1 << remaining;
+        }
+        let err = pack.entry_header(&bytes, 0).unwrap_err().to_string();
+        assert!(err.contains("overflow"), "{err}");
+    }
+
+    #[test]
+    fn pack_varints_refuse_overlong_entry_headers() {
+        let pack = Pack {
+            path: std::path::PathBuf::new(),
+            offsets: HashMap::new(),
+        };
+        let mut bytes = vec![0x80; 32];
+        bytes[0] = 0xb0;
+        bytes.push(0);
+        let err = pack.entry_header(&bytes, 0).unwrap_err().to_string();
+        assert!(err.contains("overflow"), "{err}");
+    }
+
+    #[test]
+    fn pack_varints_refuse_base_distance_overflow() {
+        let mut bytes = vec![0xff; 32];
+        bytes.push(0x7f);
+        let err = ofs_delta_base(&bytes, 0).unwrap_err().to_string();
+        assert!(err.contains("overflow"), "{err}");
+    }
+
+    #[test]
+    fn pack_varints_refuse_delta_size_overflow() {
+        let mut size = usize::MAX;
+        let mut bytes = Vec::new();
+        loop {
+            let byte = (size & 0x7f) as u8;
+            size >>= 7;
+            bytes.push(byte | if size == 0 { 0 } else { 0x80 });
+            if size == 0 {
+                break;
+            }
+        }
+        assert_eq!(delta_size(&bytes, 0).unwrap(), (usize::MAX, bytes.len()));
+        *bytes.last_mut().unwrap() |= 0x40;
+        let err = delta_size(&bytes, 0).unwrap_err().to_string();
+        assert!(err.contains("overflow"), "{err}");
+    }
+
+    #[test]
+    fn pack_varints_keep_truncation_errors() {
+        let pack = Pack {
+            path: std::path::PathBuf::new(),
+            offsets: HashMap::new(),
+        };
+        assert!(pack
+            .entry_header(&[0xb0], 0)
+            .unwrap_err()
+            .to_string()
+            .contains("truncated"));
+        assert!(ofs_delta_base(&[0x80], 0)
+            .unwrap_err()
+            .to_string()
+            .contains("truncated"));
+        assert!(delta_size(&[0x80], 0)
+            .unwrap_err()
+            .to_string()
+            .contains("truncated"));
     }
 
     #[test]
