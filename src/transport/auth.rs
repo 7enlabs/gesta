@@ -325,7 +325,7 @@ pub fn parse_expiry(s: &str) -> Option<i64> {
     }
     crate::support::clock::parse_minute(s).or_else(|| {
         // A timestamp with seconds, such as 2027-03-01T12:00:00.
-        let base = crate::support::clock::parse_minute(&s[..16.min(s.len())])?;
+        let base = crate::support::clock::parse_minute(s.get(..16)?)?;
         let rest = s.get(16..)?;
         let secs: i64 = rest.trim_start_matches(':').parse().ok()?;
         Some(base + secs)
@@ -388,6 +388,19 @@ pub fn is_loopback(bind: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_unicode_expiry_is_unparseable_without_panicking() {
+        for value in [
+            format!("{}é", "a".repeat(15)),
+            "é".repeat(9),
+            "shorté".into(),
+        ] {
+            assert_eq!(parse_expiry(&value), None);
+            let auth = Auth::from_entries(&[format!("sample:read:tester::{}", value)]);
+            assert_eq!(auth.token_count(), 1);
+        }
+    }
 
     #[test]
     fn empty_config_has_no_tokens() {

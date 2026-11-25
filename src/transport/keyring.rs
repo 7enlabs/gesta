@@ -140,6 +140,11 @@ pub fn archive(from: &Path, public_hex: &str) -> ZResult<PathBuf> {
             from.display()
         )));
     }
+    if public_hex.is_empty() || !public_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(bad(
+            "the public key used to name an archive must be nonempty hexadecimal text",
+        ));
+    }
     let short = &public_hex[..public_hex.len().min(16)];
     // The archive keeps the name the key actually had. `with_file_name("signing.key...")` renamed a
     // `--path` key called something else, which then looked like a stray file rather than an archive
@@ -174,6 +179,25 @@ mod tests {
         ));
         std::fs::create_dir_all(d.join(crate::ZF_DIR)).unwrap();
         d
+    }
+
+    #[test]
+    fn invalid_unicode_archive_name_is_refused_without_moving_the_key() {
+        let root = repo();
+        let key = root.join("signing.key");
+        std::fs::write(&key, b"original key").unwrap();
+        for public in [
+            format!("{}é", "a".repeat(15)),
+            "é".repeat(9),
+            "../escape".into(),
+            String::new(),
+        ] {
+            let err = archive(&key, &public).expect_err("invalid public key text must be refused");
+            assert!(err.to_string().contains("hexadecimal"), "{err}");
+            assert_eq!(std::fs::read(&key).unwrap(), b"original key");
+        }
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
