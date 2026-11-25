@@ -65,6 +65,38 @@ pub fn write(root: &Path, hash: &str, bytes: &[u8]) -> ZResult<PathBuf> {
     Ok(to)
 }
 
+/// Write an object from a file beside the database, copying in blocks.
+///
+/// The in-memory `write` above needs the whole body, which is exactly what a large object cannot
+/// afford: a 256 MB asset cost 256 MB to store on top of the 256 MB the hash already needed. This
+/// copies through a fixed buffer, so storing a large file costs the buffer and nothing per byte.
+/// The rename still happens, so a reader never sees a partial object.
+pub fn write_from_file(root: &Path, hash: &str, from: &Path) -> ZResult<PathBuf> {
+    use std::io::{Read, Write};
+    let to = path_for(root, hash)?;
+    if to.exists() {
+        return Ok(to);
+    }
+    if let Some(p) = to.parent() {
+        std::fs::create_dir_all(p)?;
+    }
+    let tmp = to.with_extension("tmp");
+    let mut src = std::fs::File::open(from)?;
+    let mut dst = std::fs::File::create(&tmp)?;
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = src.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        dst.write_all(&buf[..n])?;
+    }
+    dst.sync_all()?;
+    drop(dst);
+    std::fs::rename(&tmp, &to)?;
+    Ok(to)
+}
+
 /// Read one object's bytes, or `None` when no sidecar holds it.
 pub fn read(root: &Path, hash: &str) -> Option<Vec<u8>> {
     let p = path_for(root, hash).ok()?;

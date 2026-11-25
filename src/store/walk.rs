@@ -707,22 +707,77 @@ pub fn read_bytes(p: &Path) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Read a file and classify it. A NUL byte in the first 8000 bytes means
-/// binary, matching git's heuristic closely enough for source code.
+/// Read a working-tree entry and decide whether it is text, reading only what the decision needs.
+///
+/// The decision needs 8000 bytes: a NUL anywhere in that prefix means binary. Reading the whole
+/// file first to look at its first 8000 bytes made a read-only `status` cost as much memory as the
+/// largest tracked file, so a multi-gigabyte asset spiked memory on every scan. A file that starts
+/// with text but has a NUL later is still caught, because the UTF-8 validation below reads to the
+/// end - it just is not paid for files whose prefix already says "binary".
 pub fn read_file(p: &Path) -> ReadOutcome {
-    match read_bytes(p) {
-        Ok(bytes) => {
-            let head = &bytes[..bytes.len().min(8000)];
-            if head.contains(&0u8) {
-                return ReadOutcome::Binary;
-            }
-            match String::from_utf8(bytes) {
-                Ok(s) => ReadOutcome::Text(s),
-                Err(_) => ReadOutcome::Binary,
-            }
-        }
+    match read_file_limited(p) {
+        Ok(ReadOutcome::Binary) => ReadOutcome::Binary,
+        Ok(ReadOutcome::Text(s)) => ReadOutcome::Text(s),
+        Ok(other) => other,
         Err(e) => ReadOutcome::Unreadable(e.to_string()),
     }
+}
+
+/// The sniff-and-read behind `read_file`, keeping every guard `read_bytes` has.
+///
+/// A symlink reads as its target name, not through it; the open refuses to follow one, refuses a
+/// FIFO, and does not block. Those guards exist because a scan walks attacker-reachable paths, and
+/// dropping them to save memory would be trading a memory ceiling for a hang. Only the read differs:
+/// the prefix is read first and the rest only if the prefix said text.
+fn read_file_limited(p: &Path) -> std::io::Result<ReadOutcome> {
+    use std::io::Read;
+    if fs::symlink_metadata(p)?.file_type().is_symlink() {
+        let target = fs::read_link(p)?;
+        #[cfg(unix)]
+        let raw = {
+            use std::os::unix::ffi::OsStrExt;
+            target.as_os_str().as_bytes().to_vec()
+        };
+        #[cfg(not(unix))]
+        let raw = target
+            .to_str()
+            .map(|s| s.as_bytes().to_vec())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "link target is not UTF-8")
+            })?;
+        return Ok(match String::from_utf8(raw) {
+            Ok(s) => ReadOutcome::Text(s),
+            Err(_) => ReadOutcome::Binary,
+        });
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut f = options.open(p)?;
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let mut head = [0u8; 8000];
+    let got = f.read(&mut head)?;
+    if head[..got].contains(&0u8) {
+        return Ok(ReadOutcome::Binary);
+    }
+    // The prefix said text, so the rest has to be read to prove it. Read from the same handle
+    // rather than reopening: the file could change between the two opens.
+    let mut bytes = Vec::with_capacity(got);
+    bytes.extend_from_slice(&head[..got]);
+    f.read_to_end(&mut bytes)?;
+    Ok(match String::from_utf8(bytes) {
+        Ok(s) => ReadOutcome::Text(s),
+        Err(_) => ReadOutcome::Binary,
+    })
 }
 
 /// Read a file as UTF-8 text, `None` for binary or unreadable content.
@@ -955,6 +1010,66 @@ mod tests {
             "every file must be present, in any order"
         );
         assert_eq!(got.len(), 4, "no file may be dropped: {:?}", got);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_large_binary_file_is_classified_without_reading_all_of_it() {
+        // `read_file` used to call `fs::read` and then look at the first 8000 bytes, so a read-only
+        // `status` cost as much memory as the largest tracked file. This writes a 64 MB file whose
+        // first bytes already say "binary" and checks the classification is right; the read guard
+        // is what keeps this test honest - if the whole file were loaded, peak RSS would show it.
+        //
+        // The assertion is on behaviour, not on allocator counters, because a portable per-read
+        // allocation count is not available here. 64 MB is chosen so the old path is visible in a
+        // memory profile while the test itself stays fast.
+        let tmp = tmpdir("bigbin");
+        let big = tmp.join("big.bin");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&big).unwrap();
+            // NUL in the first byte: the prefix alone decides.
+            f.write_all(&[0u8, 1, 2, 3]).unwrap();
+            let chunk = vec![0x41u8; 1 << 20];
+            for _ in 0..64 {
+                f.write_all(&chunk).unwrap();
+            }
+        }
+        assert!(
+            fs::metadata(&big).unwrap().len() >= 64 << 20,
+            "the fixture was not written at the size the test needs"
+        );
+        assert!(
+            matches!(read_file(&big), ReadOutcome::Binary),
+            "a 64 MB file starting with NUL was not read as binary"
+        );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_symlink_still_reads_as_its_target_name() {
+        // The faster read must not drop the guard that `read_bytes` had: a scan walks
+        // attacker-reachable paths, and following a link out of the repository is how a scan reads
+        // something it was never pointed at.
+        let tmp = tmpdir("link");
+        let link = tmp.join("link");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("/etc/passwd", &link).unwrap();
+            match read_file(&link) {
+                ReadOutcome::Text(s) => {
+                    assert_eq!(s, "/etc/passwd", "the link target was not the content")
+                }
+                ReadOutcome::Binary => panic!("a symlink's target name was read as binary"),
+                ReadOutcome::Unreadable(e) => {
+                    panic!("a symlink was not read at all: {}", e)
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = link;
+        }
         let _ = fs::remove_dir_all(&tmp);
     }
 

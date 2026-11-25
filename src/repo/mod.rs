@@ -246,19 +246,31 @@ pub fn create_changeset_scoped(
                 match crate::store::walk::read_file(&root.join(&f.rel)) {
                     crate::store::walk::ReadOutcome::Text(c) => c,
                     crate::store::walk::ReadOutcome::Binary => {
-                        let bytes = crate::store::walk::read_bytes(&root.join(&f.rel))?;
-                        // The rules are already loaded here for the text/eol decisions; passing them
-                        // is what makes a `large` in `.gitattributes` decide instead of the 4 MB
-                        // threshold. Without this the attribute parsed and did nothing, which is
-                        // worse than not having it: `.gitattributes` is where a repository says a
-                        // path is big, and a rule that silently has no effect is a rule people keep
-                        // writing.
-                        let _ = crate::store::put_object_bytes_for(
-                            conn,
-                            &bytes,
-                            Some(f.rel.as_str()),
-                            Some(&attrs),
-                        )?;
+                        // A symlink's body is its target name, which reading the path cannot
+                        // produce - the open follows the link, so a dangling or non-UTF-8 target
+                        // fails instead of yielding the name. The name is tiny, so the streaming
+                        // path buys nothing there either.
+                        let p = root.join(&f.rel);
+                        let is_link = std::fs::symlink_metadata(&p)
+                            .map(|m| m.file_type().is_symlink())
+                            .unwrap_or(false);
+                        if is_link {
+                            let bytes = crate::store::walk::read_bytes(&p)?;
+                            crate::store::put_object_bytes_for(
+                                conn,
+                                &bytes,
+                                Some(f.rel.as_str()),
+                                Some(&attrs),
+                            )?;
+                        } else {
+                            let hash = crate::store::hash_file(&p)?;
+                            crate::store::put_object_from_file(
+                                conn,
+                                &p,
+                                &hash,
+                                std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0),
+                            )?;
+                        }
                         String::new()
                     }
                     _ => continue,

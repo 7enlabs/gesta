@@ -182,10 +182,47 @@ pub fn scan_with_cache(
                 });
             }
             ReadOutcome::Binary => {
-                // Binary files are stored as raw bytes, no compression, no delta.
-                let bytes = crate::store::walk::read_bytes(&path)?;
-                let hash = crate::store::hash_bytes(&bytes);
-                crate::store::put_object_bytes(conn, &bytes)?;
+                // Binary files are stored as raw bytes, no compression, no delta. Hashing and
+                // storing both stream, so a large asset costs one block buffer rather than its own
+                // size twice: this path used to read the whole file, and a 256 MB binary made
+                // `status` resident at 263 MB.
+                //
+                // A symlink is the exception. Its content is its target name, which `read_bytes`
+                // returns without following the link, and which the streaming path cannot produce:
+                // opening the path follows the link, and a target that does not exist - a dangling
+                // link, or a name that is not valid UTF-8 - would fail the read entirely. A target
+                // name is also tiny, so there is nothing to gain by streaming it.
+                let link = std::fs::symlink_metadata(&path)
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false);
+                let hash = if link {
+                    match crate::store::walk::read_bytes(&path) {
+                        Ok(bytes) => {
+                            let h = crate::store::hash_bytes(&bytes);
+                            crate::store::put_object_bytes_for(
+                                conn,
+                                &bytes,
+                                Some(rel.as_str()),
+                                Some(attrs),
+                            )?;
+                            h
+                        }
+                        Err(e) => {
+                            unreadable.push(format!("{}: {}", rel, e));
+                            continue;
+                        }
+                    }
+                } else {
+                    let h = match crate::store::hash_file(&path) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            unreadable.push(format!("{}: {}", rel, e));
+                            continue;
+                        }
+                    };
+                    crate::store::put_object_from_file(conn, &path, &h, size as u64)?;
+                    h
+                };
                 pending_writes.push((rel.clone(), mtime, size, hash.clone()));
                 // Binary files have no text content in the scan result.
                 files.push(ScannedFile {

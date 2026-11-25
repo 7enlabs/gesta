@@ -680,6 +680,25 @@ pub fn hash_bytes(bytes: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
+/// Hash a file without holding it in memory.
+///
+/// `hash_bytes` needs the whole body. A scan has to hash every tracked file whether or not it
+/// stores one, so a large binary cost its full size in memory just to be named.
+pub fn hash_file(p: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(p)?;
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(hex::encode(h.finalize()))
+}
+
 pub fn hash_content(s: &str) -> String {
     hash_bytes(s.as_bytes())
 }
@@ -741,6 +760,48 @@ pub fn put_object_bytes_for(
         params![h, bytes, bytes.len() as i64, now()],
     )?;
     Ok(h)
+}
+
+/// Store a large object from a file on disk, never holding it whole.
+///
+/// The caller has already hashed it (`hash_file`), so the hash is passed in rather than recomputed:
+/// hashing a 256 MB file twice would double the only I/O this path cannot avoid.
+///
+/// A body at or above the sidecar threshold goes beside the database by block copy. A smaller body
+/// is read and stored inline, because a body that small is one the inline path was built for.
+pub fn put_object_from_file(
+    conn: &Connection,
+    p: &std::path::Path,
+    hash: &str,
+    size: u64,
+) -> ZResult<String> {
+    let exists: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM objects WHERE hash = ?1",
+            params![hash],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if exists.is_some() {
+        return Ok(hash.to_string());
+    }
+    let root = db_root(conn);
+    let send_out = crate::store::sidecar::is_large(size as usize);
+    if send_out {
+        if let Some(root) = root {
+            crate::store::sidecar::write_from_file(&root, hash, p)?;
+            conn.execute(
+                "INSERT OR IGNORE INTO objects(hash, content, size, compressed, created_at, sidecar)
+                 VALUES(?1, x'', ?2, 0, ?3, 1)",
+                params![hash, size as i64, now()],
+            )?;
+            return Ok(hash.to_string());
+        }
+        // No root to place a file beside: fall through to reading it, which is correct and slower.
+    }
+    let bytes = std::fs::read(p)?;
+    put_object_bytes_for(conn, &bytes, None, None)?;
+    Ok(hash.to_string())
 }
 
 fn compress(content: &str) -> ZResult<Vec<u8>> {
@@ -2774,6 +2835,75 @@ pub(crate) mod tests {
     /// literal path. Adding a module here means adding a line, and forgetting to means the new file is
     /// the one that gets the cycle - which is why the test also checks the count against the declarations
     /// in mod.rs.
+
+    #[test]
+    fn hash_file_matches_hash_bytes_on_the_same_content() {
+        // The streaming hash exists so a large file never has to be resident. It has to agree with
+        // `hash_bytes` exactly or an object stored by one path would be unfindable by the other,
+        // and the two are deliberately written differently: one whole-buffer, one block loop.
+        let dir = std::env::temp_dir().join(format!("gesta-hashfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("a.bin");
+        // Spans several read blocks so the loop is exercised more than once.
+        let body: Vec<u8> = (0..(5u32 << 20)).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&p, &body).unwrap();
+        assert_eq!(
+            hash_file(&p).unwrap(),
+            hash_bytes(&body),
+            "the block hash and the whole-buffer hash disagreed, so an object would be stored under one name and looked for under another"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn storing_a_large_file_from_disk_round_trips_and_keeps_the_body_out_of_the_row() {
+        // `put_object_from_file` is the path a large asset takes. Two things can go wrong that no
+        // other test would see: the copy can truncate, and the row can end up carrying the body
+        // instead of a sidecar pointer, which is the memory the whole path exists to avoid.
+        //
+        // The connection is opened on a file rather than in memory because the sidecar root is
+        // derived from the database path: an in-memory connection has no root, so the function
+        // would fall back to reading the file whole and the test would pass without ever
+        // exercising the block copy.
+        let dir = std::env::temp_dir().join(format!("gesta-putfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".gesta")).unwrap();
+        let conn = Connection::open(dir.join(".gesta").join("gesta.db")).unwrap();
+        init_schema(&conn).unwrap();
+
+        let p = dir.join("big.bin");
+        let body: Vec<u8> = (0..(5u32 << 20)).map(|i| (i % 241) as u8).collect();
+        std::fs::write(&p, &body).unwrap();
+        let hash = hash_file(&p).unwrap();
+
+        let stored = put_object_from_file(&conn, &p, &hash, body.len() as u64).unwrap();
+        assert_eq!(stored, hash, "storing from a file changed the hash");
+        assert_eq!(
+            get_object_bytes(&conn, &hash).unwrap(),
+            body,
+            "the body read back differed from what was on disk, so the block copy lost or reordered bytes"
+        );
+        let (size, sidecar): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT size, sidecar FROM objects WHERE hash = ?1",
+                params![hash],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            size as usize,
+            body.len(),
+            "the recorded size was not the body's"
+        );
+        assert_eq!(
+            sidecar,
+            Some(1),
+            "a 5 MB body was not sent to a sidecar, so it was held in the row this path exists to keep free"
+        );
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_storage_layer_does_not_call_up_into_the_repository_layer() {

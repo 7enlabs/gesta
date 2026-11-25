@@ -161,6 +161,23 @@ def main():
             (r[1] or "")[-400:],
         )
 
+    if want("walk-memory"):
+        # `status` read every tracked file whole to decide whether it was text, then read the
+        # binary ones again to hash and store them. A repository with one large asset therefore
+        # made a read-only command resident at the asset's size. The bench drives the real binary
+        # and reads the child's peak RSS, so the ceiling is measured rather than asserted.
+        r = sh(
+            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'walk_memory.py')} "
+            f"{os.path.join(ZF_DIR, 'target', 'release', 'gesta')} 128",
+            cwd=ZF_DIR,
+            timeout=300,
+        )
+        record(
+            "status on a repository with a 128 MB asset stays far below its size",
+            r[0] == 0 and "VERDICT=prefix_only" in r[1],
+            (r[1] or "")[-400:],
+        )
+
     if want("json-surface"):
         # `--json tag v1.0` listed tags instead of creating one, `--json diff --name-only` dropped
         # the flag, and `--json blame --ignore-rev` ignored the list that decides which changeset a
