@@ -2336,9 +2336,9 @@ pub fn object_count(conn: &Connection) -> ZResult<i64> {
 
 /// Collect every object reachable from the repository state, and delete the rest.
 ///
-/// An object is reachable when it is the content of a file in a committed tree, or the body
-/// of a changeset, or the target of a branch head. A packfile is not considered because the
-/// database only stores loose objects; a `git gc` on the export will handle packfiles.
+/// An object is reachable when it belongs to a committed or pending tree, a stash, a branch head,
+/// or a shallow snapshot, or is a transitive base of a reachable delta. External git packfiles are
+/// separate from this store; a `git gc` on an export handles them.
 pub fn gc(conn: &Connection) -> ZResult<u64> {
     let mut reachable: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -2397,6 +2397,29 @@ pub fn gc(conn: &Connection) -> ZResult<u64> {
     // is nothing extra to collect here. The table has no hash column; reading one is a mistake
     // that only shows up when a repository has a tag.
     let _ = "tags point at changesets, which are collected above";
+
+    // A shallow clone may keep file bodies only in its snapshot, with no local history row.
+    let mut snapshot_stmt = conn.prepare("SELECT hash FROM snapshot_objects")?;
+    let snapshot_rows = snapshot_stmt.query_map([], |r| r.get::<_, String>(0))?;
+    for hash in snapshot_rows {
+        reachable.insert(hash?);
+    }
+
+    // Only live deltas keep their bases. Read the edges once and walk to a fixed point;
+    // inserting before queueing also bounds a malformed cycle.
+    let bases: std::collections::HashMap<String, String> = {
+        let mut stmt = conn.prepare("SELECT hash, base FROM deltas")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut pending: Vec<String> = reachable.iter().cloned().collect();
+    while let Some(hash) = pending.pop() {
+        if let Some(base) = bases.get(&hash) {
+            if reachable.insert(base.clone()) {
+                pending.push(base.clone());
+            }
+        }
+    }
 
     // Delete every object not in the reachable set.
     let all: Vec<String> = {
@@ -2782,6 +2805,81 @@ pub(crate) mod tests {
             checked,
             offenders.join("\n  ")
         );
+    }
+
+    #[test]
+    fn gc_preserves_snapshot_objects() {
+        let conn = mem_db();
+        let kept = put_object(&conn, "shallow snapshot body").unwrap();
+        conn.execute(
+            "INSERT INTO snapshot_objects(path, hash) VALUES('shallow.txt', ?1)",
+            params![kept],
+        )
+        .unwrap();
+        put_object(&conn, "unreachable snapshot neighbour").unwrap();
+        assert_eq!(gc(&conn).unwrap(), 1);
+        assert_eq!(get_object(&conn, &kept).unwrap(), "shallow snapshot body");
+        assert_eq!(gc(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn gc_preserves_transitive_delta_bases() {
+        let conn = mem_db();
+        let base: String = (0..500)
+            .map(|n| format!("unique source line {n:08}\n"))
+            .collect();
+        let middle = format!("{base}middle edit\n");
+        let tip = format!("{middle}final edit\n");
+        let h0 = put_object(&conn, &base).unwrap();
+        let h1 = put_object_against(&conn, &middle, Some(&h0)).unwrap();
+        let h2 = put_object_against(&conn, &tip, Some(&h1)).unwrap();
+        assert_eq!(
+            delta_depth(&conn, &h2).unwrap(),
+            2,
+            "fixture needs two real deltas"
+        );
+        crate::repo::tests::commit_files(&conn, "gc-delta", "gc delta", &[("tip.txt", &tip)]);
+        put_object(&conn, "unreachable unrelated body").unwrap();
+        assert_eq!(gc(&conn).unwrap(), 1);
+        assert_eq!(get_object(&conn, &h0).unwrap(), base);
+        assert_eq!(get_object(&conn, &h1).unwrap(), middle);
+        assert_eq!(get_object(&conn, &h2).unwrap(), tip);
+        assert_eq!(gc(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn gc_terminates_on_a_reachable_delta_cycle() {
+        let conn = mem_db();
+        let h0 = put_object(&conn, "cycle first body").unwrap();
+        let h1 = put_object(&conn, "cycle second body").unwrap();
+        for (hash, base) in [(&h0, &h1), (&h1, &h0)] {
+            conn.execute(
+                "INSERT INTO deltas(hash, base, payload, created_at) VALUES(?1, ?2, X'', 0)",
+                params![hash, base],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO snapshot_objects(path, hash) VALUES('cycle.txt', ?1)",
+            params![h0],
+        )
+        .unwrap();
+        // The fixture is corrupt; GC must terminate without deleting either live dependency.
+        assert_eq!(gc(&conn).unwrap(), 0);
+        assert_eq!(object_count(&conn).unwrap(), 2);
+    }
+
+    #[test]
+    fn gc_collects_unreachable_delta_chains() {
+        let conn = mem_db();
+        let base: String = (0..500)
+            .map(|n| format!("unique orphan line {n:08}\n"))
+            .collect();
+        let h0 = put_object(&conn, &base).unwrap();
+        let h1 = put_object_against(&conn, &format!("{base}orphan edit\n"), Some(&h0)).unwrap();
+        assert_eq!(delta_depth(&conn, &h1).unwrap(), 1);
+        assert_eq!(gc(&conn).unwrap(), 2);
+        assert_eq!(object_count(&conn).unwrap(), 0);
     }
 
     #[test]
