@@ -27,6 +27,7 @@ use crate::store::{
     branch_head, current_branch, get_object, hash_at_point, hash_content, latest_hash, merge_base,
     merge_bases, new_changeset_id, put_object, put_object_for,
 };
+use crate::support::safe_write;
 use crate::{bad, now, repo_dir, ZResult};
 
 /// Files loaded from the repository's ignore configuration.
@@ -245,7 +246,7 @@ pub fn create_changeset_scoped(
                 match crate::store::walk::read_file(&root.join(&f.rel)) {
                     crate::store::walk::ReadOutcome::Text(c) => c,
                     crate::store::walk::ReadOutcome::Binary => {
-                        let bytes = std::fs::read(root.join(&f.rel))?;
+                        let bytes = crate::store::walk::read_bytes(&root.join(&f.rel))?;
                         // The rules are already loaded here for the text/eol decisions; passing them
                         // is what makes a `large` in `.gitattributes` decide instead of the 4 MB
                         // threshold. Without this the attribute parsed and did nothing, which is
@@ -1702,12 +1703,8 @@ pub fn checkout_file(
     // next scan immediately reports as modified, which reads as if the checkout failed.
     let attrs = crate::support::attributes::Rules::load(root);
     let content = crate::support::attributes::plan_for(&attrs, rel).checked_out(&content);
-    let target = root.join(rel);
-    if let Some(parent) = target.as_path().parent() {
-        fs::create_dir_all(parent)?;
-    }
     let len = content.len();
-    fs::write(&target, &content)?;
+    safe_write::write_safe(root, rel, &content)?;
     Ok(len)
 }
 
@@ -1844,11 +1841,8 @@ pub fn materialise(conn: &Connection, root: &Path, branch: &str) -> ZResult<usiz
         // The line ending the working tree wants, which is not always the one the object holds.
         let plan = crate::support::attributes::plan_for(&attrs, path);
         let content = plan.checked_out(&content);
-        let target = target_inside(root, path)?;
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&target, &content)?;
+        let _target = target_inside(root, path)?;
+        safe_write::write_safe(root, path, &content)?;
     }
     Ok(files.len())
 }
@@ -1907,6 +1901,14 @@ pub fn restore_worktree(conn: &Connection, root: &Path, branch: &str) -> ZResult
 /// changeset, and asking it to resolve as a branch name gives `no such branch: cs...` - true, and
 /// about the wrong thing. This resolves the id directly.
 pub fn restore_at_changeset(conn: &Connection, root: &Path, changeset: &str) -> ZResult<usize> {
+    let exists: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM changesets WHERE id = ?1",
+        [changeset],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Err(bad(format!("changeset {} does not exist", changeset)));
+    }
     let files = crate::store::tree_at(conn, changeset)?;
     let attrs = crate::support::attributes::Rules::load(root);
     let mut written = 0usize;
@@ -1914,11 +1916,8 @@ pub fn restore_at_changeset(conn: &Connection, root: &Path, changeset: &str) -> 
         let content = crate::store::get_object_bytes(conn, hash)?;
         let plan = crate::support::attributes::plan_for(&attrs, path);
         let content = plan.checked_out(&content);
-        let target = root.join(path);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&target, &content)?;
+        let _target = root.join(path);
+        safe_write::write_safe(root, path, &content)?;
         written += 1;
     }
     // A path tracked at some point but absent from this tree has to go, or the checkout is a union
@@ -2589,6 +2588,56 @@ fn a_scoped_snapshot_leaves_another_writer_files_alone() {
 pub(crate) mod tests {
     use super::*;
     use crate::store::tests::mem_db;
+
+    #[cfg(unix)]
+    #[test]
+    fn changeset_stores_symlink_target_bytes_and_mode() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::symlink;
+        let tmpdir = |tag: &str| {
+            let p = std::env::temp_dir().join(format!("gesta_repo_{tag}_{}", std::process::id()));
+            fs::create_dir_all(&p).unwrap();
+            p
+        };
+        let root = tmpdir("changeset_links");
+        fs::create_dir(root.join(".gesta")).unwrap();
+        let outside = tmpdir("changeset_link_targets");
+        fs::write(outside.join("secret"), "private target content\n").unwrap();
+        fs::write(root.join(".gitattributes"), "* text eol=lf\n").unwrap();
+        let targets = [
+            ("file_link", outside.join("secret")),
+            ("directory_link", outside.clone()),
+            ("dangling_link", outside.join("missing")),
+            (
+                "raw_link",
+                std::path::PathBuf::from(std::ffi::OsStr::from_bytes(b"raw\xff")),
+            ),
+            ("crlf_link", std::path::PathBuf::from("missing\r\nname")),
+        ];
+        for (name, target) in &targets {
+            symlink(target, root.join(name)).unwrap();
+        }
+        let conn = mem_db();
+        let changeset = crate::repo::create_changeset(&conn, &root, "links", "test")
+            .unwrap()
+            .expect("new symlinks produce a changeset");
+        for (name, target) in targets {
+            let (hash, mode): (String, String) = conn
+                .query_row(
+                    "SELECT new_hash, mode FROM changeset_files WHERE changeset_id=?1 AND path=?2",
+                    params![changeset.id, name],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(mode, "120000");
+            assert_eq!(
+                crate::store::get_object_bytes(&conn, &hash).unwrap(),
+                target.as_os_str().as_bytes()
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
 
     pub fn commit_files(conn: &Connection, id: &str, msg: &str, files: &[(&str, &str)]) {
         // The parent is the current head, which is what a real commit does. With

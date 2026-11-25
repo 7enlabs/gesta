@@ -506,12 +506,17 @@ pub fn cmd_checkout(file: Option<&str>, changeset: Option<&str>) -> ZResult<()> 
     // stays available for the narrower question.
     let file = file.unwrap_or(".");
     if file == "." {
-        let branch = current_branch(&conn)?;
-        let (written, removed) = repo::restore_worktree(&conn, &root, &branch)?;
-        println!(
-            "restored {} file(s), removed {} stale file(s)",
-            written, removed
-        );
+        if let Some(cs) = changeset {
+            let written = repo::restore_at_changeset(&conn, &root, cs)?;
+            println!("restored {} file(s) from changeset {}", written, cs);
+        } else {
+            let branch = current_branch(&conn)?;
+            let (written, removed) = repo::restore_worktree(&conn, &root, &branch)?;
+            println!(
+                "restored {} file(s), removed {} stale file(s)",
+                written, removed
+            );
+        }
         return Ok(());
     }
     let rel = normalise(file);

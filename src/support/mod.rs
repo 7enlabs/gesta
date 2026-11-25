@@ -17,4 +17,5 @@ pub mod ops;
 pub mod paths;
 pub mod privacy;
 pub mod private_file;
+pub mod safe_write;
 pub mod secrets;
