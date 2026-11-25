@@ -128,6 +128,44 @@ The auth file entry gains two optional fields at the end:
 Each field may be empty, and an entry written before the branch field existed grants every branch,
 which is why an existing `.gesta/auth` keeps working unchanged.
 
+## Keying the digests
+
+A plain `sha256:` digest is `SHA-256(token)` with no secret in it, so a copy of the auth file is an
+offline attack: an operator-chosen token is usually weak, and guessing it from the digest is minutes
+of work. The file also happens to be the file the changeset endpoint reads, so a digest leak and a
+token recovery are one step apart.
+
+Set `GESTA_AUTH_KEY` on the server, to a value with real entropy, and give every token a keyed
+digest:
+
+```bash
+export GESTA_AUTH_KEY="$(head -c 32 /dev/urandom | base64)"
+gesta remote token add write ci --branches main
+```
+
+`token add` and `token rotate` then write the keyed form:
+
+```text
+sha256m:<mac> : <role> : <name> : <path globs> : <expiry> : <branch globs>
+```
+
+The mac is `HMAC-SHA256(GESTA_AUTH_KEY, "gesta-auth-v1\0" + token)`. Three properties follow, and
+they are the reason for a key rather than a per-entry salt:
+
+- **A leaked file is not a set of credentials.** Verifying a keyed entry needs the key, which lives
+  in the server's environment and not in the file. A host without `GESTA_AUTH_KEY` authenticates
+  nobody against a keyed file.
+- **The lookup stays one hash.** The key plays the part a salt would play, but it is per deployment
+  rather than per entry, so authentication is two map lookups and two HMACs rather than a scan. A
+  per-entry salt would make it `O(tokens)` with a slow hash in the middle, which measures 24 ms per
+  token per request with PBKDF2 at 210 000 rounds.
+- **The two forms mix.** A `sha256:` entry keeps verifying while the key is set, so a deployment
+  migrates one token at a time with `token rotate`. Without `GESTA_AUTH_KEY`, `token add` still
+  writes the plain form and says on stderr that the digest is unkeyed.
+
+Losing the key locks out every keyed token; that is the same trade as losing the auth file, and it
+is why the key belongs wherever the other deployment secrets already live.
+
 Two rules that are not obvious:
 
 - **A read token is never limited by branch.** Refusing a read because a branch is not listed would

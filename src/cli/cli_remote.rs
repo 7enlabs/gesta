@@ -1731,6 +1731,45 @@ fn read_auth_file(root: &Path) -> ZResult<Vec<String>> {
     }
 }
 
+/// The secret field for a new auth entry: keyed when the deployment has a key, plain otherwise.
+///
+/// Returning the prefix as well as the value keeps the two call sites from re-deciding, and keeps
+/// `sha256m:` and `sha256:` in one place.
+fn entry_secret(token: &str, hashed: bool) -> (String, bool) {
+    if !hashed {
+        return (token.to_string(), false);
+    }
+    match crate::transport::auth::digest_key() {
+        Some(key) => (
+            format!(
+                "sha256m:{}",
+                crate::transport::auth::digest_keyed(token, &key)
+            ),
+            true,
+        ),
+        None => (
+            format!("sha256:{}", crate::transport::auth::digest(token)),
+            false,
+        ),
+    }
+}
+
+/// Say once, where a person is watching, that an unkeyed digest is the weaker form.
+///
+/// A plain `SHA-256(token)` is brute-forceable when the auth file leaks, and a weak operator-chosen
+/// token falls in minutes. The keyed form costs one HMAC per request and nothing else, so a
+/// deployment that leaves `GESTA_AUTH_KEY` unset is choosing the weaker form, and that choice should
+/// be visible rather than silent.
+fn warn_if_unkeyed(hashed: bool) {
+    if hashed && crate::transport::auth::digest_key().is_none() {
+        eprintln!(
+            "warning: this digest is unkeyed, so a leaked auth file can be brute-forced for a weak \
+             token. Set GESTA_AUTH_KEY on the server and re-run this to store keyed digests, which \
+             cost one HMAC per request and nothing else."
+        );
+    }
+}
+
 /// Add a token to `.gesta/auth`. The token is generated, never typed by the
 /// user, and printed once.
 pub fn cmd_token_add(
@@ -1770,9 +1809,11 @@ pub fn cmd_token_add(
     let path_scope = scope.map(|s| s.trim().to_string()).unwrap_or_default();
     let branch_scope = branches.map(|s| s.trim().to_string()).unwrap_or_default();
     let entry = if hashed {
+        warn_if_unkeyed(hashed);
+        let (secret, _keyed) = entry_secret(&token, true);
         format!(
-            "sha256:{}:{}:{}:{}:{}:{}",
-            auth::digest(&token),
+            "{}:{}:{}:{}:{}:{}",
+            secret,
             role,
             name.trim(),
             path_scope,
@@ -1928,7 +1969,8 @@ pub fn cmd_token_rotate(selector: &str, hashed: bool) -> ZResult<()> {
 
     let token = auth::generate_token(32)?;
     let secret = if hashed {
-        format!("sha256:{}", auth::digest(&token))
+        warn_if_unkeyed(hashed);
+        entry_secret(&token, true).0
     } else {
         token.clone()
     };

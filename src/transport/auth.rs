@@ -28,6 +28,12 @@ pub enum Role {
 #[derive(Debug, Clone)]
 pub struct Auth {
     tokens: HashMap<String, Grant>,
+    /// The key a `sha256m:` entry is verified with, from `GESTA_AUTH_KEY`.
+    ///
+    /// `None` means keyed entries cannot be verified at all, which is what makes a leaked keyed file
+    /// useless on its own. Plain `sha256:` entries still verify without it, so a file that has not
+    /// been migrated keeps working and a migration does not have to be all at once.
+    key: Option<Vec<u8>>,
     pub required: bool,
     /// What the file said last time it was read, so a change can be noticed without re-reading a
     /// file that has not changed.
@@ -184,6 +190,35 @@ impl Auth {
                 continue;
             }
 
+            // `sha256m:<mac>:...` is the keyed form and is tried first, because it shares a prefix
+            // with the plain form and a `strip_prefix("sha256:")` that ran first would read
+            // `sha256m:` as a malformed plain entry and drop the token without saying so.
+            if let Some(rest) = line.strip_prefix("sha256m:") {
+                let mut parts = rest.splitn(6, ':');
+                let (Some(mac), Some(role)) = (parts.next(), parts.next()) else {
+                    continue;
+                };
+                let name = parts.next().unwrap_or("unnamed");
+                let scope = parts.next().unwrap_or("");
+                let expires = parts.next().unwrap_or("");
+                let branches = parts.next().unwrap_or("");
+                let mac = mac.trim().to_ascii_lowercase();
+                if mac.len() != 64 || !mac.chars().all(|c| c.is_ascii_hexdigit()) {
+                    continue; // a malformed mac must never match anything
+                }
+                tokens.insert(
+                    mac,
+                    Grant {
+                        name: name.trim().to_string(),
+                        role: parse_role(role),
+                        scope: parse_scope(scope),
+                        expires_at: parse_expiry(expires),
+                        branches: parse_scope(branches),
+                    },
+                );
+                continue;
+            }
+
             // `sha256:<digest>:<role>:<name>` has four fields, the clear form
             // has three, so the digest marker has to be handled first.
             if let Some(rest) = line.strip_prefix("sha256:") {
@@ -237,6 +272,7 @@ impl Auth {
         Auth {
             required: !tokens.is_empty(),
             tokens,
+            key: digest_key(),
             loaded_at: None,
         }
     }
@@ -277,9 +313,23 @@ impl Auth {
     }
 
     /// Resolve a presented token to a role, or `None` when it is unknown.
+    ///
+    /// Two lookups rather than one, because the entry decided which digest it carries and the token
+    /// does not say. A keyed lookup is skipped when there is no key, which is the case that matters:
+    /// a leaked keyed file authenticates nobody on a host that does not hold `GESTA_AUTH_KEY`.
+    fn lookup(&self, presented: &str) -> Option<&Grant> {
+        if let Some(key) = self.key.as_deref() {
+            if let Some(g) = self.tokens.get(&digest_keyed(presented, key)) {
+                return Some(g);
+            }
+        }
+        self.tokens.get(&digest(presented))
+    }
+
+    /// Resolve a presented token to a role, or `None` when it is unknown.
     #[cfg(test)]
     pub fn authenticate(&self, presented: &str) -> Option<Grant> {
-        self.tokens.get(&digest(presented)).cloned()
+        self.lookup(presented).cloned()
     }
 
     /// Authenticate and reject a grant that has expired.
@@ -288,7 +338,7 @@ impl Auth {
     /// "right token, too late" and answer 401 with a different reason. The
     /// server uses this one.
     pub fn authenticate_now(&self, presented: &str, now: i64) -> AuthOutcome {
-        match self.tokens.get(&digest(presented)) {
+        match self.lookup(presented) {
             None => AuthOutcome::Unknown,
             Some(g) if g.is_expired(now) => AuthOutcome::Expired(g.name.clone()),
             Some(g) => AuthOutcome::Granted(g.clone()),
@@ -357,6 +407,44 @@ pub fn digest(token: &str) -> String {
     let mut h = Sha256::new();
     h.update(token.as_bytes());
     hex::encode(h.finalize())
+}
+
+/// The environment variable that keys a token digest.
+///
+/// Named here rather than at each call site so the reader of a leaked file has one string to search
+/// for, and so a test and the server cannot drift apart on the spelling.
+pub const DIGEST_KEY_VAR: &str = "GESTA_AUTH_KEY";
+
+/// A token digest keyed with a secret the auth file does not carry.
+///
+/// A plain `SHA-256(token)` in the file is an offline attack: a digest of a weak operator-chosen
+/// token is a few minutes of guessing, and the file that carries the digests is the same file the
+/// changeset endpoint reads. Keying the digest with `GESTA_AUTH_KEY` means a leaked file alone is
+/// worthless; the attacker needs the key as well, and the key lives in the environment of the
+/// process rather than next to the tokens.
+///
+/// A keyed hash also keeps the lookup a single map: the salt-equivalent is the key, not a per-entry
+/// value, so neither loading nor authenticating walks the entries. A per-entry salt would make the
+/// lookup `O(tokens)` with a slow hash in the middle, which measured 24 ms per token per request.
+///
+/// The domain prefix keeps this from being the plain digest with a key stuck on: a keyed hash over
+/// the bare token would let the two forms be confused when the key happens to be a token.
+pub fn digest_keyed(token: &str, key: &[u8]) -> String {
+    let hk = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);
+    let tag = ring::hmac::sign(&hk, format!("gesta-auth-v1\u{0}{}", token).as_bytes());
+    hex::encode(tag.as_ref())
+}
+
+/// The key from the environment, when this process has one.
+///
+/// Public because the writer needs the same answer the reader uses: an entry written keyed and read
+/// unkeyed is a token that stops working, and the two spellings drifting apart is exactly how that
+/// happens.
+pub fn digest_key() -> Option<Vec<u8>> {
+    std::env::var(DIGEST_KEY_VAR)
+        .ok()
+        .filter(|k| !k.is_empty())
+        .map(|k| k.into_bytes())
 }
 
 /// Generate a token of `bytes` random bytes, hex encoded.
@@ -532,6 +620,61 @@ mod tests {
         assert_eq!(a.len(), 64, "32 bytes hex encoded");
         assert_ne!(a, b, "two calls must not repeat");
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn a_keyed_entry_does_not_authenticate_on_a_host_without_the_key() {
+        // The whole point of the keyed form: a leaked auth file is not a set of usable credentials.
+        // The digest is the same length as the plain one on purpose, so a reader cannot tell the two
+        // apart by eye and neither can a tool that only counts characters.
+        let key = b"a-deployment-key-with-real-entropy";
+        let token = "an-operator-chosen-token";
+        let mac = digest_keyed(token, key);
+        assert_eq!(mac.len(), 64);
+        assert_ne!(
+            mac,
+            digest(token),
+            "keyed and plain must differ for the same token"
+        );
+
+        let line = format!("sha256m:{}:read:alice", mac);
+        let loaded = Auth::from_entries(std::slice::from_ref(&line));
+        assert_eq!(loaded.token_count(), 1, "the keyed line must load");
+
+        // Without the key in the environment the entry is present but verifies nobody.
+        // SAFETY: this test owns the variable name.
+        unsafe { std::env::remove_var(DIGEST_KEY_VAR) };
+        let without = Auth::from_entries(std::slice::from_ref(&line));
+        assert!(
+            without.authenticate(token).is_none(),
+            "a keyed entry must not verify without the key"
+        );
+
+        // With it, the right token verifies and a different one does not.
+        let mut with = Auth::from_entries(std::slice::from_ref(&line));
+        with.key = Some(key.to_vec());
+        let g = with
+            .authenticate(token)
+            .expect("the keyed entry must verify with the key");
+        assert_eq!(g.name, "alice");
+        assert!(with.authenticate("a-different-token").is_none());
+    }
+
+    #[test]
+    fn a_plain_entry_still_verifies_while_a_key_is_set() {
+        // A migration cannot be all at once: a file that mixes both forms is the state a deployment
+        // is in for as long as it takes to re-add its tokens, and every entry must keep working.
+        let key = b"deployment-key";
+        let plain_token = "old-plain-token";
+        let keyed_token = "new-keyed-token";
+        let entries = [
+            format!("sha256:{}:read:old", digest(plain_token)),
+            format!("sha256m:{}:write:new", digest_keyed(keyed_token, key)),
+        ];
+        let mut store = Auth::from_entries(&entries);
+        store.key = Some(key.to_vec());
+        assert_eq!(store.authenticate(plain_token).unwrap().name, "old");
+        assert_eq!(store.authenticate(keyed_token).unwrap().name, "new");
     }
 
     #[test]
