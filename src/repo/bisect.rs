@@ -178,12 +178,16 @@ fn checkout(conn: &Connection, root: &Path, changeset: &str) -> ZResult<usize> {
     let files = crate::store::tree_at(conn, changeset)?;
     let mut written = 0usize;
     for (path, hash) in &files {
-        let content = crate::store::get_object(conn, hash)?;
+        // Bytes, not text: a tree with a binary file is ordinary, and the text reader refuses
+        // non-UTF-8 with an encoding error. Every other tree-writing path in the repository already
+        // reads bytes for this reason; bisect was the last one reading text, so a bisect step
+        // aborted with an encoding error on any tree holding a binary file.
+        let content = crate::store::get_object_bytes(conn, hash)?;
         let target = root.join(path);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&target, content.as_bytes())?;
+        std::fs::write(&target, &content)?;
         written += 1;
     }
     // Paths tracked somewhere in history but absent from this changeset are gone
@@ -373,6 +377,43 @@ pub fn finish(conn: &Connection, root: &Path) -> ZResult<usize> {
 mod tests {
     use super::*;
     use crate::repo::tests::commit_files;
+
+    #[test]
+    fn a_tree_holding_a_binary_file_is_checked_out() {
+        // A tree with a binary file is ordinary, and the text reader refuses non-UTF-8 with an
+        // encoding error, so a bisect step aborted on any tree holding one. The assertion is on the
+        // bytes that reach the disk rather than on the call succeeding: a checkout that wrote text
+        // would still return Ok on a file that happens to be valid UTF-8.
+        let conn = crate::store::tests::mem_db();
+        commit_files(&conn, "c1", "base", &[("f", "1\n")]);
+        let head = crate::store::branch_head(&conn, "main").unwrap();
+        conn.execute(
+            "INSERT INTO changesets(id,message,author,created_at,status,parent,branch)
+             VALUES('c2','bin','a',2,'pending',?1,'main')",
+            rusqlite::params![head],
+        )
+        .unwrap();
+        let bytes: &[u8] = &[0x00, 0xff, 0xfe, 0x80, 0x01];
+        let h = crate::store::put_object_bytes(&conn, bytes).unwrap();
+        conn.execute(
+            "INSERT INTO changeset_files(changeset_id,path,old_hash,new_hash)
+             VALUES('c2','blob.bin',NULL,?1)",
+            rusqlite::params![h],
+        )
+        .unwrap();
+        crate::repo::commit_one(&conn, "c2").unwrap();
+
+        let d = std::env::temp_dir().join(format!("gesta-bisect-bin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+
+        let written = checkout(&conn, &d, "c2").expect("a binary file must not fail the checkout");
+        assert!(written >= 1);
+        let on_disk = std::fs::read(d.join("blob.bin")).unwrap();
+        assert_eq!(on_disk, bytes, "the bytes written must be the bytes stored");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn the_range_excludes_what_the_good_point_already_contains() {
