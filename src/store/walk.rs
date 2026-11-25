@@ -593,10 +593,9 @@ fn stat_in_parallel(
                 scope.spawn(move || {
                     let mut mine = Vec::with_capacity(part.len());
                     for (rel, path) in part.iter() {
-                        // A symlink to a directory is deliberately not followed, which is what
-                        // `metadata` reports and what the walk has always done.
-                        if let Ok(meta) = fs::metadata(path) {
-                            if meta.is_file() {
+                        // Keep the link itself, including directory and dangling links.
+                        if let Ok(meta) = fs::symlink_metadata(path) {
+                            if meta.is_file() || meta.file_type().is_symlink() {
                                 mine.push((rel.clone(), meta));
                             }
                         }
@@ -614,14 +613,13 @@ fn stat_in_parallel(
     out
 }
 
-/// Stat one slice, keeping the paths that are regular files.
+/// Stat one slice, keeping regular files and symbolic links.
 fn stat_range(items: Vec<(String, PathBuf)>) -> Vec<(String, fs::Metadata)> {
     let mut out = Vec::with_capacity(items.len());
     for (rel, path) in items {
-        // A symlink to a directory is deliberately not followed, which is what `metadata` reports
-        // and what the walk has always done.
-        if let Ok(meta) = fs::metadata(&path) {
-            if meta.is_file() {
+        // Keep the link itself, including directory and dangling links.
+        if let Ok(meta) = fs::symlink_metadata(&path) {
+            if meta.is_file() || meta.file_type().is_symlink() {
                 out.push((rel, meta));
             }
         }
@@ -670,10 +668,49 @@ pub enum ReadOutcome {
     Unreadable(String),
 }
 
+/// Read a working-tree entry, storing a link's target name rather than following it.
+pub fn read_bytes(p: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    if fs::symlink_metadata(p)?.file_type().is_symlink() {
+        let target = fs::read_link(p)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            return Ok(target.as_os_str().as_bytes().to_vec());
+        }
+        #[cfg(not(unix))]
+        {
+            return target
+                .to_str()
+                .map(|s| s.as_bytes().to_vec())
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "link target is not UTF-8")
+                });
+        }
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(p)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 /// Read a file and classify it. A NUL byte in the first 8000 bytes means
 /// binary, matching git's heuristic closely enough for source code.
 pub fn read_file(p: &Path) -> ReadOutcome {
-    match fs::read(p) {
+    match read_bytes(p) {
         Ok(bytes) => {
             let head = &bytes[..bytes.len().min(8000)];
             if head.contains(&0u8) {

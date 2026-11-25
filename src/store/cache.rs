@@ -41,6 +41,9 @@ pub struct ScannedFile {
 /// whatever git recorded. That is why the mode is read where the format knows about it (import) and
 /// carried as data everywhere else, rather than recomputed from the filesystem on the way out.
 fn mode_of(meta: &fs::Metadata) -> String {
+    if meta.file_type().is_symlink() {
+        return "120000".into();
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -127,7 +130,7 @@ pub fn scan_with_cache(
                 // instead of trusted. Once it is a couple of seconds old the stat is stable and the
                 // fast path applies.
                 let young = now_ns.saturating_sub(mtime) < RACY_WINDOW_NS;
-                if !young {
+                if !young && !meta.file_type().is_symlink() {
                     // The stat matches, so the recorded hash is the answer and the file is never
                     // opened. Reading it anyway made the cache worthless: a 2000 file status read all
                     // 2000 files.
@@ -153,7 +156,7 @@ pub fn scan_with_cache(
         let path = root.join(&rel);
         match read_file(&path) {
             ReadOutcome::Text(content) => {
-                let content = if plan.normalise {
+                let content = if plan.normalise && !meta.file_type().is_symlink() {
                     match String::from_utf8(plan.stored(content.as_bytes())) {
                         Ok(s) => s,
                         // Normalising never changes bytes for a body that parsed as UTF-8, so this
@@ -180,7 +183,7 @@ pub fn scan_with_cache(
             }
             ReadOutcome::Binary => {
                 // Binary files are stored as raw bytes, no compression, no delta.
-                let bytes = fs::read(&path)?;
+                let bytes = crate::store::walk::read_bytes(&path)?;
                 let hash = crate::store::hash_bytes(&bytes);
                 crate::store::put_object_bytes(conn, &bytes)?;
                 pending_writes.push((rel.clone(), mtime, size, hash.clone()));
@@ -329,6 +332,8 @@ pub fn remember(conn: &Connection, root: &Path, rel: &str, hash: &str) -> ZResul
 mod tests {
     use super::*;
     use crate::store::tests::mem_db;
+    #[cfg(unix)]
+    use crate::store::walk::read_bytes;
 
     /// Move a file's mtime into the past so it is outside the racy window.
     fn backdate(p: &std::path::Path, secs: u64) {
@@ -342,6 +347,128 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_scan_records_links_without_reading_their_targets() {
+        use std::os::unix::fs::symlink;
+        let root = tmpdir("links");
+        let outside = tmpdir("link_targets");
+        fs::write(outside.join("secret"), "private target content\n").unwrap();
+        for (name, target) in [
+            ("file_link", outside.join("secret")),
+            ("directory_link", outside.clone()),
+            ("dangling_link", outside.join("missing")),
+        ] {
+            symlink(&target, root.join(name)).unwrap();
+        }
+        let conn = mem_db();
+        let rules = IgnoreRules::with_defaults(&[]);
+        for _ in 0..2 {
+            let scan = scan_with_cache(
+                &conn,
+                &root,
+                &rules,
+                &crate::support::attributes::Rules::default(),
+            )
+            .unwrap();
+            assert!(scan.unreadable.is_empty(), "{:?}", scan.unreadable);
+            assert_eq!(
+                scan.files.len(),
+                3,
+                "directory and dangling links must be tracked"
+            );
+            for file in scan.files {
+                let target = fs::read_link(root.join(&file.rel)).unwrap();
+                let target = target.to_str().unwrap();
+                assert_eq!(file.mode, "120000");
+                assert_eq!(file.content, target);
+                assert_eq!(file.hash, hash_content(target));
+                assert!(!file.content.contains("private target content"));
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parallel_stats_preserve_directory_and_dangling_links() {
+        use std::os::unix::fs::symlink;
+        let root = tmpdir("parallel_links");
+        for n in 0..512 {
+            fs::write(root.join(format!("file_{n}")), "ordinary\n").unwrap();
+        }
+        symlink("missing", root.join("dangling_link")).unwrap();
+        symlink(".", root.join("directory_link")).unwrap();
+        let scan = scan_with_cache(
+            &mem_db(),
+            &root,
+            &IgnoreRules::with_defaults(&[]),
+            &crate::support::attributes::Rules::default(),
+        )
+        .unwrap();
+        assert_eq!(scan.files.len(), 514);
+        for (name, target) in [("dangling_link", "missing"), ("directory_link", ".")] {
+            let file = scan.files.iter().find(|file| file.rel == name).unwrap();
+            assert_eq!(file.mode, "120000");
+            assert_eq!(file.content, target);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_bytes_does_not_follow_a_link_swapped_after_lstat() {
+        use std::os::unix::fs::symlink;
+        use std::time::Duration;
+
+        let root = tmpdir("link_swap");
+        let target = root.join("target");
+        let candidate = root.join("candidate");
+        let entry = root.join("entry");
+        fs::write(&target, vec![b'x'; 32 * 1024 * 1024]).unwrap();
+        symlink("target", &candidate).unwrap();
+        fs::write(&entry, "safe").unwrap();
+
+        let writer_entry = entry.clone();
+        let writer_candidate = candidate.clone();
+        let writer = std::thread::spawn(move || {
+            for _ in 0..10_000 {
+                let _ = fs::remove_file(&writer_entry);
+                let _ = fs::rename(&writer_candidate, &writer_entry);
+                let _ = symlink("target", &writer_candidate);
+            }
+        });
+        std::thread::sleep(Duration::from_millis(10));
+        for _ in 0..10_000 {
+            if let Ok(bytes) = read_bytes(&entry) {
+                assert!(
+                    bytes == b"safe" || bytes == b"target",
+                    "read followed a concurrently swapped symlink"
+                );
+            }
+        }
+        writer.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_bytes_rejects_a_fifo_without_blocking() {
+        use std::os::unix::fs::FileTypeExt;
+
+        let root = tmpdir("fifo");
+        let fifo = root.join("pipe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
+        assert!(read_bytes(&fifo).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

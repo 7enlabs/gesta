@@ -12,6 +12,7 @@ Exit code is 0 only when every step passes.
 import io
 import os
 import re
+import shlex
 import socket
 import subprocess
 import sys
@@ -33,7 +34,7 @@ def free_port():
 # a change is checked against.
 ZF_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ZF = os.path.join(ZF_DIR, "target/release/gesta")
-BUGHUNTER = os.environ.get("BUGHUNTER_DIR", "/work/hermes-health/sec/bughunter")
+BUGHUNTER = os.environ.get("BUGHUNTER_DIR", os.path.join(ZF_DIR, "bench", "bughunter"))
 results = []
 skipped = []
 
@@ -5205,7 +5206,7 @@ def main():
         if not os.path.isdir(BUGHUNTER):
             skip("bughunter scenarios", f"{BUGHUNTER} not present, so no scenario ran")
         else:
-            rc, out = sh(f"bash {BUGHUNTER}/run.sh {ZF_DIR}", timeout=900)
+            rc, out = sh(f"bash {shlex.quote(os.path.join(BUGHUNTER, 'run.sh'))} {shlex.quote(ZF_DIR)}", timeout=900)
             record("bughunter scenarios", rc == 0, out[-600:])
 
     if want("backup-remote"):
