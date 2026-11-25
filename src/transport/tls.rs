@@ -18,7 +18,7 @@
 //! person makes once and can check later.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -367,8 +367,34 @@ pub fn connect(
     pin: Option<&str>,
     timeout: std::time::Duration,
 ) -> ZResult<TlsStream> {
-    let tcp = TcpStream::connect((host, port))
-        .map_err(|e| bad(format!("cannot connect to {}:{}: {}", host, port, e)))?;
+    // The timeout has to cover the connect itself. `TcpStream::connect` waits for the OS default,
+    // which on Linux is over two minutes, so a host that drops SYNs held the caller for minutes
+    // before the first timeout applied - the caller asked for `timeout` and got something else.
+    // Resolving first and trying each address with a deadline keeps the promise.
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| bad(format!("cannot resolve {}:{}: {}", host, port, e)))?;
+    let mut last: Option<std::io::Error> = None;
+    let mut tcp: Option<TcpStream> = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, timeout) {
+            Ok(s) => {
+                tcp = Some(s);
+                break;
+            }
+            Err(e) => last = Some(e),
+        }
+    }
+    let tcp = tcp.ok_or_else(|| {
+        bad(format!(
+            "cannot connect to {}:{} within {:?}: {}",
+            host,
+            port,
+            timeout,
+            last.map(|e| e.to_string())
+                .unwrap_or_else(|| "no address".to_string())
+        ))
+    })?;
     tcp.set_read_timeout(Some(timeout))?;
     tcp.set_write_timeout(Some(timeout))?;
 
@@ -461,6 +487,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn connecting_gives_up_within_the_timeout_it_was_given() {
+        // 203.0.113.0/24 is TEST-NET-3, reserved for documentation and never routed, so a connect
+        // there waits for the kernel to give up. The old code called `TcpStream::connect`, which
+        // waits the OS default - over two minutes on Linux - and only set the read and write
+        // timeouts afterwards, so the caller asked for two seconds and got minutes.
+        let started = std::time::Instant::now();
+        let r = connect("203.0.113.1", 9, None, std::time::Duration::from_secs(2));
+        let took = started.elapsed();
+        assert!(
+            r.is_err(),
+            "a connect to an unroutable address reported success"
+        );
+        assert!(
+            took < std::time::Duration::from_secs(10),
+            "connect ignored its timeout: took {took:?} for a 2s deadline"
+        );
     }
 
     #[test]
