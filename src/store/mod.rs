@@ -854,9 +854,8 @@ fn delta_depth(conn: &Connection, hash: &str) -> ZResult<usize> {
     // search existed: the gate caught it on CI while the local machine was too noisy to show it.
     //
     // The cap is in the query, so a corrupt store with a cycle still terminates.
-    let depth: i64 = conn
-        .query_row(
-            "WITH RECURSIVE chain(hash, base, n) AS (
+    let depth: i64 = conn.query_row(
+        "WITH RECURSIVE chain(hash, base, n) AS (
                  SELECT hash, base, 0 FROM deltas WHERE hash = ?1
                  UNION ALL
                  SELECT d.hash, d.base, chain.n + 1
@@ -864,10 +863,9 @@ fn delta_depth(conn: &Connection, hash: &str) -> ZResult<usize> {
                  WHERE chain.n < ?2
              )
              SELECT COALESCE(MAX(n) + 1, 0) FROM chain",
-            params![hash, MAX_DELTA_DEPTH as i64],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
+        params![hash, MAX_DELTA_DEPTH as i64],
+        |r| r.get(0),
+    )?;
     Ok(depth as usize)
 }
 
@@ -3637,6 +3635,16 @@ pub(crate) mod tests {
         assert_eq!(get_object(&conn, &h1).unwrap(), v1, "first delta");
         assert_eq!(get_object(&conn, &h2).unwrap(), v2, "nested delta");
         assert_eq!(get_object(&conn, &h0).unwrap(), v0, "base still whole");
+    }
+
+    #[test]
+    fn delta_depth_propagates_query_errors() {
+        let conn = mem_db();
+        assert_eq!(delta_depth(&conn, "missing").unwrap(), 0);
+        conn.execute_batch("DROP TABLE deltas").unwrap();
+        let error = delta_depth(&conn, "missing")
+            .expect_err("a failed depth query must not look like a whole object");
+        assert!(error.to_string().contains("deltas"), "{error}");
     }
 
     #[test]
