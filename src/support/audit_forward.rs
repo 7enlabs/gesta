@@ -30,7 +30,18 @@ const QUEUE_DEPTH: usize = 4096;
 /// What the forwarder has dropped since it started, so the loss is countable.
 #[derive(Default)]
 struct Counters {
+    /// Drops that have not yet been reported to the collector. The gap note carries this and then
+    /// clears it, and a failed post puts it back.
     dropped: u64,
+    /// Every drop since the forwarder started. Never cleared.
+    ///
+    /// It exists because one field was answering two different questions. `stats()` is what an
+    /// operator reads and what the test below asserts on - "how many events have I lost" - while the
+    /// gap note needs "how many have I lost since the last line that went out". The consumer clears
+    /// the lending counter before posting, so `stats()` returned 0 for events that were gone: a loss
+    /// counter that reports itself healthy after doing its job. Drops were exactly the events that
+    /// never reached the collector, and the number meant to make that visible said none were lost.
+    dropped_total: u64,
     delivered: u64,
     failed: u64,
 }
@@ -134,12 +145,14 @@ impl Forwarder {
             Err(TrySendError::Full(_)) => {
                 if let Ok(mut n) = self.counters.lock() {
                     n.dropped += 1;
+                    n.dropped_total += 1;
                 }
                 false
             }
             Err(TrySendError::Disconnected(_)) => {
                 if let Ok(mut n) = self.counters.lock() {
                     n.dropped += 1;
+                    n.dropped_total += 1;
                 }
                 false
             }
@@ -153,7 +166,7 @@ impl Forwarder {
     #[allow(dead_code)]
     pub fn stats(&self) -> (u64, u64, u64) {
         match self.counters.lock() {
-            Ok(n) => (n.delivered, n.failed, n.dropped),
+            Ok(n) => (n.delivered, n.failed, n.dropped_total),
             Err(_) => (0, 0, 0),
         }
     }
@@ -381,7 +394,29 @@ mod tests {
             dropped > 0,
             "the queue must overflow, or this tests nothing"
         );
-        assert_eq!(f.stats().2, dropped as u64, "the counter must agree");
+        // Wait for the consumer to have taken at least one line, then read the counter.
+        //
+        // Without this the assertion is a race and it reads as a proof. The consumer clears the
+        // lending counter as it takes each line, so with the two jobs sharing one field the answer
+        // depended on whether the consumer happened to have run yet: 20 out of 20 runs passed on the
+        // buggy code in a plain build, and the coverage build (slower, instrumented) failed every
+        // time. A test that only fails on one build is not measuring the code, it is measuring the
+        // schedule. Once a line has been taken, the lending counter is zero either way, so `stats()`
+        // has to be reading something that was never lent out.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while f.stats().0 + f.stats().1 == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            f.stats().0 + f.stats().1 > 0,
+            "the consumer never took a line, so this test cannot tell the two counters apart"
+        );
+        assert_eq!(
+            f.stats().2,
+            dropped as u64,
+            "the counter must agree: {dropped} send(s) were refused, and a loss counter that \
+             reports zero after the loss has been delivered makes the record look complete"
+        );
         assert_eq!(
             accepted + dropped,
             QUEUE_DEPTH + 8,
