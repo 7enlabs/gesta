@@ -54,10 +54,15 @@ pub fn read_records(root: &Path) -> ZResult<Vec<KeyRecord>> {
         if f.len() < 4 {
             continue;
         }
+        // An empty retired field means the key is still in use. A field that holds something else
+        // is not evidence that it never retired: `parse().ok()` turned a corrupt value into
+        // `None`, the same value an active key carries, so a key retired years ago came back as
+        // the one in use. A record that cannot say when it retired is treated as retired, and the
+        // timestamp it does not have is read as the epoch so the ordering still holds.
         let retired_at = if f[2].is_empty() {
             None
         } else {
-            f[2].parse::<i64>().ok()
+            Some(f[2].parse::<i64>().unwrap_or(0))
         };
         out.push(KeyRecord {
             public_hex: f[0].to_string(),
@@ -85,8 +90,20 @@ fn write_records(root: &Path, records: &[KeyRecord]) -> ZResult<()> {
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(&p, text)?;
-    Ok(())
+    // The list is written to a neighbour and renamed into place. Writing straight over the file
+    // truncated it first, so a crash, a full disk or a second process writing at the same moment
+    // left a short list, and the list is the only answer to "which keys were ours": losing it makes
+    // every signature an old key made unverifiable. Rename is atomic within a directory, so a
+    // reader sees either the old list or the new one and never half of either.
+    let staging = p.with_extension("gesta-tmp");
+    std::fs::write(&staging, text)?;
+    match std::fs::rename(&staging, &p) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&staging);
+            Err(e.into())
+        }
+    }
 }
 
 /// Record the key at `path` as active, retiring whatever was active before.
@@ -198,6 +215,77 @@ mod tests {
         }
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_malformed_retired_field_does_not_bring_a_retired_key_back() {
+        // `retired` held a value that is not a number. `parse().ok()` turned that into `None`,
+        // which is the same value an active key carries, so a key retired years ago read as the
+        // one in use and every signature made since looked like it came from the wrong key.
+        // Refusing to guess is the safe reading: a record that cannot say when it retired is not
+        // evidence that it never did.
+        let root = repo();
+        record_active(&root, "aaaa", Path::new("/k1"), 100).unwrap();
+        record_active(&root, "bbbb", Path::new("/k2"), 200).unwrap();
+        let p = record_path(&root);
+        let text = std::fs::read_to_string(&p).unwrap();
+        let broken = text.replace("aaaa:100:200:", "aaaa:100:not-a-number:");
+        assert_ne!(
+            text, broken,
+            "the fixture did not contain the retired field to break"
+        );
+        std::fs::write(&p, broken).unwrap();
+
+        let recs = read_records(&root).unwrap();
+        let aaaa = recs
+            .iter()
+            .find(|r| r.public_hex == "aaaa")
+            .expect("aaaa is still listed");
+        assert!(
+            aaaa.retired_at.is_some(),
+            "a retired key with an unreadable retired field was read as active again"
+        );
+        assert_eq!(
+            active(&root).unwrap().map(|r| r.public_hex),
+            Some("bbbb".to_string()),
+            "the active key is not the one that was written last"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_retired_key_whose_field_is_blank_stays_active() {
+        // The blank field is the documented way to say "still in use", and the fix above must not
+        // turn that into a refusal.
+        let root = repo();
+        record_active(&root, "aaaa", Path::new("/k1"), 100).unwrap();
+        let recs = read_records(&root).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].retired_at, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_failed_write_leaves_the_previous_record_list_readable() {
+        // write_records wrote straight over the file. A crash, a full disk or a second process
+        // writing at the same moment left a truncated list, and the list is the only answer to
+        // "which keys were ours" - losing it makes every old signature unverifiable.
+        let root = repo();
+        record_active(&root, "aaaa", Path::new("/k1"), 100).unwrap();
+        let before = std::fs::read_to_string(record_path(&root)).unwrap();
+        // A directory where the temporary file would go makes the write fail after the point the
+        // old code had already truncated the real file.
+        let scratch = record_path(&root).with_extension("gesta-tmp");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let err = write_records(&root, &[]);
+        assert!(
+            err.is_err(),
+            "a write that could not complete reported success"
+        );
+        let after = std::fs::read_to_string(record_path(&root)).unwrap();
+        assert_eq!(after, before, "a failed write damaged the record list");
+        let _ = std::fs::remove_dir_all(&scratch);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
