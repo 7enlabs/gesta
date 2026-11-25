@@ -1983,9 +1983,10 @@ pub fn resolve_rev(conn: &Connection, rev: &str) -> ZResult<Option<String>> {
     if looks_like_prefix {
         let matches: Vec<String> = {
             let mut stmt = conn.prepare(
-                "SELECT id FROM changesets WHERE id LIKE ?1 ORDER BY created_at DESC LIMIT 8",
+                "SELECT id FROM changesets WHERE id LIKE ?1 ESCAPE '!' ORDER BY created_at DESC LIMIT 8",
             )?;
-            let rows = stmt.query_map(params![format!("{}%", rev)], |r| r.get::<_, String>(0))?;
+            let prefix = rev.replace('!', "!!").replace('%', "!%").replace('_', "!_");
+            let rows = stmt.query_map(params![format!("{prefix}%")], |r| r.get::<_, String>(0))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
         if matches.len() == 1 {
@@ -3566,6 +3567,70 @@ pub(crate) mod tests {
     fn resolve_rev_reports_an_unknown_name() {
         let conn = mem_db();
         assert_eq!(resolve_rev(&conn, "nowhere").unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_rev_does_not_interpret_prefixes_as_like_patterns() {
+        let conn = mem_db();
+        conn.execute(
+            "INSERT INTO changesets(id, message, author, created_at, status, branch)
+             VALUES('csabcd1234', 'm', 'a', 1, 'committed', 'main')",
+            [],
+        )
+        .unwrap();
+        for rev in ["csab_d", "csab%4", "csab!d"] {
+            assert_eq!(resolve_rev(&conn, rev).unwrap(), None, "{rev}");
+        }
+    }
+
+    #[test]
+    fn resolve_rev_accepts_literal_pattern_characters_in_prefixes() {
+        let conn = mem_db();
+        for id in ["cs!_%abc", "cs!XYZabc"] {
+            conn.execute(
+                "INSERT INTO changesets(id, message, author, created_at, status, branch)
+                 VALUES(?1, 'm', 'a', 1, 'committed', 'main')",
+                params![id],
+            )
+            .unwrap();
+        }
+        for rev in ["cs!_", "cs!_%", "cs!_%a"] {
+            assert_eq!(
+                resolve_rev(&conn, rev).unwrap().as_deref(),
+                Some("cs!_%abc"),
+                "{rev}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_rev_preserves_plain_prefixes_and_real_ambiguity() {
+        let conn = mem_db();
+        for (id, commit) in [
+            ("csAbÉcd123", "abcdef0123456789"),
+            ("csdupe123", "fedcba9876543210"),
+            ("csdupe456", "0123456789abcdef"),
+        ] {
+            conn.execute(
+                "INSERT INTO changesets(id, message, author, created_at, status, branch, git_commit)
+                 VALUES(?1, 'm', 'a', 1, 'committed', 'main', ?2)",
+                params![id, commit],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            resolve_rev(&conn, "csaBÉ").unwrap().as_deref(),
+            Some("csAbÉcd123")
+        );
+        assert_eq!(
+            resolve_rev(&conn, "abcdef0").unwrap().as_deref(),
+            Some("csAbÉcd123")
+        );
+        let error = resolve_rev(&conn, "csdupe").expect_err("two literal prefixes are ambiguous");
+        assert!(
+            error.to_string().contains("matches 2 changesets"),
+            "{error}"
+        );
     }
 
     #[test]
