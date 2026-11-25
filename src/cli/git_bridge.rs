@@ -697,6 +697,61 @@ pub fn push_to_git_remote(
     Ok(written)
 }
 
+/// Hand each pack file in `<staging>/objects/pack` to `git unpack-objects`, one process per pack.
+///
+/// The pack is streamed from the file into the child's stdin, never held. It used to be
+/// `std::fs::read(&path)` and then written to stdin, so a pull held the whole pack in memory on
+/// top of whatever the import needed. A remote chooses that size: a hostile or careless one can
+/// serve a pack of any size, and the pull has no reason to keep it.
+fn unpack_each_pack(staging: &Path) -> ZResult<()> {
+    use std::io::Write;
+    let pack_dir = staging.join("objects").join("pack");
+    let Ok(entries) = std::fs::read_dir(&pack_dir) else {
+        return Ok(());
+    };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.extension().is_none_or(|x| x != "pack") {
+            continue;
+        }
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let child = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(staging)
+            .args(["unpack-objects", "-q"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+        let Ok(mut child) = child else {
+            continue;
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            // A copy, not a read: the file's bytes pass through an 8 KB buffer on their way to the
+            // child. `io::copy` returning early is not silent: the child then sees a short pack and
+            // says so on stderr, which is the error reported below.
+            let _ = std::io::copy(&mut std::io::BufReader::new(file), &mut stdin);
+            let _ = stdin.flush();
+            // Dropping stdin closes the pipe, which is what tells the child the pack is complete.
+        }
+        let out = child.wait_with_output();
+        if let Ok(o) = out {
+            if !o.status.success() {
+                let err = String::from_utf8_lossy(&o.stderr);
+                return Err(bad(format!(
+                    "unpacking {} failed: {}",
+                    path.display(),
+                    err.trim()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Fetch branches from a git remote into a bare staging repository, then import them.
 pub fn pull_from_git_remote(
     conn: &Connection,
@@ -751,44 +806,11 @@ pub fn pull_from_git_remote(
     // first. `git unpack-objects` reads one pack per invocation from stdin, and a repository
     // fetched with several refs can hold more than one, so each pack gets its own run. Piping
     // them all into one process produced "fatal: early EOF" and unpacked only the first.
-    let pack_dir = staging.join("objects").join("pack");
-    if let Ok(entries) = std::fs::read_dir(&pack_dir) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if path.extension().is_none_or(|x| x != "pack") {
-                continue;
-            }
-            let bytes = match std::fs::read(&path) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            use std::io::Write;
-            if let Ok(mut child) = std::process::Command::new("git")
-                .arg("--git-dir")
-                .arg(&staging)
-                .args(["unpack-objects", "-q"])
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-            {
-                if let Some(stdin) = child.stdin.as_mut() {
-                    let _ = stdin.write_all(&bytes);
-                }
-                let out = child.wait_with_output();
-                if let Ok(o) = out {
-                    if !o.status.success() {
-                        let err = String::from_utf8_lossy(&o.stderr);
-                        let _ = std::fs::remove_dir_all(&staging);
-                        return Err(bad(format!(
-                            "unpacking {} failed: {}",
-                            path.display(),
-                            err.trim()
-                        )));
-                    }
-                }
-            }
-        }
+    if let Err(e) = unpack_each_pack(&staging) {
+        // The staging directory holds the packs the remote sent. A failed unpack still leaves it
+        // behind, and the earlier shape removed it on the error path too.
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e);
     }
 
     let got = import(conn, &staging, prefix);
@@ -829,6 +851,82 @@ fn export_bare(conn: &Connection, git_dir: &Path, branch: Option<&str>) -> ZResu
 
 #[cfg(test)]
 mod tests {
+    /// Peak resident size of this process so far, in KiB, or `None` where the kernel is not asked.
+    fn peak_rss_kib() -> Option<u64> {
+        let s = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("VmHWM:") {
+                return rest.split_whitespace().next()?.parse().ok();
+            }
+        }
+        None
+    }
+
+    /// Put a pack file of `size` bytes under `<staging>/objects/pack`, made of a header followed by a
+    /// hole, and return the staging directory.
+    ///
+    /// A hole rather than a `Vec`: the fixture must not itself allocate the size being measured, or
+    /// the peak is spent before the measurement starts and the test passes on any code.
+    ///
+    /// `git unpack-objects` then refuses the pack, and that is fine: the refusal arrives after the
+    /// pass has measured the writing, which is where the copy happens. `unpack_each_pack` returns its
+    /// error, and the assertion below is about memory, not about the exit status.
+    fn staging_with_padded_pack(size: u64) -> std::path::PathBuf {
+        use std::io::Write;
+        let staging = std::env::temp_dir().join(format!(
+            "gesta-unpack-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pack_dir = staging.join("objects").join("pack");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        let path = pack_dir.join("pack-t.pack");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // A real pack header so the child gets as far as reading a body before refusing.
+        f.write_all(b"PACK").unwrap();
+        f.write_all(&2u32.to_be_bytes()).unwrap();
+        f.write_all(&1u32.to_be_bytes()).unwrap();
+        f.set_len(size).unwrap();
+        staging
+    }
+
+    #[test]
+    fn unpacking_a_pack_does_not_hold_the_pack() {
+        // `pull_from_git_remote` read each pack file whole and then wrote it to the child's stdin,
+        // so a pull was resident at the pack's size, and a remote chooses that size.
+        //
+        // The fixture is a 256 MB pack that the child will reject. What is measured is this
+        // process's peak RSS across the passthrough, which a whole-file read would push up by
+        // 256 MB.
+        let size = 256u64 << 20;
+        let staging = staging_with_padded_pack(size);
+
+        let before = peak_rss_kib();
+        let _ = super::unpack_each_pack(&staging); // the child refuses the pack, which is expected
+        let after = peak_rss_kib();
+        // Removed before the assertion, so a failing run does not leave 256 MB behind in /tmp.
+        let _ = std::fs::remove_dir_all(&staging);
+
+        match (before, after) {
+            (Some(b), Some(a)) => {
+                let grew_kib = a.saturating_sub(b);
+                let allowance_kib = size / 4 / 1024; // 64 MiB
+                assert!(
+                    grew_kib < allowance_kib,
+                    "streaming a {} MB pack to the child grew peak RSS by {} KiB, which is the \
+                     pack being held rather than copied (allowance {} KiB)",
+                    size >> 20,
+                    grew_kib,
+                    allowance_kib
+                );
+            }
+            _ => eprintln!("no /proc/self/status here, so the memory ceiling was not checked"),
+        }
+    }
+
     use super::*;
     use crate::store::gitobj::HashKind;
 
