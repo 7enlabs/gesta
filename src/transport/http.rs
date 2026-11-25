@@ -439,6 +439,40 @@ fn build_request_head(
     head
 }
 
+/// How many connections are handled at once.
+///
+/// A thread per connection with no ceiling is an outage waiting for a caller: a few hundred
+/// sockets that open and never speak cost a few hundred threads, and the server that was meant to
+/// answer a team stops answering anyone.
+const MAX_CONNECTIONS: usize = 128;
+
+/// Run `work` on a thread, at most `MAX_CONNECTIONS` at a time.
+///
+/// The slot is taken before the spawn and given back when the work returns, so a worker that is
+/// slow holds its slot for as long as it runs. A caller over the ceiling waits here rather than
+/// being dropped: the socket is already accepted, and refusing it would turn a busy moment into a
+/// client error.
+fn spawn_bounded<F>(slots: Arc<std::sync::Mutex<usize>>, work: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    loop {
+        {
+            let mut n = slots.lock().unwrap_or_else(|e| e.into_inner());
+            if *n < MAX_CONNECTIONS {
+                *n += 1;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    std::thread::spawn(move || {
+        work();
+        let mut n = slots.lock().unwrap_or_else(|e| e.into_inner());
+        *n = n.saturating_sub(1);
+    });
+}
+
 /// Serve `root` over HTTP until the process is killed.
 /// Serve `root` over TLS until the process is killed.
 ///
@@ -478,6 +512,7 @@ pub fn serve_tls(
     let auth_path = Arc::new(crate::repo_dir(&root).join("auth"));
     let root = Arc::new(root);
     let auth = Arc::new(std::sync::Mutex::new(auth));
+    let slots = Arc::new(std::sync::Mutex::new(0usize));
     for incoming in listener.incoming() {
         let stream = match incoming {
             Ok(s) => s,
@@ -487,7 +522,13 @@ pub fn serve_tls(
         let auth = Arc::clone(&auth);
         let auth_path = Arc::clone(&auth_path);
         let cfg = Arc::clone(&cfg);
-        std::thread::spawn(move || {
+        let slots = Arc::clone(&slots);
+        spawn_bounded(slots, move || {
+            // A TLS client that finishes the handshake and then goes silent held a worker for as
+            // long as the socket lived: the plaintext path set a read timeout and this one did not,
+            // so the encrypted listener was the easier one to exhaust.
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(120)));
+            let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(120)));
             match crate::transport::tls::accept(stream, cfg) {
                 Ok(tls) => {
                     // TLS serving does not forward audit lines yet: the collector is reached over plain HTTP
@@ -598,6 +639,7 @@ pub fn serve(
     let accept_auth = Arc::clone(&auth);
     let accept_auth_path = Arc::clone(&auth_path);
     let accept_forward = Arc::clone(&forward);
+    let accept_slots = Arc::new(std::sync::Mutex::new(0usize));
     std::thread::spawn(move || {
         for incoming in listener.incoming() {
             let stream = match incoming {
@@ -609,7 +651,8 @@ pub fn serve(
             let auth = Arc::clone(&accept_auth);
             let auth_path = Arc::clone(&accept_auth_path);
             let forward = Arc::clone(&accept_forward);
-            std::thread::spawn(move || {
+            let slots = Arc::clone(&accept_slots);
+            spawn_bounded(slots, move || {
                 let _ =
                     handle_connection(stream, &root, &auth, &auth_path, forward.as_ref().as_ref());
             });
@@ -2226,6 +2269,51 @@ fn parse_response(raw: &[u8]) -> ZResult<(u16, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_connection_ceiling_holds_and_releases_its_slots() {
+        // One thread per connection with no ceiling is the shape that turns a busy moment into an
+        // outage: a caller that opens sockets and never speaks costs a thread each, and the server
+        // that was meant to answer a team answers nobody. This checks the ceiling is real and that
+        // a finished worker gives its slot back.
+        //
+        // The workers sleep rather than wait on a latch: `spawn_bounded` blocks the caller once the
+        // ceiling is reached, so a latch the caller holds would deadlock the spawn loop against its
+        // own workers, and an earlier version of this test did exactly that.
+        let slots = Arc::new(std::sync::Mutex::new(0usize));
+        let running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..(MAX_CONNECTIONS + 40) {
+            let running = Arc::clone(&running);
+            let peak = Arc::clone(&peak);
+            spawn_bounded(Arc::clone(&slots), move || {
+                let now = running.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                running.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while running.load(std::sync::atomic::Ordering::SeqCst) > 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let peak = peak.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            peak <= MAX_CONNECTIONS,
+            "peak concurrency {peak} exceeded the ceiling of {MAX_CONNECTIONS}"
+        );
+        assert!(
+            peak > MAX_CONNECTIONS / 2,
+            "only {peak} workers ran at once, so the ceiling was not exercised"
+        );
+        let left = *slots.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            left, 0,
+            "workers finished but {left} slots were never released"
+        );
+    }
 
     fn grant_to(branches: &[&str]) -> crate::transport::auth::Grant {
         crate::transport::auth::Grant {
