@@ -966,6 +966,20 @@ pub fn receive_pack_scoped(
                 // refuses only when the token was actually narrowed.
                 let outside: Vec<String> = written.into_iter().filter(|p| !g.permits(p)).collect();
                 if !outside.is_empty() {
+                    // The refusal went out as an `ng` line and left no audit entry, which is the one
+                    // record that would show a token probing for what it can reach.
+                    crate::support::audit::record_with(
+                        root,
+                        &crate::support::audit::Event {
+                            who: pusher,
+                            decision: crate::support::audit::Decision::PathRefused,
+                            action: "push",
+                            target: outside.first().map(|s| s.as_str()).unwrap_or(""),
+                            reason: "path outside the scope",
+                            remote: None,
+                        },
+                        None,
+                    );
                     // Put the branch back, otherwise the client reads `ng` while the branch has moved.
                     if let Some((_, _, Some(head))) = before.iter().find(|(b, _, _)| b == &branch) {
                         let _ = conn.execute(

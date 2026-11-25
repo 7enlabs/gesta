@@ -1557,6 +1557,38 @@ fn decode_basic_token(value: &str) -> Option<String> {
     Some(token.to_string())
 }
 
+/// Record a scope refusal.
+///
+/// `Decision::PathRefused` and `Decision::BranchRefused` existed with a `Display` arm and a unit
+/// test but no production caller, so every `permits`/`permits_branch` denial answered 403 and wrote
+/// nothing. `docs/credentials.md` promises a line for every refusal, and the refusal a scope exists
+/// to produce - a token probing for what it can reach - was the one that left no trace.
+fn audit_scope_refusal(
+    root: &Path,
+    who: &str,
+    branch_refused: bool,
+    action: &str,
+    target: &str,
+    reason: &str,
+) {
+    crate::support::audit::record_with(
+        root,
+        &crate::support::audit::Event {
+            who,
+            decision: if branch_refused {
+                crate::support::audit::Decision::BranchRefused
+            } else {
+                crate::support::audit::Decision::PathRefused
+            },
+            action,
+            target,
+            reason,
+            remote: None,
+        },
+        None,
+    );
+}
+
 /// `GET /v1/file`: the object at `path` as `rev` names it.
 ///
 /// Extracted from the route so the scope check can be tested by calling it. The route used to be one
@@ -1578,6 +1610,7 @@ fn read_file_at(
     // store is opened, so a refused read does not report whether the repository exists.
     if let Some(g) = grant {
         if !g.permits(&path) {
+            audit_scope_refusal(root, &g.name, false, "GET", &path, "path outside the scope");
             return Response::error(
                 403,
                 "Forbidden",
@@ -1689,6 +1722,14 @@ fn create_changeset_from_json(
     // do. The branch comes straight from the request body, so it is caller-controlled input.
     if let Some(g) = grant {
         if !g.permits_branch(branch) {
+            audit_scope_refusal(
+                root,
+                &g.name,
+                true,
+                "POST",
+                branch,
+                "branch outside the scope",
+            );
             return Err(ChangeErr::Denied(format!(
                 "this token may not write branch {:?}; its scope is {}",
                 branch,
@@ -1719,6 +1760,14 @@ fn create_changeset_from_json(
             }
             if let Some(g) = grant {
                 if !g.permits(&path) {
+                    audit_scope_refusal(
+                        root,
+                        &g.name,
+                        false,
+                        "POST",
+                        &path,
+                        "path outside the scope",
+                    );
                     return Err(ChangeErr::Denied(format!(
                         "token {} may not write {}",
                         g.name, path
@@ -1737,6 +1786,14 @@ fn create_changeset_from_json(
             let path = crate::normalise(path);
             if let Some(g) = grant {
                 if !g.permits(&path) {
+                    audit_scope_refusal(
+                        root,
+                        &g.name,
+                        false,
+                        "POST",
+                        &path,
+                        "path outside the scope",
+                    );
                     return Err(ChangeErr::Denied(format!(
                         "token {} may not delete {}",
                         g.name, path
@@ -1872,6 +1929,7 @@ fn receive_bundle(
     // first so a refused push writes nothing, rather than being undone afterwards.
     if let Some(g) = grant {
         if !g.permits_branch(branch) {
+            audit_scope_refusal(root, who, true, "POST", branch, "branch outside the scope");
             return Err(ApplyError::Rejected(format!(
                 "this token may not write branch {:?}; its scope is {}",
                 branch,
@@ -1917,6 +1975,7 @@ fn receive_bundle(
             }
         }
         if let Some(path) = offending {
+            audit_scope_refusal(root, who, false, "POST", &path, "path outside the scope");
             return Err(ApplyError::Rejected(format!(
                 "this token may not write {:?}; its scope is {}",
                 path,
@@ -2269,6 +2328,102 @@ fn parse_response(raw: &[u8]) -> ZResult<(u16, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_refusal_leaves_an_audit_line() {
+        // #165: `PathRefused` had a `Display` arm and a unit test but no production caller, so a
+        // token probing for what it can reach got a 403 and left nothing behind. The refusal a scope
+        // exists to produce was the one missing from the log.
+        let dir = std::env::temp_dir().join(format!("gesta-audit-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".gesta")).unwrap();
+
+        let g = grant_to_paths(&["docs/**"]);
+        let payload = crate::support::json::parse(
+            r#"{"message":"m","branch":"main","files":[{"path":"src/main.rs","content":"x"}]}"#,
+        )
+        .unwrap();
+        let err = create_changeset_from_json(&dir, &payload, "t", Some(&g));
+        assert!(err.is_err(), "a path outside the scope must be refused");
+
+        let entries = crate::support::audit::read(&dir, false, None).unwrap();
+        let line = entries
+            .iter()
+            .find(|e| e.decision == "path-refused")
+            .unwrap_or_else(|| {
+                panic!(
+                    "no path-refused line; decisions were {:?}",
+                    entries
+                        .iter()
+                        .map(|e| e.decision.as_str())
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(
+            line.target, "src/main.rs",
+            "the line must name the refused path"
+        );
+        assert_eq!(line.who, "t", "the line must name the token");
+        assert!(
+            line.reason.contains("scope"),
+            "the reason must say why: {}",
+            line.reason
+        );
+    }
+
+    #[test]
+    fn a_branch_refusal_leaves_an_audit_line() {
+        // The mirror of the test above, and the one #155 left behind: a token scoped to `main` being
+        // used on `release` is exactly the mistake the branch scope exists to catch.
+        let dir = std::env::temp_dir().join(format!("gesta-audit-branch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".gesta")).unwrap();
+
+        let g = grant_to(&["main"]);
+        let payload = crate::support::json::parse(
+            r#"{"message":"m","branch":"release","files":[{"path":"a.txt","content":"x"}]}"#,
+        )
+        .unwrap();
+        assert!(create_changeset_from_json(&dir, &payload, "t", Some(&g)).is_err());
+
+        let entries = crate::support::audit::read(&dir, false, None).unwrap();
+        let line = entries
+            .iter()
+            .find(|e| e.decision == "branch-refused")
+            .unwrap_or_else(|| {
+                panic!(
+                    "no branch-refused line; decisions were {:?}",
+                    entries
+                        .iter()
+                        .map(|e| e.decision.as_str())
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(line.target, "release");
+        assert_eq!(line.who, "t");
+    }
+
+    #[test]
+    fn a_permitted_request_writes_no_refusal_line() {
+        // The negative half: a log that records a refusal on every request would be noise, and noise
+        // is how a real refusal goes unread.
+        let dir = std::env::temp_dir().join(format!("gesta-audit-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".gesta")).unwrap();
+
+        let g = grant_to_paths(&["docs/**"]);
+        let payload = crate::support::json::parse(
+            r#"{"message":"m","branch":"main","files":[{"path":"docs/a.md","content":"x"}]}"#,
+        )
+        .unwrap();
+        let _ = create_changeset_from_json(&dir, &payload, "t", Some(&g));
+
+        let entries = crate::support::audit::read(&dir, false, None).unwrap();
+        assert!(
+            !entries.iter().any(|e| e.decision == "path-refused"),
+            "a permitted path produced a path-refused line"
+        );
+    }
 
     #[test]
     fn the_connection_ceiling_holds_and_releases_its_slots() {
