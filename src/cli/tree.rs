@@ -632,12 +632,25 @@ pub fn cmd_status_json() -> ZResult<()> {
     Ok(())
 }
 
-pub fn cmd_diff_json(changeset: Option<&str>) -> YResultAlias {
+pub fn cmd_diff_json(changeset: Option<&str>, name_only: bool) -> YResultAlias {
     let (root, conn) = open_repo()?;
     match changeset {
         Some(id) => {
             let files = repo::changeset_diff(&conn, id)?;
             let renames = history::detect_renames(&conn, id, 0.5)?;
+            // `--name-only` asked for a list of paths and nothing else. Accepting the flag and
+            // printing the full per-file bodies anyway answers with more than was asked, and a
+            // caller that piped the result into `wc -l` gets the wrong count, not a longer one.
+            if name_only {
+                emit(Json::obj(vec![
+                    ("changeset", Json::str(id)),
+                    (
+                        "files",
+                        Json::arr(files.into_iter().map(|(p, _, _)| Json::str(p)).collect()),
+                    ),
+                ]));
+                return Ok(());
+            }
             emit(Json::obj(vec![
                 ("changeset", Json::str(id)),
                 (
@@ -770,7 +783,7 @@ pub fn cmd_diff_range(from: Option<&str>, to: Option<&str>, name_only: bool) -> 
 }
 
 /// The same as `cmd_diff_range` with `--json`.
-pub fn cmd_diff_range_json(from: Option<&str>, to: Option<&str>) -> ZResult<()> {
+pub fn cmd_diff_range_json(from: Option<&str>, to: Option<&str>, name_only: bool) -> ZResult<()> {
     let (_root, conn) = open_repo()?;
     let from = resolve_from(&conn, from, to)?;
     let diffs = crate::repo::diff_revs(&conn, from.as_deref(), to)?;
@@ -779,6 +792,9 @@ pub fn cmd_diff_range_json(from: Option<&str>, to: Option<&str>) -> ZResult<()> 
         diffs
             .into_iter()
             .map(|(path, removed, added)| {
+                if name_only {
+                    return Json::str(path);
+                }
                 Json::obj(vec![
                     ("path", Json::str(path)),
                     (
@@ -793,6 +809,6 @@ pub fn cmd_diff_range_json(from: Option<&str>, to: Option<&str>) -> ZResult<()> 
             })
             .collect(),
     );
-    println!("{}", arr.render());
+    emit(arr);
     Ok(())
 }

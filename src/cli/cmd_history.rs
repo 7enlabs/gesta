@@ -167,73 +167,19 @@ pub fn cmd_blame(file: &str, ignore: &[String]) -> ZResult<()> {
     // the reader wants the change that last touched the line in substance. Git settled on a file
     // at the repository root listing those revisions, read without being asked, and the same
     // convention here means a project does not have to teach every tool about its own list.
-    let ignore = if ignore.is_empty() {
-        read_ignore_revs(&root)
-    } else {
-        ignore
-            .iter()
-            .flat_map(|v| {
-                // A caller may name a file of revisions, or a revision directly.
-                match std::fs::read_to_string(root.join(v)) {
-                    Ok(text) => parse_rev_list(&text),
-                    Err(_) => vec![v.clone()],
-                }
-            })
-            .collect()
-    };
-
-    let content = match walk::read_text(&root.join(&rel)) {
-        Some(c) => c,
-        None => {
-            let branch = current_branch(&conn)?;
-            let h = store::latest_hash(&conn, &rel, &branch)?
-                .ok_or_else(|| bad(format!("file not found: {}", rel)))?;
-            get_object(&conn, &h)?
-        }
-    };
+    let ignore = resolve_ignore_list(&root, ignore);
+    let content = read_blame_content(&root, &conn, &rel)?;
 
     // A blame row answers who wrote a line. With provenance it can also answer which
     // session wrote it and why, which is the question that actually comes up when an
     // agent produced most of the file.
-    let rows: Vec<(i64, String, String, Option<String>)> = {
-        // Expand the ranges into one entry per line, because the caller prints a line at a time.
-        // The expansion happens here rather than in the store: a range is the cheapest way to
-        // keep the answer, and a list of lines is the cheapest way to read it.
-        let mut stmt = conn.prepare(
-            "SELECT b.start_line, b.end_line, b.changeset_id, c.author, c.intent
-             FROM blame_ranges b LEFT JOIN changesets c ON c.id = b.changeset_id
-             WHERE b.path = ?1 ORDER BY b.start_line",
-        )?;
-        let ranges = stmt
-            .query_map(rusqlite::params![rel], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, Option<String>>(3)?,
-                    r.get::<_, Option<String>>(4)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut out = Vec::new();
-        for (start, end, cs, author, intent) in ranges {
-            for line in start..=end {
-                out.push((
-                    line,
-                    cs.clone(),
-                    author.clone().unwrap_or_default(),
-                    intent.clone(),
-                ));
-            }
-        }
-        out
-    };
+    let rows = read_blame_rows(&conn, &rel)?;
 
     if rows.is_empty() {
         println!("no blame data for {} (never committed)", rel);
         return Ok(());
     }
-    let map: std::collections::HashMap<i64, (String, String, Option<String>)> = rows
+    let map: BlameMap = rows
         .into_iter()
         .map(|(n, c, a, i)| (n, (c, a, i)))
         .collect();
@@ -376,15 +322,100 @@ pub fn cmd_log_json(limit: usize, envelope: bool) -> ZResult<()> {
     Ok(())
 }
 
-pub fn cmd_blame_json(file: &str) -> ZResult<()> {
-    let (_root, conn) = open_repo()?;
+pub fn cmd_blame_json(file: &str, ignore: &[String]) -> ZResult<()> {
+    let (root, conn) = open_repo()?;
     let rel = normalise(file);
+    // Resolved the same way the text path resolves it, because the ignore list changes which
+    // changeset a line is attributed to. Reading one path and letting the other skip the list is
+    // how JSON and text blame end up naming different changesets for the same line.
+    let ignore = resolve_ignore_list(&root, ignore);
+    let content = read_blame_content(&root, &conn, &rel)?;
+    let map = read_blame_map(&conn, &rel)?;
+
+    let mut lines = Vec::new();
+    for (i, _line) in content.lines().enumerate() {
+        let n = (i + 1) as i64;
+        let looked = match map.get(&n) {
+            Some(found) if ignore.iter().any(|i| i == &found.0) => {
+                blame_through(&conn, &rel, n, &ignore)?
+            }
+            Some(found) => Some(found.clone()),
+            None => blame_through(&conn, &rel, n, &ignore)?,
+        };
+        let (cs, author) = match looked {
+            Some((cs, author, _intent)) => (Json::str(cs), Json::str(author)),
+            // A line the ignore list walked past every writer of has no changeset to name.
+            // Reporting `null` says that; an empty string reads as an author with no name.
+            None => (Json::Null, Json::Null),
+        };
+        lines.push(Json::obj(vec![
+            ("line", Json::int(n)),
+            ("changeset", cs),
+            ("author", author),
+        ]));
+    }
+    let count = lines.len();
+    emit(Json::obj(vec![
+        ("path", Json::str(rel)),
+        ("line_count", Json::int(count as i64)),
+        (
+            "ignored",
+            Json::arr(ignore.into_iter().map(Json::str).collect()),
+        ),
+        ("lines", Json::arr(lines)),
+    ]));
+    Ok(())
+}
+
+/// Turn the caller's `--ignore-rev` values into a list of changesets.
+///
+/// A value may name a revision directly or a file holding revisions, and with none given the
+/// repository's own `.gesta-blame-ignore-revs` is read. Shared by the text and JSON paths so the
+/// two cannot disagree about which changesets were skipped.
+fn resolve_ignore_list(root: &Path, ignore: &[String]) -> Vec<String> {
+    if ignore.is_empty() {
+        return read_ignore_revs(root);
+    }
+    ignore
+        .iter()
+        .flat_map(|v| match std::fs::read_to_string(root.join(v)) {
+            Ok(text) => parse_rev_list(&text),
+            Err(_) => vec![v.clone()],
+        })
+        .collect()
+}
+
+/// The file's lines, from the working tree or, failing that, the last committed body.
+fn read_blame_content(root: &Path, conn: &Connection, rel: &str) -> ZResult<String> {
+    match walk::read_text(&root.join(rel)) {
+        Some(c) => Ok(c),
+        None => {
+            let branch = current_branch(conn)?;
+            let h = store::latest_hash(conn, rel, &branch)?
+                .ok_or_else(|| bad(format!("file not found: {}", rel)))?;
+            get_object(conn, &h)
+        }
+    }
+}
+
+type BlameRow = (i64, String, String, Option<String>);
+type BlameMap = std::collections::HashMap<i64, (String, String, Option<String>)>;
+
+fn read_blame_map(conn: &Connection, rel: &str) -> ZResult<BlameMap> {
+    let rows = read_blame_rows(conn, rel)?;
+    Ok(rows
+        .into_iter()
+        .map(|(n, c, a, i)| (n, (c, a, i)))
+        .collect())
+}
+
+/// One entry per line, expanded from the stored ranges.
+fn read_blame_rows(conn: &Connection, rel: &str) -> ZResult<Vec<BlameRow>> {
     let mut stmt = conn.prepare(
-        "SELECT b.start_line, b.end_line, b.changeset_id, c.author FROM blame_ranges b
-         LEFT JOIN changesets c ON c.id = b.changeset_id WHERE b.path = ?1 ORDER BY b.start_line",
+        "SELECT b.start_line, b.end_line, b.changeset_id, c.author, c.intent
+         FROM blame_ranges b LEFT JOIN changesets c ON c.id = b.changeset_id
+         WHERE b.path = ?1 ORDER BY b.start_line",
     )?;
-    // The document keeps one entry per line, because a caller that asked for JSON asked for the
-    // same answer the text form gives. Ranges are how the answer is stored, not how it is read.
     let ranges = stmt
         .query_map(rusqlite::params![rel], |r| {
             Ok((
@@ -392,26 +423,22 @@ pub fn cmd_blame_json(file: &str) -> ZResult<()> {
                 r.get::<_, i64>(1)?,
                 r.get::<_, String>(2)?,
                 r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut lines = Vec::new();
-    for (start, end, cs, author) in ranges {
+    let mut out = Vec::new();
+    for (start, end, cs, author, intent) in ranges {
         for line in start..=end {
-            lines.push(Json::obj(vec![
-                ("line", Json::int(line)),
-                ("changeset", Json::str(cs.clone())),
-                ("author", Json::str(author.clone().unwrap_or_default())),
-            ]));
+            out.push((
+                line,
+                cs.clone(),
+                author.clone().unwrap_or_default(),
+                intent.clone(),
+            ));
         }
     }
-    let count = lines.len();
-    emit(Json::obj(vec![
-        ("path", Json::str(rel)),
-        ("line_count", Json::int(count as i64)),
-        ("lines", Json::arr(lines)),
-    ]));
-    Ok(())
+    Ok(out)
 }
 
 pub fn cmd_history_json(file: &str) -> YResultAlias {

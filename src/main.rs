@@ -1386,10 +1386,10 @@ fn run() -> ZResult<()> {
         Cmd::Log {
             limit, envelope, ..
         } if json => cli::cmd_log_json(limit, envelope),
-        Cmd::Blame { file, .. } if json => {
+        Cmd::Blame { file, ignore_rev } if json => {
             let file = file
                 .ok_or_else(|| bad("blame needs a file: `gesta blame src/main.rs`".to_string()))?;
-            cli::cmd_blame_json(&file)
+            cli::cmd_blame_json(&file, &ignore_rev)
         }
         Cmd::History { file } if json => {
             let file = file.ok_or_else(|| {
@@ -1401,15 +1401,20 @@ fn run() -> ZResult<()> {
             changeset,
             from,
             to,
-            ..
+            name_only,
         } if json => {
             if from.is_some() || to.is_some() {
-                cli::cmd_diff_range_json(from.as_deref(), to.as_deref())
+                cli::cmd_diff_range_json(from.as_deref(), to.as_deref(), name_only)
             } else {
-                cli::cmd_diff_json(changeset.as_deref())
+                cli::cmd_diff_json(changeset.as_deref(), name_only)
             }
         }
-        Cmd::Tag { .. } if json => cli::cmd_tag_json(),
+        Cmd::Tag {
+            name,
+            changeset,
+            list,
+            force,
+        } if json => cli::cmd_tag_json(name.as_deref(), changeset.as_deref(), list, force),
         Cmd::Ops { limit } if json => cli::cmd_ops_json(limit),
         // The specific arms come before the general one: a catch-all
         // `Cmd::Branch { sub } if json` would swallow them, and a match arm

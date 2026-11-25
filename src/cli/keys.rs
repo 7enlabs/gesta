@@ -243,18 +243,7 @@ pub fn cmd_tag(
 ) -> ZResult<()> {
     let (_root, conn) = open_repo()?;
     if list {
-        let tags: Vec<(String, String, i64)> = {
-            let mut stmt =
-                conn.prepare("SELECT name, changeset_id, created_at FROM tags ORDER BY name")?;
-            let rows = stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
-                ))
-            })?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()?
-        };
+        let tags = read_tags(&conn)?;
         if tags.is_empty() {
             println!("no tags");
         }
@@ -265,12 +254,44 @@ pub fn cmd_tag(
     }
     let name =
         name.ok_or_else(|| bad("a tag needs a name: `gesta tag <name> [--changeset REV]`"))?;
+    match write_tag(&conn, name, changeset, force)? {
+        TagWrite::Created { target } => println!("tagged {} at {}", name, target),
+        TagWrite::Moved { old, target } => println!("moved {} from {} to {}", name, old, target),
+        TagWrite::AlreadyThere { target } => println!("{} is already at {}", name, target),
+    }
+    Ok(())
+}
 
+/// What writing a tag did, so the text and JSON renderers describe the same event.
+pub enum TagWrite {
+    Created { target: String },
+    Moved { old: String, target: String },
+    AlreadyThere { target: String },
+}
+
+fn read_tags(conn: &Connection) -> ZResult<Vec<(String, String, i64)>> {
+    let mut stmt = conn.prepare("SELECT name, changeset_id, created_at FROM tags ORDER BY name")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn write_tag(
+    conn: &Connection,
+    name: &str,
+    changeset: Option<&str>,
+    force: bool,
+) -> ZResult<TagWrite> {
     // Whatever was named has to be turned into a changeset id before it is stored. Storing the
     // name is what let `tag v2 main` succeed while pointing at a string that is not a changeset:
     // the tag exists, resolves to nothing, and fails only when somebody reads through it.
     let target = match changeset {
-        Some(c) => crate::store::resolve_rev(&conn, c)?.ok_or_else(|| {
+        Some(c) => crate::store::resolve_rev(conn, c)?.ok_or_else(|| {
             bad(format!(
                 "no such branch, tag or changeset: {}; a tag can point at a branch, a changeset \
                  or another tag, but it has to point at something",
@@ -278,8 +299,8 @@ pub fn cmd_tag(
             ))
         })?,
         None => {
-            let branch = current_branch(&conn)?;
-            branch_head(&conn, &branch)?.ok_or_else(|| bad("branch has no changesets to tag"))?
+            let branch = current_branch(conn)?;
+            branch_head(conn, &branch)?.ok_or_else(|| bad("branch has no changesets to tag"))?
         }
     };
     // A tag that already exists is refused, not moved. `ON CONFLICT DO UPDATE` made `gesta tag v1`
@@ -300,8 +321,7 @@ pub fn cmd_tag(
         (Some(old), false) if old == &target => {
             // Re-tagging the same point is a no-op, not an error: a script that sets a tag after
             // every build should not fail on the runs where nothing moved.
-            println!("{} is already at {}", name, target);
-            return Ok(());
+            return Ok(TagWrite::AlreadyThere { target });
         }
         (Some(old), false) => {
             return Err(bad(format!(
@@ -314,9 +334,11 @@ pub fn cmd_tag(
                 "UPDATE tags SET changeset_id = ?2, created_at = ?3 WHERE name = ?1",
                 rusqlite::params![name, target, now()],
             )?;
-            ops::record(&conn, "tag-move", Some(name), Some(old))?;
-            println!("moved {} from {} to {}", name, old, target);
-            return Ok(());
+            ops::record(conn, "tag-move", Some(name), Some(old))?;
+            return Ok(TagWrite::Moved {
+                old: old.clone(),
+                target,
+            });
         }
         (None, _) => {}
     }
@@ -324,22 +346,48 @@ pub fn cmd_tag(
         "INSERT INTO tags(name, changeset_id, message, created_at) VALUES(?1, ?2, NULL, ?3)",
         rusqlite::params![name, target, now()],
     )?;
-    ops::record(&conn, "tag", Some(name), None)?;
-    println!("tagged {} at {}", name, target);
-    Ok(())
+    ops::record(conn, "tag", Some(name), None)?;
+    Ok(TagWrite::Created { target })
 }
 
-pub fn cmd_tag_json() -> YResultAlias {
+pub fn cmd_tag_json(
+    name: Option<&str>,
+    changeset: Option<&str>,
+    list: bool,
+    force: bool,
+) -> YResultAlias {
     let (_root, conn) = open_repo()?;
-    let mut stmt = conn.prepare("SELECT name, changeset_id, created_at FROM tags ORDER BY name")?;
-    let rows = stmt.query_map([], |r| {
-        Ok(Json::obj(vec![
-            ("name", Json::str(r.get::<_, String>(0)?)),
-            ("changeset", Json::str(r.get::<_, String>(1)?)),
-            ("created_at", Json::int(r.get::<_, i64>(2)?)),
-        ]))
-    })?;
-    emit(Json::arr(rows.collect::<rusqlite::Result<Vec<_>>>()?));
+    // A command that names a tag means to create it. Printing the list instead answered a question
+    // nobody asked and threw away the arguments, so `gesta --json tag v1.0` reported success while
+    // creating nothing.
+    if !list {
+        if let Some(name) = name {
+            let outcome = write_tag(&conn, name, changeset, force)?;
+            let (action, old, target) = match outcome {
+                TagWrite::Created { target } => ("created", Json::Null, target),
+                TagWrite::Moved { old, target } => ("moved", Json::str(old), target),
+                TagWrite::AlreadyThere { target } => ("unchanged", Json::Null, target),
+            };
+            emit(Json::obj(vec![
+                ("name", Json::str(name.to_string())),
+                ("action", Json::str(action)),
+                ("previous", old),
+                ("changeset", Json::str(target)),
+            ]));
+            return Ok(());
+        }
+    }
+    let rows = read_tags(&conn)?
+        .into_iter()
+        .map(|(n, cs, ts)| {
+            Json::obj(vec![
+                ("name", Json::str(n)),
+                ("changeset", Json::str(cs)),
+                ("created_at", Json::int(ts)),
+            ])
+        })
+        .collect();
+    emit(Json::arr(rows));
     Ok(())
 }
 

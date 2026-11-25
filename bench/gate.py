@@ -161,6 +161,23 @@ def main():
             (r[1] or "")[-400:],
         )
 
+    if want("json-surface"):
+        # `--json tag v1.0` listed tags instead of creating one, `--json diff --name-only` dropped
+        # the flag, and `--json blame --ignore-rev` ignored the list that decides which changeset a
+        # line belongs to. All three were the seam between a parsed flag and the handler it
+        # reached, where a unit test on the handler passes and the dispatch throws the arguments
+        # away. This drives the binary the way a caller does.
+        r = sh(
+            f"python3 {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'json_surface.py')}",
+            cwd=ZF_DIR,
+            timeout=180,
+        )
+        record(
+            "the --json surface honours its flags and always parses",
+            r[0] == 0 and "21/21 json surface checks pass" in r[1],
+            (r[1] or "")[-600:],
+        )
+
     if want("ci"):
         rc, out = sh("python3 bench/ci.py", timeout=60)
         record("CI refuses incomplete and unexpected gate exits", rc == 0, out[-1000:])
