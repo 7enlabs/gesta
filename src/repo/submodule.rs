@@ -205,6 +205,55 @@ fn checkout_our_repo(dest: &Path, commit: &str, sub_path: &str) -> ZResult<()> {
     Ok(())
 }
 
+/// The arguments for `git checkout`, with the pin already known to be a commit id.
+///
+/// The pin is *not* put behind `--`: for `checkout` the separator means "everything after this is a
+/// path", so `git checkout --quiet -- fff4956` fails with `pathspec 'fff4956' did not match`, while
+/// `git checkout --quiet fff4956` checks the commit out. `--detach` is what makes the position
+/// explicit instead, and `pinned_commit` is what makes an option-like pin unreachable.
+fn checkout_args(commit: &str) -> Vec<String> {
+    vec![
+        "checkout".into(),
+        "--quiet".into(),
+        "--detach".into(),
+        commit.into(),
+    ]
+}
+
+/// The commit a `.gitmodules` pin names, or the reason it cannot be one.
+///
+/// A pin is a hexadecimal object name: 4 to 64 characters of `[0-9a-f]`. Checking that here is the
+/// boundary that makes option injection impossible rather than merely unlikely, because
+/// `--orphan=x` is not hexadecimal and therefore never reaches `git checkout`. `git checkout
+/// --quiet --orphan=x` created an orphan branch and exited 0, so the submodule sat on a branch
+/// nobody asked for and every later read of it was wrong.
+fn pinned_commit<'a>(sub_path: &str, pin: &'a str) -> ZResult<&'a str> {
+    let ok = (4..=64).contains(&pin.len())
+        && pin.chars().all(|c| c.is_ascii_hexdigit())
+        && pin.chars().next().is_some_and(|c| c.is_ascii_hexdigit());
+    if !ok {
+        return Err(bad(format!(
+            "submodule {} has a pin that is not a commit id: {:?}",
+            sub_path, pin
+        )));
+    }
+    Ok(pin)
+}
+
+/// The arguments for `git clone`, ending option parsing before the url and the destination.
+///
+/// `--` matters here too: a `.gitmodules` url of `--upload-pack=...` was read as an option, and
+/// `git clone` runs the named program.
+fn clone_args(url: &str, dest: &Path) -> Vec<String> {
+    vec![
+        "clone".into(),
+        "--quiet".into(),
+        "--".into(),
+        url.into(),
+        dest.to_string_lossy().into_owned(),
+    ]
+}
+
 /// Move a git repository to a named commit, fetching it first so a pin from another machine resolves.
 fn checkout_git_repo(dest: &Path, commit: &str, sub_path: &str) -> ZResult<()> {
     let status = std::process::Command::new("git")
@@ -220,9 +269,7 @@ fn checkout_git_repo(dest: &Path, commit: &str, sub_path: &str) -> ZResult<()> {
     let status = std::process::Command::new("git")
         .arg("-C")
         .arg(dest)
-        .arg("checkout")
-        .arg("--quiet")
-        .arg(commit)
+        .args(checkout_args(pinned_commit(sub_path, commit)?))
         .status()?;
     if !status.success() {
         return Err(bad(format!(
@@ -311,10 +358,7 @@ fn clone_child(url: &str, dest: &Path) -> ZResult<()> {
         return import_child(src, dest);
     }
     let status = std::process::Command::new("git")
-        .arg("clone")
-        .arg("--quiet")
-        .arg(url)
-        .arg(dest)
+        .args(clone_args(url, dest))
         .status()?;
     if !status.success() {
         return Err(bad(format!(
@@ -375,6 +419,132 @@ pub fn child_head(path: &Path) -> ZResult<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pin_that_is_not_a_commit_id_is_refused_before_git_runs() {
+        // `git checkout --quiet --orphan=x` created an orphan branch and exited 0, so the submodule
+        // sat on a branch nobody asked for. A pin is hexadecimal, so refusing anything else closes
+        // the option path completely instead of arguing about which options are dangerous.
+        for bad_pin in [
+            "--orphan=x",
+            "-b",
+            "--detach",
+            "",
+            "HEAD",
+            "main",
+            "fff",
+            "fffzzz",
+            "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        ] {
+            let e = pinned_commit("vendor/lib", bad_pin)
+                .expect_err(&format!("{:?} must not be accepted as a pin", bad_pin));
+            let msg = format!("{e}");
+            assert!(msg.contains("vendor/lib"), "{msg}");
+            assert!(msg.contains("not a commit id"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn a_hexadecimal_pin_is_accepted_and_reaches_git_as_a_positional() {
+        let pin = pinned_commit("vendor/lib", "fff4956").expect("a hex pin is a commit id");
+        assert_eq!(pin, "fff4956");
+        let args = checkout_args(pin);
+        assert!(args.contains(&"fff4956".to_string()), "{args:?}");
+        // `--` before the pin would make git read it as a path and fail.
+        let dash = args.iter().position(|a| a == "--");
+        assert_eq!(
+            dash, None,
+            "no separator before a checkout revision: {args:?}"
+        );
+        assert!(
+            args.contains(&"--detach".to_string()),
+            "the detached position must be explicit: {args:?}"
+        );
+    }
+
+    #[test]
+    fn a_clone_url_reaches_git_as_a_positional_argument_not_an_option() {
+        // A url of `--upload-pack=<program>` made `git clone` run that program.
+        let args = clone_args("--upload-pack=/bin/sh", Path::new("/tmp/dest"));
+        let dash = args
+            .iter()
+            .position(|a| a == "--")
+            .expect("`--` must be present");
+        let url = args
+            .iter()
+            .position(|a| a == "--upload-pack=/bin/sh")
+            .expect("url must be present");
+        assert!(dash < url, "`--` must come before the url, got {args:?}");
+    }
+
+    #[test]
+    fn git_run_for_real_checks_out_a_hex_pin_with_the_argv_the_fix_builds() {
+        // The tests above check the argv we build; this one hands that argv to git in a real
+        // repository, so "the pin is honoured" is measured and not assumed. Skipped only when git is
+        // absent, which this repository cannot work without.
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("gesta-sub-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "--quiet", "."]);
+        git(&["config", "user.email", "t@t.c"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(
+            dir.join("child.txt"),
+            "v1
+",
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "v1"]);
+        let pin = git(&["rev-parse", "HEAD"]);
+        std::fs::write(dir.join("child.txt"), "v1\nv2\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "v2"]);
+
+        assert_eq!(
+            pinned_commit("vendor/lib", &pin).unwrap(),
+            pin,
+            "a real commit id must pass the boundary check"
+        );
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(checkout_args(&pin))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git rejected our argv: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let text = std::fs::read_to_string(dir.join("child.txt")).unwrap();
+        assert_eq!(
+            text, "v1\n",
+            "the checkout must land on the pin, not the head"
+        );
+    }
 
     #[test]
     fn a_well_formed_file_round_trips_through_parse_and_write() {
