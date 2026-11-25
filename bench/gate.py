@@ -161,6 +161,10 @@ def main():
             (r[1] or "")[-400:],
         )
 
+    if want("ci"):
+        rc, out = sh("python3 bench/ci.py", timeout=60)
+        record("CI refuses incomplete and unexpected gate exits", rc == 0, out[-1000:])
+
     if want("audit"):
         rc, out = sh("bash -lc 'source $HOME/.cargo/env && cargo audit'", timeout=600)
         vulns = "vulnerability found" in out or "Vulnerabilities found" in out

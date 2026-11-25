@@ -30,7 +30,7 @@ jobs:
 
       - name: Install the toolchain
         run: |
-          rustup toolchain install stable --profile minimal --component clippy,llvm-tools-preview
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt,llvm-tools-preview
           rustup default stable
           rustc --version
           cargo --version
@@ -44,29 +44,25 @@ jobs:
           # The SQLite build needs these headers on a bare runner.
           sudo apt-get update -qq
           sudo apt-get install -y -qq pkg-config libssl-dev zlib1g-dev
+          # Match the local scanner and verify the published release checksum before execution.
+          curl --fail --location --retry 3 \
+            https://github.com/google/osv-scanner/releases/download/v2.7.1/osv-scanner_linux_amd64 \
+            --output "$RUNNER_TEMP/osv-scanner"
+          printf '%s  %s\n' \
+            fb7dab19a8bd9bbe5c3189f09d4b7ee1820c9553a23bac202648a56efd2f6ee8 \
+            "$RUNNER_TEMP/osv-scanner" | sha256sum --check
+          mkdir -p "$HOME/.local/bin"
+          install -m 0755 "$RUNNER_TEMP/osv-scanner" "$HOME/.local/bin/osv-scanner"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Build
         run: cargo build --release
 
       - name: Gate
-        id: gate
-        # The bughunter scenarios live outside this repository, so that step reports "did not run"
-        # and the gate exits 3: the checks that ran passed, and the run is incomplete. That is not a
-        # failure of this tree and not a pass either, so the step records the code and the next step
-        # decides. A real failure is 1, and an unknown step name is 2; both fail here.
+        # Incomplete checks and unexpected exit codes must block CI just like failures.
         run: |
-          set +e
           python3 bench/gate.py
-          code=$?
-          echo "code=$code" >> "$GITHUB_OUTPUT"
-          echo "gate exited $code (0 pass, 1 fail, 2 unknown step, 3 incomplete)"
-          if [ "$code" = "1" ] || [ "$code" = "2" ]; then exit "$code"; fi
         shell: bash
-
-      - name: Say what an incomplete run means
-        if: steps.gate.outputs.code == '3'
-        run: |
-          echo "::warning::the gate ran and passed every check it could, but at least one check did not run here. Not counted as a pass."
 
   build-windows:
     name: build (windows)
