@@ -56,7 +56,7 @@ pub fn write_safe(root: &Path, rel: &str, content: &[u8]) -> crate::ZResult<usiz
                 return Err(Box::new(Error::new(
                     Code::Usage,
                     format!("parent directory {} is a symlink", parent.display()),
-                ))) as crate::ZResult<()>;
+                )));
             }
             fs::create_dir_all(parent)?;
         }
