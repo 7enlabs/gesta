@@ -106,58 +106,63 @@ pub fn glob_is_match(pattern: &str, text: &str) -> bool {
 }
 
 fn glob_match(pattern: &str, text: &str) -> bool {
-    fn go(p: &[char], t: &[char]) -> bool {
-        if p.is_empty() {
-            return t.is_empty();
-        }
-        if p[0] == '*' && p.len() > 1 && p[1] == '*' {
-            // `**` crosses directory separators; the leading `/` in `**/x` is
-            // optional so `**/a.md` also matches a top level `a.md`.
-            let rest = &p[2..];
-            let rest = if rest.first() == Some(&'/') {
-                &rest[1..]
-            } else {
-                rest
-            };
-            for skip in 0..=t.len() {
-                if go(rest, &t[skip..]) {
-                    return true;
-                }
-                if skip < t.len() && t[skip] == '/' {
-                    continue;
-                }
-            }
-            // Simple fallback: try every suffix.
-            for skip in 0..=t.len() {
-                if go(rest, &t[skip..]) {
-                    return true;
-                }
-            }
-            false
-        } else if p[0] == '*' {
-            let rest = &p[1..];
-            if go(rest, t) {
-                return true;
-            }
-            for skip in 0..t.len() {
-                if t[skip] == '/' {
-                    return false; // a single `*` does not cross a separator
-                }
-                if go(rest, &t[skip + 1..]) {
-                    return true;
-                }
-            }
-            false
-        } else if p[0] == '?' {
-            !t.is_empty() && t[0] != '/' && go(&p[1..], &t[1..])
-        } else {
-            !t.is_empty() && p[0] == t[0] && go(&p[1..], &t[1..])
-        }
-    }
-    let p: Vec<char> = pattern.chars().collect();
-    let x: Vec<char> = text.chars().collect();
-    go(&p, &x)
+    glob_match_counting(pattern, text, &mut 0)
 }
+
+/// `glob_match`, optionally counting how many `(pattern index, text index)` pairs it settled.
+///
+/// The count is the cost of the match: it is what a caller can assert on instead of a duration, and
+/// it does not move when the machine is busy.
+fn glob_match_counting(pattern: &str, text: &str, calls: &mut u64) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    // Three states per cell: unknown, no, yes. Without the memo the matcher tries every split for
+    // each `**`, and a pattern of five `**` segments against a fifteen component path ran 1 018 000
+    // 000 recursive calls - a pushed path could stall a serve worker that way.
+    let mut memo = vec![UNKNOWN; (p.len() + 1) * (t.len() + 1)];
+    go(0, 0, &p, &t, &mut memo, calls)
+}
+
+fn go(pi: usize, ti: usize, p: &[char], t: &[char], memo: &mut Vec<u8>, calls: &mut u64) -> bool {
+    let cell = pi * (t.len() + 1) + ti;
+    if memo[cell] != UNKNOWN {
+        return memo[cell] == YES;
+    }
+    *calls += 1;
+    let answer = if pi == p.len() {
+        ti == t.len()
+    } else if p[pi] == '*' && pi + 1 < p.len() && p[pi + 1] == '*' {
+        // `**` crosses directory separators; the leading `/` in `**/x` is optional so
+        // `**/a.md` also matches a top level `a.md`.
+        let mut rest = pi + 2;
+        if rest < p.len() && p[rest] == '/' {
+            rest += 1;
+        }
+        let mut hit = false;
+        for skip in ti..=t.len() {
+            if go(rest, skip, p, t, memo, calls) {
+                hit = true;
+                break;
+            }
+        }
+        hit
+    } else if p[pi] == '*' {
+        // A single `*` stops at a separator. Consuming zero characters first keeps `*` matching an
+        // empty name, as the recursive version did.
+        go(pi + 1, ti, p, t, memo, calls)
+            || (ti < t.len() && t[ti] != '/' && go(pi, ti + 1, p, t, memo, calls))
+    } else if p[pi] == '?' {
+        ti < t.len() && t[ti] != '/' && go(pi + 1, ti + 1, p, t, memo, calls)
+    } else {
+        ti < t.len() && p[pi] == t[ti] && go(pi + 1, ti + 1, p, t, memo, calls)
+    };
+    memo[cell] = if answer { YES } else { NO };
+    answer
+}
+
+const UNKNOWN: u8 = 0;
+const NO: u8 = 1;
+const YES: u8 = 2;
 
 impl Auth {
     /// Build from the `auth` file inside the repository directory.
@@ -388,6 +393,59 @@ pub fn is_loopback(bind: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_double_star_segment_still_crosses_directories() {
+        assert!(glob_match("**/a.md", "a.md"));
+        assert!(glob_match("**/a.md", "x/y/a.md"));
+        assert!(glob_match("docs/**", "docs/a/b.md"));
+        assert!(glob_match("docs/**/*.rs", "docs/x/y/z.rs"));
+        assert!(
+            !glob_match("docs/*.rs", "docs/x/y.rs"),
+            "one star stops at a separator"
+        );
+        assert!(!glob_match("**/a.md", "x/y/b.md"));
+    }
+
+    #[test]
+    fn a_single_star_matches_within_one_segment() {
+        assert!(glob_match("*.md", "a.md"));
+        assert!(glob_match("*", "abc"));
+        assert!(glob_match("docs/*", "docs/readme.md"));
+        assert!(!glob_match("docs/*", "docs/a/b.md"));
+        assert!(glob_match("a?c", "abc"));
+        assert!(!glob_match("a?c", "a/c"), "? does not match a separator");
+    }
+
+    #[test]
+    fn an_empty_pattern_matches_only_an_empty_path() {
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "a"));
+        assert!(!glob_match("a", ""));
+    }
+
+    #[test]
+    fn several_double_star_segments_settle_a_bounded_number_of_pairs() {
+        // Measured against the unmemoised matcher: 1 018 000 000 recursive calls at five segments,
+        // 30 123 521 at four, 721 601 at three. A pushed path is attacker-controlled, so the cost of
+        // the match cannot be a function of how many `**` the operator wrote.
+        let text = (0..14)
+            .map(|i| format!("dir{i}"))
+            .collect::<Vec<_>>()
+            .join("/")
+            + "/f.txt";
+        for segments in 1..=6 {
+            let pattern = (0..segments).map(|_| "**").collect::<Vec<_>>().join("/") + "/nomatch.md";
+            let mut calls = 0u64;
+            assert!(!glob_match_counting(&pattern, &text, &mut calls));
+            // Every (pattern, text) pair is settled at most once, so the ceiling is the product.
+            let ceiling = (pattern.chars().count() + 1) as u64 * (text.chars().count() + 1) as u64;
+            assert!(
+                calls <= ceiling,
+                "{segments} segments settled {calls} pairs, ceiling is {ceiling}"
+            );
+        }
+    }
 
     #[test]
     fn invalid_unicode_expiry_is_unparseable_without_panicking() {
