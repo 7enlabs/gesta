@@ -12,6 +12,7 @@ use crate::store::{
     ancestors, branch_head, current_branch, delta_stats, init_schema, object_store_bytes, open_db,
     set_state,
 };
+use crate::support::json::Json;
 use crate::support::ops;
 use crate::transport::auth;
 use crate::transport::http;
@@ -2640,29 +2641,11 @@ pub fn cmd_forge_push(
     let result = crate::transport::forge::push_branch(&conn, &root, &ep, branch, remote_ref)?;
 
     if json {
-        // A reason from a remote can carry a quote, a backslash or a newline, and pasting it into a JSON
-        // string is how a caller's parser fails on a message that was meant to explain a failure.
-        let esc = |s: &str| -> String {
-            let mut o = String::with_capacity(s.len());
-            for c in s.chars() {
-                match c {
-                    '"' => o.push_str("\\\""),
-                    '\\' => o.push_str("\\\\"),
-                    '\n' => o.push_str("\\n"),
-                    '\r' => o.push_str("\\r"),
-                    '\t' => o.push_str("\\t"),
-                    c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
-                    c => o.push(c),
-                }
-            }
-            o
-        };
-        println!(
-            "{{\"ref\":\"{}\",\"ok\":{},\"message\":\"{}\"}}",
-            esc(&result.name),
-            result.ok,
-            esc(&result.message)
-        );
+        crate::cli::jsonutil::emit(Json::obj(vec![
+            ("ref", Json::str(result.name.clone())),
+            ("ok", Json::Bool(result.ok)),
+            ("message", Json::str(result.message.clone())),
+        ]));
     } else {
         println!("pushed {} to {}", branch, url);
         println!("  {} now at the commit the remote accepted", remote_ref);
@@ -2701,26 +2684,17 @@ pub fn cmd_forge_push_all(url: &str, token: Option<&str>, user: &str, json: bool
     let results = crate::transport::forge::push_all(&conn, &root, &ep)?;
 
     if json {
-        let esc = |s: &str| -> String {
-            let mut o = String::with_capacity(s.len());
-            for c in s.chars() {
-                match c {
-                    '"' => o.push_str("\\\""),
-                    '\\' => o.push_str("\\\\"),
-                    '\n' => o.push_str("\\n"),
-                    '\r' => o.push_str("\\r"),
-                    '\t' => o.push_str("\\t"),
-                    c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
-                    c => o.push(c),
-                }
-            }
-            o
-        };
-        let items: Vec<String> = results
-            .iter()
-            .map(|r| format!("{{\"ref\":\"{}\",\"ok\":{}}}", esc(&r.name), r.ok))
-            .collect();
-        println!("[{}]", items.join(","));
+        crate::cli::jsonutil::emit(Json::arr(
+            results
+                .iter()
+                .map(|r| {
+                    Json::obj(vec![
+                        ("ref", Json::str(r.name.clone())),
+                        ("ok", Json::Bool(r.ok)),
+                    ])
+                })
+                .collect(),
+        ));
     } else if results.is_empty() {
         // Every branch is already at the id the remote holds. Saying nothing was pushed is honest and
         // different from failing; a caller that cannot tell the two apart will retry a no-op forever.

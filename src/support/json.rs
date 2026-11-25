@@ -7,6 +7,13 @@
 
 use std::collections::BTreeMap;
 
+/// The version stamped on every object this program puts on the wire.
+///
+/// It lives in the JSON tier, not the CLI tier, because the error document is built in
+/// `support::error` and the MCP server stamps its own replies in `transport::mcp`. Both are below
+/// the CLI, so a constant that only the CLI could reach forced those two to depend upward on it.
+pub const WIRE_SCHEMA: &str = "gesta@1";
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Json {
     Null,

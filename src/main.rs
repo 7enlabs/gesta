@@ -1216,14 +1216,15 @@ fn main() {
         // Only when nothing was printed yet. `merge --json` prints the conflicted files and then
         // returns an error to keep the exit code non-zero; a second object after that document
         // makes the output unparseable, which is worse than having no error object at all.
-        if std::env::args().any(|a| a == "--json")
+        if cli::JSON_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
             && !cli::JSON_PRINTED.load(std::sync::atomic::Ordering::Relaxed)
         {
             if let Some(ours) = e.downcast_ref::<error::Error>() {
                 println!("{}", ours.json());
             } else {
                 println!(
-                    "{{\"error\":{{\"code\":\"{}\",\"message\":\"{}\",\"advice\":\"{}\"}}}}",
+                    "{{\"schema\":\"{}\",\"error\":{{\"code\":\"{}\",\"message\":\"{}\",\"advice\":\"{}\"}}}}",
+                    cli::SCHEMA_VERSION,
                     code.name(),
                     escape_json(&e.to_string()),
                     escape_json(code.advice())
@@ -1379,6 +1380,7 @@ fn run() -> ZResult<()> {
         }
     };
     let json = cli.json;
+    cli::JSON_REQUESTED.store(json, std::sync::atomic::Ordering::Relaxed);
     match cli.cmd {
         Cmd::Status if json => cli::cmd_status_json(),
         Cmd::Log {

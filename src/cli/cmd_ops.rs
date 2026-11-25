@@ -76,12 +76,11 @@ pub fn cmd_stash(sub: crate::StashCmd, json: bool) -> ZResult<()> {
                 return Ok(());
             }
             if json {
-                println!(
-                    "{{\"id\":{},\"files\":{},\"message\":\"{}\"}}",
-                    id,
-                    n,
-                    message.replace('"', "\\\"")
-                );
+                emit(Json::obj(vec![
+                    ("id", Json::int(id)),
+                    ("files", Json::int(n as i64)),
+                    ("message", Json::str(message)),
+                ]));
             } else {
                 println!("saved stash {} ({} file(s)): {}", id, n, message);
                 println!("the working tree is back at the head");
@@ -92,17 +91,18 @@ pub fn cmd_stash(sub: crate::StashCmd, json: bool) -> ZResult<()> {
             let (_root, conn) = open_repo()?;
             let all = crate::repo::stash::list(&conn)?;
             if json {
-                let mut parts = Vec::new();
-                for s in &all {
-                    parts.push(format!(
-                        "{{\"id\":{},\"message\":\"{}\",\"files\":{},\"created_at\":{}}}",
-                        s.id,
-                        s.message.replace('"', "\\\""),
-                        s.files.len(),
-                        s.created_at
-                    ));
-                }
-                println!("[{}]", parts.join(","));
+                emit(Json::arr(
+                    all.iter()
+                        .map(|s| {
+                            Json::obj(vec![
+                                ("id", Json::int(s.id)),
+                                ("message", Json::str(s.message.clone())),
+                                ("files", Json::int(s.files.len() as i64)),
+                                ("created_at", Json::int(s.created_at)),
+                            ])
+                        })
+                        .collect(),
+                ));
                 return Ok(());
             }
             if all.is_empty() {

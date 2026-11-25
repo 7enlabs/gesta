@@ -19,19 +19,21 @@ pub fn cmd_sub(sub: crate::SubCmd, json: bool) -> ZResult<()> {
             let (root, conn) = open_repo()?;
             let all = crate::repo::subrepo::list(&conn)?;
             if json {
-                let parts: Vec<String> = all
-                    .iter()
-                    .map(|s| {
-                        format!(
-                            "{{\"path\":\"{}\",\"remote\":\"{}\",\"pinned\":\"{}\",\"present\":{}}}",
-                            s.path,
-                            s.remote,
-                            s.pinned,
-                            crate::repo::subrepo::is_present(&root, s)
-                        )
-                    })
-                    .collect();
-                println!("[{}]", parts.join(","));
+                emit(Json::arr(
+                    all.iter()
+                        .map(|s| {
+                            Json::obj(vec![
+                                ("path", Json::str(s.path.clone())),
+                                ("remote", Json::str(s.remote.clone())),
+                                ("pinned", Json::str(s.pinned.clone())),
+                                (
+                                    "present",
+                                    Json::Bool(crate::repo::subrepo::is_present(&root, s)),
+                                ),
+                            ])
+                        })
+                        .collect(),
+                ));
                 return Ok(());
             }
             if all.is_empty() {
@@ -147,18 +149,26 @@ pub fn cmd_submodule(sub: crate::SubmoduleCmd, json: bool) -> ZResult<()> {
             let (root, _conn) = open_repo()?;
             let statuses = crate::repo::submodule::submodule_status(&root)?;
             if json {
-                let parts: Vec<String> = statuses
-                    .iter()
-                    .map(|s| format!(
-                        "{{\"path\":\"{}\",\"commit\":\"{}\",\"pinned\":{},                        \"dirty\":{},                        \"missing\":{}}}",
-                        s.path,
-                        s.commit,
-                        s.pinned.as_ref().map(|p| format!("\"{}\"", p)).unwrap_or("null".to_string()),
-                        s.dirty,
-                        s.missing
-                    ))
-                    .collect();
-                println!("[{}]", parts.join(","));
+                emit(Json::arr(
+                    statuses
+                        .iter()
+                        .map(|s| {
+                            Json::obj(vec![
+                                ("path", Json::str(s.path.clone())),
+                                ("commit", Json::str(s.commit.clone())),
+                                (
+                                    "pinned",
+                                    s.pinned
+                                        .as_ref()
+                                        .map(|p| Json::str(p.clone()))
+                                        .unwrap_or(Json::Null),
+                                ),
+                                ("dirty", Json::Bool(s.dirty)),
+                                ("missing", Json::Bool(s.missing)),
+                            ])
+                        })
+                        .collect(),
+                ));
                 return Ok(());
             }
             if statuses.is_empty() {

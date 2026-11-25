@@ -110,7 +110,8 @@ impl Error {
     /// tool.
     pub fn json(&self) -> String {
         format!(
-            "{{\"error\":{{\"code\":\"{}\",\"message\":\"{}\",\"advice\":\"{}\"}}}}",
+            "{{\"schema\":\"{}\",\"error\":{{\"code\":\"{}\",\"message\":\"{}\",\"advice\":\"{}\"}}}}",
+            crate::support::json::WIRE_SCHEMA,
             self.code.name(),
             escape(&self.message),
             escape(self.code.advice())
@@ -199,6 +200,20 @@ mod tests {
         let e = Error::new(Code::Other, "line one\nline two");
         assert!(!e.json().contains('\n'));
         assert!(e.json().contains("\\n"));
+    }
+
+    #[test]
+    fn the_json_error_carries_the_schema_the_contract_promises() {
+        // docs/json-contract.md: "Every object the program prints now carries `schema`". The
+        // error document is the one a caller reads when things already went wrong, so a missing
+        // stamp here is the worst place to break the contract.
+        let e = Error::not_found("no such branch: nope");
+        let json = e.json();
+        assert!(
+            json.contains("\"schema\":\"gesta@1\""),
+            "the error object carries no schema: {}",
+            json
+        );
     }
 
     #[test]

@@ -93,7 +93,15 @@ pub(crate) type YResultAlias = ZResult<()>;
 /// An agent reads this output and branches on its field names. Renaming a field without saying so
 /// breaks a caller silently, which is the worst kind of break: it keeps running and does the wrong
 /// thing. The version goes on every object so a caller can refuse one it does not know.
-pub const SCHEMA_VERSION: &str = "gesta@1";
+pub const SCHEMA_VERSION: &str = crate::support::json::WIRE_SCHEMA;
+
+/// Set once the parser has accepted a command with `--json`, so the failure path in `main` can
+/// decide the output shape from what was actually parsed rather than by scanning argv.
+///
+/// Scanning argv matched any argument equal to `--json`, including a message that happened to be
+/// that word, and missed `--json=true`. The parsed flag knows both.
+pub static JSON_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Set once anything has been printed as JSON, so a later failure does not append a second object to
 /// a document that already went out.
