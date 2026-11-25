@@ -337,9 +337,17 @@ pub fn run(
             s.current = None;
             store(conn, &s)?;
             if s.candidates.len() <= 1 {
-                let answer = s.candidates.first().cloned().ok_or_else(|| {
-                    bad("every candidate was skipped, so the search has no answer".to_string())
-                })?;
+                let Some(answer) = s.candidates.first().cloned() else {
+                    // Every candidate answered 125, so there is no answer to report. The worktree is
+                    // still checked out at the last tested changeset and the session row is still
+                    // there, so `finish` has to run before the error: returning early would leave a
+                    // person with a modified tree and a bisect that still looks running, and
+                    // nothing telling them to cancel it.
+                    finish(conn, root)?;
+                    return Err(bad(
+                        "every candidate was skipped, so the search has no answer".to_string(),
+                    ));
+                };
                 finish(conn, root)?;
                 return Ok(answer);
             }
@@ -377,6 +385,45 @@ pub fn finish(conn: &Connection, root: &Path) -> ZResult<usize> {
 mod tests {
     use super::*;
     use crate::repo::tests::commit_files;
+
+    #[test]
+    fn every_candidate_skipped_leaves_nothing_running() {
+        // The error is the right answer, but the state matters as much as the message: an early
+        // return left the worktree at the last tested changeset and the session row in place, so the
+        // next `bisect start` refused with "a bisect is already running" and the tree looked
+        // modified for reasons the person could not see. Exit 125 is git's "skip".
+        let conn = crate::store::tests::mem_db();
+        commit_files(&conn, "c00", "base", &[("f", "0\n")]);
+        commit_files(&conn, "c01", "one", &[("f", "1\n")]);
+        // Exactly one candidate, so skipping it empties the range: with two, skipping one leaves the
+        // other as the answer, which is the documented behaviour and not the path under test.
+        start(&conn, "c00", "c01").unwrap();
+
+        let d = std::env::temp_dir().join(format!("gesta-bisect-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+
+        let err = run(&conn, &d, "exit 125", |_, _| {})
+            .expect_err("with everything skipped there is no answer");
+        assert!(
+            format!("{err}").contains("every candidate was skipped"),
+            "the message must name the reason, got: {err}"
+        );
+
+        // Nothing is left running, and the worktree is back on the branch rather than the last
+        // changeset the search happened to test.
+        assert!(
+            crate::repo::bisect::load(&conn).unwrap().is_none(),
+            "the session must be cleared"
+        );
+        let on_disk = std::fs::read_to_string(d.join("f")).unwrap();
+        assert_eq!(
+            on_disk, "1\n",
+            "the worktree must be the branch head, not a candidate"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn a_tree_holding_a_binary_file_is_checked_out() {
