@@ -608,8 +608,9 @@ fn tool_blame(conn: &Connection, args: &Json) -> Result<Json, String> {
         .query_map([&path], |r| {
             Ok(Json::obj(vec![
                 ("line", Json::int(r.get::<_, i64>(0)?)),
-                ("changeset", Json::str(r.get::<_, String>(1)?)),
-                ("author", Json::str(r.get::<_, String>(2)?)),
+                ("end_line", Json::int(r.get::<_, i64>(1)?)),
+                ("changeset", Json::str(r.get::<_, String>(2)?)),
+                ("author", Json::str(r.get::<_, String>(3)?)),
             ]))
         })
         .map_err(|e| e.to_string())?;
@@ -911,6 +912,63 @@ mod tests {
             Some("line one\n")
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn blame_tool_returns_ordered_ranges_and_changeset_authors() {
+        let d = tmp_repo("blame_ranges");
+        let conn = store::open_db(&d).unwrap();
+        conn.execute_batch(
+            "INSERT INTO changesets(id, message, author, created_at, status, parent, parent2, branch)
+             VALUES('cs-first', 'first', 'First Author', 0, 'committed', NULL, NULL, 'main'),
+                   ('cs-second', 'second', 'Second Author', 1, 'committed', 'cs-first', NULL, 'main');
+             INSERT INTO blame_ranges(path, start_line, end_line, changeset_id)
+             VALUES('a.txt', 9, 12, 'cs-second'), ('a.txt', 1, 8, 'cs-first'),
+                   ('other.txt', 1, 2, 'cs-second');",
+        )
+        .unwrap();
+        drop(conn);
+        let r = rpc(
+            &d,
+            r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"gesta_blame","arguments":{"path":"a.txt"}}}"#,
+        );
+        assert!(field(&r, "error").is_none(), "{}", r.render());
+        let result = field(&r, "result").unwrap();
+        let sc = field(result, "structuredContent").unwrap();
+        assert_eq!(json::as_str(field(sc, "path").unwrap()), Some("a.txt"));
+        let Json::Arr(lines) = field(sc, "lines").unwrap() else {
+            panic!("blame lines must be an array");
+        };
+        assert_eq!(lines.len(), 2);
+        for (row, start, end, changeset, author) in [
+            (&lines[0], 1, 8, "cs-first", "First Author"),
+            (&lines[1], 9, 12, "cs-second", "Second Author"),
+        ] {
+            assert_eq!(json::as_i64(field(row, "line").unwrap()), Some(start));
+            assert_eq!(json::as_i64(field(row, "end_line").unwrap()), Some(end));
+            assert_eq!(
+                json::as_str(field(row, "changeset").unwrap()),
+                Some(changeset)
+            );
+            assert_eq!(json::as_str(field(row, "author").unwrap()), Some(author));
+        }
+        assert!(matches!(field(result, "isError"), Some(Json::Bool(false))));
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn blame_tool_keeps_missing_path_refusal() {
+        let d = tmp_repo("blame_missing");
+        let r = rpc(
+            &d,
+            r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"gesta_blame","arguments":{"path":"missing.txt"}}}"#,
+        );
+        let error = field(&r, "error").unwrap();
+        assert_eq!(
+            json::as_str(field(error, "message").unwrap()),
+            Some("no blame data for missing.txt")
+        );
+        std::fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
