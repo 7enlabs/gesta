@@ -1087,6 +1087,47 @@ pub fn route(
                     )
                 }
             };
+            // `force` releases a lock held by somebody else, so it is a privilege and not a
+            // preference: the caller may only assert it when the server actually knows who they are
+            // (#153). Before this, `force` came straight out of the request body, so any caller could
+            // release any lock - and on a server with auth off the holder name is self-asserted too,
+            // which made every lock releasable by anyone.
+            //
+            // When `grant` is `None` the request was not authenticated at all: either the route does
+            // not require it (auth off) or the token was absent, and `who` is then whatever the
+            // client typed. Neither is an identity. Keep the ordinary path - an owner releasing their
+            // own lock - and refuse the privileged one.
+            // `force` releases a lock somebody else holds, so the question is who is asking (#153).
+            //
+            // Two cases, and the first version of this fix got them backwards. On a server with
+            // tokens configured, `force` needs a credential that the server verified: without one,
+            // `who` is a name the client typed and the audit line would name the victim. On a server
+            // with auth off there is nothing to verify against, and `force` is how the single-user
+            // workflow releases a stale lock - refusing it there breaks the feature to protect
+            // nobody. `bench/lfs_locks.py` covers that second case and went red when I got this
+            // wrong, which is the value of having the bench.
+            let force = if auth.required {
+                match grant.as_ref() {
+                    None => {
+                        return Response::error(
+                            403,
+                            "Forbidden",
+                            "this server requires a token to release another client's lock"
+                                .to_string(),
+                        )
+                    }
+                    Some(g) if g.role == crate::transport::auth::Role::Read => {
+                        return Response::error(
+                            403,
+                            "Forbidden",
+                            "releasing another client's lock needs a write token".to_string(),
+                        )
+                    }
+                    Some(_) => force,
+                }
+            } else {
+                force
+            };
             match crate::transport::lfs::unlock(&conn, &id, &who, force) {
                 Ok(l) => {
                     log_access(root, &who, "git-lfs-unlock", &l.path, "released");
@@ -1797,6 +1838,48 @@ fn receive_bundle(
     init_schema(&conn)?;
 
     let bundle = Bundle::decode(body)?;
+
+    // The path scope, before anything is written (#149).
+    //
+    // This route checked the role and the branch scope and never asked about paths, so a token
+    // issued for `docs/**` pushed any file it liked through the most capable push endpoint there is,
+    // while the JSON changeset route and git-receive-pack both refused it. The scope a token was
+    // issued with was silently void here, and the caller had no way to know.
+    //
+    // Every path in the bundle, not just the ones that differ from what the server holds: the cost
+    // is a glob per version row and the alternative is deciding which rows "count", which is the
+    // question this is here to answer. Checked before `apply_bundle` so a refused push writes
+    // nothing rather than being rolled back - the branch roll-back below exists for a fast-forward
+    // violation, which cannot be known any earlier.
+    if let Some(g) = grant {
+        let mut offending: Option<String> = None;
+        for (path, ..) in &bundle.versions {
+            if !g.permits(path) {
+                offending = Some(path.clone());
+                break;
+            }
+        }
+        if offending.is_none() {
+            for (path, ..) in &bundle.files {
+                if !g.permits(path) {
+                    offending = Some(path.clone());
+                    break;
+                }
+            }
+        }
+        if let Some(path) = offending {
+            return Err(ApplyError::Rejected(format!(
+                "this token may not write {:?}; its scope is {}",
+                path,
+                if g.scope.is_empty() {
+                    "unrestricted".to_string()
+                } else {
+                    g.scope.join(", ")
+                }
+            )));
+        }
+    }
+
     let previous = branch_head(&conn, branch)?;
 
     // Apply first, check afterwards. A bundle normally carries only the
@@ -2484,6 +2567,232 @@ mod tests {
         assert!(text.contains("Content-Length: 5"));
         assert!(text.contains("Connection: close"));
         assert!(text.ends_with("hello"));
+    }
+    #[test]
+    fn force_releasing_another_clients_lfs_lock_needs_a_real_credential() {
+        // #153. Two separate holes on the lock surface, and the route check was already fixed, so
+        // what is left is the one the issue's second half names: `force` came from the request body,
+        // and `who` comes from a name the client typed into an `Authorization` header that, on a
+        // server with auth off, is never verified. Together that meant anyone could release anyone's
+        // lock - and could do it while claiming to be them.
+        //
+        // This calls `route`, not `required_role`: the role table answers "does this route need a
+        // credential", and it says yes, and the request below carries one. The defect was inside the
+        // handler, which is why a routing test cannot see it (A36).
+        let dir = std::env::temp_dir().join(format!("gesta-lfs-force-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".gesta")).unwrap();
+        let lock_id;
+        {
+            let conn = crate::store::open_db(&dir).unwrap();
+            crate::store::init_schema(&conn).unwrap();
+            let l = crate::transport::lfs::lock(&conn, "big.bin", "victim", None, 1_700_000_000)
+                .unwrap();
+            lock_id = l.id;
+        }
+
+        // No Authorization header at all: `who` is `anonymous`, `force` is true, and the lock belongs
+        // to `victim`. Before the fix this deleted it.
+        let req = Request {
+            method: "POST".to_string(),
+            path: "/repo.git/info/lfs/locks/unlock".to_string(),
+            query: Vec::new(),
+            body: format!("{{\"lock\":{{\"id\":\"{}\"}},\"force\":true}}", lock_id).into_bytes(),
+            authorization: None,
+            git_protocol: None,
+        };
+        // A server WITH tokens configured, because that is the case the refusal is about: there,
+        // `who` is a name the client typed into a header nothing verified, and `force` would let a
+        // stranger release the lock while the access log named its holder. On a server without
+        // tokens there is nothing to verify against and force is the normal single-user workflow
+        // (`bench/lfs_locks.py` asserts that, and my first version broke it).
+        let mut auth =
+            crate::transport::auth::Auth::from_entries(&["writer-token:write:alice".to_string()]);
+        auth.required = true;
+        let resp = route(&dir, &req, &auth, None);
+        assert_ne!(
+            resp.status, 200,
+            "an unauthenticated caller force-released a lock held by someone else"
+        );
+
+        // The lock is still there, which is the half a status code alone does not prove: a 403 after
+        // the delete would read as passing.
+        let conn = crate::store::open_db(&dir).unwrap();
+        let still = crate::transport::lfs::list(&conn, None, None, None);
+        assert_eq!(
+            still.len(),
+            1,
+            "the lock was released even though the request was refused"
+        );
+        assert_eq!(still[0].owner, "victim");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_owner_can_still_release_their_own_lock_without_force() {
+        // The check above must not turn into "nobody may ever unlock". A caller releasing the lock
+        // they hold needs no privilege: the owner matches, `force` is irrelevant, and this has to
+        // keep working on an auth-off server or the fix has broken the feature.
+        let dir = std::env::temp_dir().join(format!("gesta-lfs-own-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".gesta")).unwrap();
+        let lock_id;
+        {
+            let conn = crate::store::open_db(&dir).unwrap();
+            crate::store::init_schema(&conn).unwrap();
+            let l = crate::transport::lfs::lock(&conn, "mine.bin", "owner", None, 1_700_000_000)
+                .unwrap();
+            lock_id = l.id;
+        }
+        let req = Request {
+            method: "POST".to_string(),
+            path: "/repo.git/info/lfs/locks/unlock".to_string(),
+            query: Vec::new(),
+            body: format!("{{\"lock\":{{\"id\":\"{}\"}}}}", lock_id).into_bytes(),
+            // The name the client claims. With auth off there is nothing to verify it against, and
+            // the ordinary path is allowed to trust it for exactly that reason: it only releases a
+            // lock that already says the same name.
+            // base64("owner:whatever"), written out rather than computed: the crate has a decoder
+            // and no encoder, and a test that used the decoder to build its own input would not
+            // notice the two disagreeing.
+            authorization: Some("Basic b3duZXI6d2hhdGV2ZXI=".to_string()),
+            git_protocol: None,
+        };
+        let auth = crate::transport::auth::Auth::from_entries(&[]);
+        let resp = route(&dir, &req, &auth, None);
+        assert_eq!(
+            resp.status,
+            200,
+            "the holder could not release their own lock: {}",
+            String::from_utf8_lossy(&resp.body)
+        );
+        let conn = crate::store::open_db(&dir).unwrap();
+        assert_eq!(
+            crate::transport::lfs::list(&conn, None, None, None).len(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bundle_push_outside_the_path_scope_writes_nothing() {
+        // #149. `receive_bundle` checked the branch scope and never checked paths, so a token issued
+        // for `docs/**` pushed `src/main.rs` through the primary push endpoint - while the JSON
+        // changeset route and git-receive-pack both refused the same file. The scope was void on the
+        // most capable route, and the caller was never told.
+        //
+        // The check runs before `apply_bundle`, so this asserts on the store as well as the answer:
+        // a rejection after the write would satisfy a status assertion and still have written.
+        let src = std::env::temp_dir().join(format!("gesta-bundle-src-{}", std::process::id()));
+        let dst = std::env::temp_dir().join(format!("gesta-bundle-dst-{}", std::process::id()));
+        for d in [&src, &dst] {
+            let _ = std::fs::remove_dir_all(d);
+            std::fs::create_dir_all(d.join(".gesta")).unwrap();
+        }
+        // The destination has a `main`, because a server that accepts a push has one: a bundle
+        // arrives against an existing branch, and without it the failure below would be "no such
+        // branch" rather than the scope question this test is about.
+        {
+            let conn = crate::store::open_db(&dst).unwrap();
+            crate::store::init_schema(&conn).unwrap();
+            crate::store::migrate(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO branches(name, head, created_at, from_branch) VALUES('main', NULL, 0, NULL)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // The source repository: one changeset with a file the token may not touch.
+        let body = {
+            let conn = crate::store::open_db(&src).unwrap();
+            crate::store::init_schema(&conn).unwrap();
+            crate::store::migrate(&conn).unwrap();
+            conn.execute(
+                "INSERT INTO branches(name, head, created_at, from_branch) VALUES('main', NULL, 0, NULL)",
+                [],
+            )
+            .unwrap();
+            std::fs::create_dir_all(src.join("src")).unwrap();
+            std::fs::write(src.join("src/main.rs"), "fn main() {}\n").unwrap();
+            let cs = crate::repo::create_changeset(&conn, &src, "add main", "t")
+                .unwrap()
+                .expect("one file is a changeset");
+            crate::repo::commit_one(&conn, &cs.id).unwrap();
+            crate::transport::remote::build_bundle(&conn, "main", &std::collections::HashSet::new())
+                .unwrap()
+                .encode()
+                .unwrap()
+        };
+
+        let g = grant_to_paths(&["docs/**"]);
+        let res = receive_bundle(&dst, "main", &body, "t", Some(&g));
+        match res {
+            Err(ApplyError::Rejected(msg)) => assert!(
+                msg.contains("src/main.rs"),
+                "the refusal does not name the file it refused: {msg}"
+            ),
+            Ok(_) => panic!("a docs-scoped token pushed src/main.rs"),
+            // `ApplyError` has no `Debug`, and printing a variant by hand is what the other tests
+            // here do rather than deriving it for a test's convenience.
+            Err(ApplyError::Other(e)) => panic!("wrong failure: {e}"),
+        }
+
+        // And the destination is untouched - no changeset, no branch head.
+        let conn = crate::store::open_db(&dst).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM changesets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "the refused push wrote {count} changeset(s) anyway"
+        );
+
+        for d in [&src, &dst] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn force_still_works_on_a_server_without_tokens() {
+        // The other side of #153, and the half my first fix broke. `bench/lfs_locks.py` drives
+        // `force` with no credential at all and expects a 200: on a server with no tokens there is
+        // nobody to verify against, so the alternative to trusting the caller is deleting the
+        // feature. Guarding a check-with-nothing-behind-it is not security, it is a regression.
+        let dir = std::env::temp_dir().join(format!("gesta-lfs-forceoff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".gesta")).unwrap();
+        let lock_id;
+        {
+            let conn = crate::store::open_db(&dir).unwrap();
+            crate::store::init_schema(&conn).unwrap();
+            let l = crate::transport::lfs::lock(&conn, "shared.bin", "bob", None, 1_700_000_000)
+                .unwrap();
+            lock_id = l.id;
+        }
+        let req = Request {
+            method: "POST".to_string(),
+            path: "/repo.git/info/lfs/locks/unlock".to_string(),
+            query: Vec::new(),
+            body: format!("{{\"lock\":{{\"id\":\"{}\"}},\"force\":true}}", lock_id).into_bytes(),
+            authorization: Some("Basic YWxpY2U6eA==".to_string()), // alice:x
+            git_protocol: None,
+        };
+        // `required` false: no tokens in the file, which is what `Auth::from_entries(&[])` builds.
+        let auth = crate::transport::auth::Auth::from_entries(&[]);
+        let resp = route(&dir, &req, &auth, None);
+        assert_eq!(
+            resp.status, 200,
+            "force was refused on a server with no tokens, which has nothing to check it against: {}",
+            String::from_utf8_lossy(&resp.body)
+        );
+        let conn = crate::store::open_db(&dir).unwrap();
+        assert_eq!(
+            crate::transport::lfs::list(&conn, None, None, None).len(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

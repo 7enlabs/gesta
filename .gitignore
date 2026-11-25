@@ -49,3 +49,6 @@ bench/harness/runs/
 .t_*.py
 .*.sh
 
+
+# llvm-cov writes one profraw per test binary into the tree it was run from.
+*.profraw
