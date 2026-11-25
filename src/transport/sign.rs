@@ -58,26 +58,27 @@ pub struct SigningKey {
 impl SigningKey {
     /// Generate a new key and write it, refusing to overwrite an existing one.
     pub fn generate(path: &Path) -> ZResult<SigningKey> {
-        if path.exists() {
-            return Err(bad(format!(
-                "{} already exists: move it aside rather than replacing it, or every signature it made becomes unverifiable",
-                path.display()
-            )));
-        }
         let rng = SystemRandom::new();
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)
             .map_err(|_| bad("the system random source refused to generate a key"))?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(path, pkcs8.as_ref())?;
-        // The private key is the whole secret. A file the whole machine can read is not a secret.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(path)?.permissions();
-            perms.set_mode(0o600);
-            std::fs::set_permissions(path, perms)?;
+        // One call, not `exists()` then `write()` (#161). The check and the write were two
+        // operations, so two concurrent generates both passed the check and the second overwrote the
+        // first - a key lost with no error to either caller. And `fs::write` creates 0644 under the
+        // usual umask, with the mode fixed up afterwards, so the key was readable by any local
+        // process for the width of the write. `create_new` with mode 0600 at creation answers
+        // "does it exist" and "make it mine" in the same syscall.
+        match crate::support::private_file::write_new_private(path, pkcs8.as_ref()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(bad(format!(
+                    "{} already exists: move it aside rather than replacing it, or every signature it made becomes unverifiable",
+                    path.display()
+                )));
+            }
+            Err(e) => return Err(e.into()),
         }
         let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref())
             .map_err(|_| bad("the key just generated cannot be loaded"))?;
@@ -262,5 +263,123 @@ mod tests {
         let a = signed_payload("cs1", "x\nauthor:bob", "alice", None);
         let b = signed_payload("cs1", "x", "bob", None);
         assert_ne!(a, b);
+    }
+    #[test]
+    fn a_generated_key_is_created_unreadable_not_made_so_afterwards() {
+        // #161, and the first version of this test was a lesson in what does not work.
+        //
+        // It asserted on the mode of the finished file. That test passes against the old code too -
+        // `fs::write` then `set_permissions(0600)` ends at 0600, so the only thing it proved was
+        // that the fix-up ran. The window between the two calls is real and invisible from the end
+        // state, which is the whole point: you cannot observe a gap by looking at what comes after
+        // it (A60).
+        //
+        // What can be observed is the property that removes the gap. `create_new` with mode 0600
+        // makes the file exist and private in the same syscall, so a second create cannot succeed
+        // and no reader sees a wider file. The mode is still asserted - it is the outcome a person
+        // cares about - but the race test above is what makes the claim, and this one would pass
+        // either way, so it is stated as the weaker check it is.
+        let d = std::env::temp_dir().join(format!("zf-key-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let path = d.join("signing.key");
+
+        SigningKey::generate(&path).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the key ended at {mode:o}, not 600");
+        }
+        let key = SigningKey::load(&path).unwrap();
+        assert_eq!(key.path, path);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn concurrent_generates_against_one_path_produce_exactly_one_key() {
+        // The half of #161 a sequential test cannot reach. `if path.exists() { refuse }` followed by
+        // `write` is a check-then-act: two threads can both pass the check, and then both write, so
+        // the loser's key vanishes with no error to either caller - and any signature the loser made
+        // stops verifying. Racing them is the only way to see it.
+        //
+        // Sixteen threads on a barrier, so they start together rather than one after another. With
+        // `create_new` exactly one wins by construction; it is not a matter of timing.
+        let d = std::env::temp_dir().join(format!("zf-key-race2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let path = d.join("contended.key");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                SigningKey::generate(&path).is_ok()
+            }));
+        }
+        let wins = handles
+            .into_iter()
+            .filter(|_| true)
+            .map(|h| h.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(
+            wins, 1,
+            "{wins} of 16 racing generates reported success on one path; the loser's key was \
+             overwritten and neither caller was told"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn two_generates_cannot_both_win() {
+        // The other half of #161: `if path.exists() { refuse }` then `write` let two callers both
+        // pass the check, and the second overwrote the first's key with no error to either. With
+        // `create_new` exactly one call succeeds and the other gets AlreadyExists.
+        let d = std::env::temp_dir().join(format!("zf-key-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let path = d.join("contended.key");
+
+        let first = SigningKey::generate(&path);
+        assert!(first.is_ok(), "the first generate must succeed");
+        let winner = std::fs::read(&path).unwrap();
+
+        let second = SigningKey::generate(&path);
+        assert!(
+            second.is_err(),
+            "a second generate on the same path reported success and replaced a key that signatures \
+             already depend on"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            winner,
+            "the losing call rewrote the file"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_refusal_for_an_existing_key_still_says_why() {
+        // The message is the whole value of the refusal: "already exists" without the reason reads
+        // like a bug, and somebody moves the file aside without knowing what it costs.
+        let d = std::env::temp_dir().join(format!("zf-key-msg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let path = d.join("k");
+        SigningKey::generate(&path).unwrap();
+        let err = match SigningKey::generate(&path) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a second generate on the same path succeeded"),
+        };
+        assert!(
+            err.contains("unverifiable"),
+            "the refusal does not explain why replacing the key is worse than failing: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

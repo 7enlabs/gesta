@@ -425,13 +425,16 @@ pub fn generate_self_signed(
     std::fs::create_dir_all(dir)?;
     let cert_path = dir.join("cert.pem");
     let key_path = dir.join("key.pem");
-    std::fs::write(&cert_path, cert.pem())?;
-    std::fs::write(&key_path, key_pair.serialize_pem())?;
-
-    // The key is private, and the library that wrote it did not choose a mode. The shared helper
-    // fails loudly rather than ignoring the error, which the old inline `let _ =` did: a key left at
-    // 0644 with nothing reported is the state this exists to prevent.
-    crate::support::private_file::tighten(&key_path)?;
+    // The certificate is public - it is printed and pinned - so it does not need a private mode.
+    // The key does, and it gets one at creation rather than after it (#161): `fs::write` made it
+    // 0644 under the usual umask and `tighten` fixed it up afterwards, which left it readable by any
+    // local process for as long as the write took.
+    //
+    // `replace_private` and not `write_new_private`, because `serve --tls self-signed` generates
+    // here on every start: refusing an existing key would make the second run of the same command
+    // fail. The rename is what makes it atomic, so a reader sees the old pair or the new one.
+    crate::support::private_file::replace_private(&cert_path, cert.pem().as_bytes())?;
+    crate::support::private_file::replace_private(&key_path, key_pair.serialize_pem().as_bytes())?;
 
     let der = cert.der();
     use sha2::{Digest, Sha256};
