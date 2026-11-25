@@ -1710,7 +1710,13 @@ fn create_changeset_from_json(
 
     let result = crate::store::with_retry(|| {
         crate::store::content::changeset_from_content(
-            &conn, message, author, branch, &files, &delete, None,
+            crate::store::content::Repo { conn: &conn, root },
+            message,
+            author,
+            branch,
+            &files,
+            &delete,
+            None,
         )
     })
     .map_err(|e| ChangeErr::Internal(e.to_string()))?;

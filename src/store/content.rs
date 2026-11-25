@@ -85,8 +85,20 @@ pub fn effective_tree(
     Ok(out)
 }
 
+/// A repository is a database and a root directory, and functions that need both should say so once.
+///
+/// It arrived as a bare pair (#107): the database was passed everywhere and the root was not passed
+/// at all, which is how a file came to be read against the process's working directory. Naming the
+/// pair makes the second half impossible to forget, and it is the reason this function has seven
+/// arguments rather than eight.
+#[derive(Clone, Copy)]
+pub struct Repo<'a> {
+    pub conn: &'a Connection,
+    pub root: &'a std::path::Path,
+}
+
 pub fn changeset_from_content(
-    conn: &Connection,
+    repo: Repo<'_>,
     message: &str,
     author: &str,
     branch: &str,
@@ -94,6 +106,8 @@ pub fn changeset_from_content(
     delete: &[String],
     rules: Option<&crate::support::attributes::Rules>,
 ) -> ZResult<ContentChangeset> {
+    let conn = repo.conn;
+    let root = repo.root;
     let head = branch_head(conn, branch)?;
     // The base includes changesets still pending on this branch, not just the
     // head, so a second API call sees what the first one wrote.
@@ -136,7 +150,14 @@ pub fn changeset_from_content(
                     path
                 )));
             }
-            let bytes = std::fs::read(path).map_err(|e| {
+            // Against the repository root, not against whatever directory the server happens to
+            // have been started in (#107). This function is handed a tree path - the same string
+            // that goes into `changeset_files` - and reading it as given meant the answer depended
+            // on the process's cwd: correct only when the server started inside the repo, a
+            // different file or a hard error everywhere else. Nothing in the signature said so, and
+            // the comment claimed the caller passes a path on disk, which the one caller never did.
+            let on_disk = root.join(path);
+            let bytes = std::fs::read(&on_disk).map_err(|e| {
                 bad(format!(
                     "{}: an entry with empty content is read from disk, and it could not be read ({e}). \
                      Send the content, or a path that exists inside the repository.",
@@ -222,6 +243,13 @@ mod tests {
     use crate::repo::committed_tree;
     use crate::store::tests::mem_db;
 
+    /// A root for tests whose content is never empty: they take the `else` branch, so the only code
+    /// that reads through the root is not reached. Explicit rather than reusing `mem_db`, which has
+    /// no directory behind it.
+    fn no_disk() -> &'static std::path::Path {
+        std::path::Path::new("/nonexistent-test-root")
+    }
+
     #[test]
     fn a_repo_relative_path_is_the_only_kind_allowed() {
         for ok in [
@@ -262,8 +290,18 @@ mod tests {
         // contents stored as an object, then read back through the ordinary file routes.
         let conn = mem_db();
         let outside = vec![("/etc/passwd".to_string(), String::new())];
-        let err = match changeset_from_content(&conn, "steal", "agent", "main", &outside, &[], None)
-        {
+        let err = match changeset_from_content(
+            Repo {
+                conn: &conn,
+                root: no_disk(),
+            },
+            "steal",
+            "agent",
+            "main",
+            &outside,
+            &[],
+            None,
+        ) {
             Ok(cs) => panic!("an absolute path was accepted: {}", cs.id),
             Err(e) => e.to_string(),
         };
@@ -274,8 +312,18 @@ mod tests {
 
         // The climbing form is refused for the same reason.
         let climb = vec![("../../../etc/shadow".to_string(), String::new())];
-        let err2 = match changeset_from_content(&conn, "steal", "agent", "main", &climb, &[], None)
-        {
+        let err2 = match changeset_from_content(
+            Repo {
+                conn: &conn,
+                root: no_disk(),
+            },
+            "steal",
+            "agent",
+            "main",
+            &climb,
+            &[],
+            None,
+        ) {
             Ok(cs) => panic!("a climbing path was accepted: {}", cs.id),
             Err(e) => e.to_string(),
         };
@@ -286,11 +334,34 @@ mod tests {
     fn a_changeset_records_only_what_differs_from_the_head() {
         let conn = mem_db();
         let first = vec![("a.txt".to_string(), "one\n".to_string())];
-        let cs = changeset_from_content(&conn, "add", "agent", "main", &first, &[], None).unwrap();
+        let cs = changeset_from_content(
+            Repo {
+                conn: &conn,
+                root: no_disk(),
+            },
+            "add",
+            "agent",
+            "main",
+            &first,
+            &[],
+            None,
+        )
+        .unwrap();
         assert_eq!(cs.paths, vec!["a.txt".to_string()]);
 
         // The same content again is not a change.
-        let again = changeset_from_content(&conn, "same", "agent", "main", &first, &[], None);
+        let again = changeset_from_content(
+            Repo {
+                conn: &conn,
+                root: no_disk(),
+            },
+            "same",
+            "agent",
+            "main",
+            &first,
+            &[],
+            None,
+        );
         assert!(
             again.is_err(),
             "identical content must not create a changeset"
@@ -304,8 +375,19 @@ mod tests {
         // second API call lost track of what the first one wrote.
         let conn = mem_db();
         let files = vec![("src/app.py".to_string(), "print(1)\n".to_string())];
-        let cs =
-            changeset_from_content(&conn, "queued", "agent", "main", &files, &[], None).unwrap();
+        let cs = changeset_from_content(
+            Repo {
+                conn: &conn,
+                root: no_disk(),
+            },
+            "queued",
+            "agent",
+            "main",
+            &files,
+            &[],
+            None,
+        )
+        .unwrap();
 
         let committed = committed_tree(&conn, "main").unwrap();
         assert!(
@@ -325,10 +407,25 @@ mod tests {
     fn a_second_changeset_can_delete_what_the_first_one_added() {
         let conn = mem_db();
         let files = vec![("doc.md".to_string(), "# doc\n".to_string())];
-        changeset_from_content(&conn, "add", "agent", "main", &files, &[], None).unwrap();
+        changeset_from_content(
+            Repo {
+                conn: &conn,
+                root: no_disk(),
+            },
+            "add",
+            "agent",
+            "main",
+            &files,
+            &[],
+            None,
+        )
+        .unwrap();
 
         let del = changeset_from_content(
-            &conn,
+            Repo {
+                conn: &conn,
+                root: no_disk(),
+            },
             "remove",
             "agent",
             "main",
@@ -355,7 +452,10 @@ mod tests {
         let conn = mem_db();
         let files = vec![("keep.txt".to_string(), "x\n".to_string())];
         let r = changeset_from_content(
-            &conn,
+            Repo {
+                conn: &conn,
+                root: no_disk(),
+            },
             "one",
             "a",
             "main",
@@ -374,11 +474,34 @@ mod tests {
         // changeset claims to rewrite a version that never existed.
         let conn = mem_db();
         let first = vec![("a.txt".to_string(), "one\n".to_string())];
-        changeset_from_content(&conn, "first", "agent", "main", &first, &[], None).unwrap();
+        changeset_from_content(
+            Repo {
+                conn: &conn,
+                root: no_disk(),
+            },
+            "first",
+            "agent",
+            "main",
+            &first,
+            &[],
+            None,
+        )
+        .unwrap();
 
         let second = vec![("a.txt".to_string(), "two\n".to_string())];
-        let cs =
-            changeset_from_content(&conn, "second", "agent", "main", &second, &[], None).unwrap();
+        let cs = changeset_from_content(
+            Repo {
+                conn: &conn,
+                root: no_disk(),
+            },
+            "second",
+            "agent",
+            "main",
+            &second,
+            &[],
+            None,
+        )
+        .unwrap();
 
         let old: Option<String> = conn
             .query_row(
@@ -398,7 +521,10 @@ mod tests {
     fn an_unknown_path_to_delete_is_refused_when_nothing_else_changed() {
         let conn = mem_db();
         let r = changeset_from_content(
-            &conn,
+            Repo {
+                conn: &conn,
+                root: no_disk(),
+            },
             "noop",
             "a",
             "main",
@@ -417,7 +543,18 @@ mod tests {
             ("a.txt".to_string(), "one\n".to_string()),
             ("a.txt".to_string(), "two\n".to_string()),
         ];
-        let r = changeset_from_content(&conn, "dupe", "a", "main", &files, &[], None);
+        let r = changeset_from_content(
+            Repo {
+                conn: &conn,
+                root: no_disk(),
+            },
+            "dupe",
+            "a",
+            "main",
+            &files,
+            &[],
+            None,
+        );
         assert!(r.is_err(), "two contents for one path is ambiguous");
     }
 
@@ -426,7 +563,10 @@ mod tests {
         let conn = mem_db();
         let files = vec![("a.txt".to_string(), "one\n".to_string())];
         let r = changeset_from_content(
-            &conn,
+            Repo {
+                conn: &conn,
+                root: no_disk(),
+            },
             "conflict",
             "a",
             "main",
@@ -435,5 +575,60 @@ mod tests {
             None,
         );
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn a_binary_upload_is_read_from_the_repository_not_the_processs_cwd() {
+        // #107. The read was `std::fs::read(path)` with the tree path, so it resolved against
+        // whatever directory the server was started in - correct exactly when the cwd happened to
+        // be the repo, a wrong file or a hard error otherwise, with nothing in the signature
+        // saying so.
+        //
+        // The repo here is a temp directory and the process does not stand in it, so the old code
+        // cannot find the file at all. That is the weaker half of the defect (the wrong-file half
+        // needs a cwd that holds a same-named file), and it is the half that can be asserted
+        // without `set_current_dir`, which is process-global and would race every other test in
+        // this binary.
+        let repo = std::env::temp_dir().join(format!("gesta-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("blob.bin"), b"from the repository").unwrap();
+        assert!(
+            !std::path::Path::new("blob.bin").exists(),
+            "this test needs the cwd to NOT hold blob.bin, or it cannot tell the two reads apart"
+        );
+
+        let conn = mem_db();
+        // Empty content means "read the bytes off disk" - the branch under test.
+        let files = vec![("blob.bin".to_string(), String::new())];
+        let cs = changeset_from_content(
+            Repo {
+                conn: &conn,
+                root: &repo,
+            },
+            "bin",
+            "agent",
+            "main",
+            &files,
+            &[],
+            None,
+        )
+        .unwrap_or_else(|e| {
+            panic!("a binary upload was not read from the repository it was given: {e}")
+        });
+
+        let hash: String = conn
+            .query_row(
+                "SELECT new_hash FROM changeset_files WHERE changeset_id = ?1 AND path = 'blob.bin'",
+                rusqlite::params![cs.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            hash,
+            crate::store::hash_content("from the repository"),
+            "the stored object is not the file inside the repository"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }
