@@ -138,24 +138,61 @@ fn blame_through(
     // changeset before it that touched this file at all. That is an approximation of what git
     // computes by re-running the diff, and it is the honest one to report: the line came from
     // somewhere earlier, and this names where.
-    let earlier: Option<(String, String, Option<String>)> = conn
-        .query_row(
-            "SELECT cf.changeset_id, c.author, c.intent
-             FROM changeset_files cf JOIN changesets c ON c.id = cf.changeset_id
-             WHERE cf.path = ?1 AND cf.changeset_id != ?2
-               AND c.created_at <= (SELECT created_at FROM changesets WHERE id = ?2)
-             ORDER BY c.created_at DESC, c.rowid DESC LIMIT 1",
-            rusqlite::params![path, cs],
-            |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                ))
-            },
-        )
-        .optional()?;
-    Ok(earlier.or(current))
+    //
+    // "Before" is ordered by (created_at, rowid), not by created_at alone. Two commits in the same
+    // second carry the same timestamp, so `created_at <=` let a changeset made *after* the ignored
+    // one count as earlier, and its rowid tiebreak picked the later of the two. The ordering is
+    // strict: a changeset is earlier only if its stamp is smaller, or equal with a smaller rowid.
+    //
+    // The walk continues while the answer is itself ignored. Skipping one revision when the caller
+    // named three would report the second one, which is still a revision they asked not to see.
+    //
+    // There is deliberately no fallback to `current`. `current` is the row this branch was reached
+    // for, so it is in the ignore list by definition; returning it answers with the changeset the
+    // caller asked to skip. A line whose every writer is ignored has no earlier author, and `None`
+    // says that.
+    let (stamp, rid): (i64, i64) = conn.query_row(
+        "SELECT created_at, rowid FROM changesets WHERE id = ?1",
+        rusqlite::params![cs],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let mut at_stamp = stamp;
+    let mut at_rowid = rid;
+    let mut skip: Vec<String> = ignored.to_vec();
+    loop {
+        let earlier: Option<(String, String, Option<String>)> = conn
+            .query_row(
+                "SELECT cf.changeset_id, c.author, c.intent
+                 FROM changeset_files cf JOIN changesets c ON c.id = cf.changeset_id
+                 WHERE cf.path = ?1
+                   AND (c.created_at < ?2 OR (c.created_at = ?2 AND c.rowid < ?3))
+                 ORDER BY c.created_at DESC, c.rowid DESC LIMIT 1",
+                rusqlite::params![path, at_stamp, at_rowid],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((found_cs, author, intent)) = earlier else {
+            return Ok(None);
+        };
+        if !skip.iter().any(|i| i == &found_cs) {
+            return Ok(Some((found_cs, author, intent)));
+        }
+        // Step past it: ask for the newest changeset strictly before this one.
+        let (s2, r2): (i64, i64) = conn.query_row(
+            "SELECT created_at, rowid FROM changesets WHERE id = ?1",
+            rusqlite::params![found_cs],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        skip.push(found_cs);
+        at_stamp = s2;
+        at_rowid = r2;
+    }
 }
 
 pub fn cmd_blame(file: &str, ignore: &[String]) -> ZResult<()> {
@@ -478,4 +515,87 @@ pub fn cmd_history_json(file: &str) -> YResultAlias {
         ("versions", Json::arr(versions)),
     ]));
     Ok(())
+}
+
+#[cfg(test)]
+mod ignore_rev_tests {
+    use super::*;
+
+    /// A connection with two changesets a second apart (or in the same second) and a one-line range
+    /// blamed on the first.
+    ///
+    /// Written as SQL rather than through `changeset commit` because the point is the timestamps:
+    /// the bug appears when the ignored revision is older by at least a second, and the product path
+    /// would need a `sleep` to arrange that. This is the "fixture needs a state the product cannot
+    /// create cheaply" case, not a fixture that skips a guard.
+    fn two_changesets(gap_seconds: i64) -> Connection {
+        let conn = crate::store::tests::mem_db();
+        conn.execute(
+            "INSERT INTO changesets(id, message, author, created_at, status, branch)
+             VALUES('csolder', 'first', 'agent', 1000, 'committed', 'main')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO changesets(id, message, author, created_at, status, parent, branch)
+             VALUES('csnewer', 'second', 'agent', ?1, 'committed', 'csolder', 'main')",
+            [1000 + gap_seconds],
+        )
+        .unwrap();
+        for cs in ["csolder", "csnewer"] {
+            conn.execute(
+                "INSERT INTO changeset_files(changeset_id, path) VALUES(?1, 'a.txt')",
+                [cs],
+            )
+            .unwrap();
+        }
+        // Line 1 was written in `csolder` and never touched again; line 2 changed in `csnewer`.
+        conn.execute(
+            "INSERT INTO blame_ranges(path, start_line, end_line, changeset_id)
+             VALUES('a.txt', 1, 1, 'csolder')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO blame_ranges(path, start_line, end_line, changeset_id)
+             VALUES('a.txt', 2, 2, 'csnewer')",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn skipping_the_only_writer_of_a_line_does_not_blame_it_on_itself() {
+        // It used to. The earlier-changeset query filtered `created_at <=` the ignored one and then
+        // `earlier.or(current)` fell back to the ignored row itself, so a line whose only writer was
+        // skipped came back attributed to the changeset the caller asked to skip. Whether it did
+        // depended on whether the two changesets landed in the same second, which is why the bench
+        // failed roughly one run in twenty and named a different pair each time.
+        for gap in [0, 1, 5] {
+            let conn = two_changesets(gap);
+            let found = blame_through(&conn, "a.txt", 1, &["csolder".to_string()]).unwrap();
+            match found {
+                None => {} // nothing earlier wrote line 1, which is the honest answer
+                Some((cs, _, _)) => assert_ne!(
+                    cs, "csolder",
+                    "with a {gap}s gap, skipping the only writer of line 1 blamed it on the very \
+                     changeset that was skipped"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn skipping_a_revision_leaves_lines_it_did_not_write_alone() {
+        // The other half: the fix must not stop attribution working. Line 2 was written by the
+        // newer changeset, so ignoring the older one changes nothing about it.
+        let conn = two_changesets(5);
+        let found = blame_through(&conn, "a.txt", 2, &["csolder".to_string()]).unwrap();
+        assert_eq!(
+            found.map(|r| r.0).as_deref(),
+            Some("csnewer"),
+            "a line the skipped revision never wrote lost its author"
+        );
+    }
 }

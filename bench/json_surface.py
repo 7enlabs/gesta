@@ -51,22 +51,29 @@ try:
     run(["changeset", "create", "second"], d)
     run(["changeset", "commit"], d)
 
-    # Which changeset is first is read from the parent link, not from the order `log` prints. Two
-    # commits in the same second sort by a timestamp that cannot tell them apart, so an earlier
-    # version of this bench passed when the two runs happened to straddle a second boundary and
-    # failed inside the gate, where they do not.
+    # Which changeset is first is read from the parent link, and each step scans the whole array
+    # instead of relying on the order `log` prints. Two commits in the same second carry the same
+    # `created_at`, so the order is not fixed: a single pass that sets `first` and then looks for its
+    # child can see the child before the parent and skip it, leaving `second` unset and the #200
+    # checks reading the wrong revision. That happened once in twenty runs and twice in the gate.
     log, _ = doc(["log", "--json"], d)
     first_rev = second_rev = None
     if isinstance(log, list):
-        for row in log:
-            if row.get("parent") is None:
-                first_rev = row["id"]
-            elif row.get("parent") == first_rev:
-                second_rev = row["id"]
-        if second_rev is None:
-            for row in log:
-                if row["id"] != first_rev:
-                    second_rev = row["id"]
+        parents = {row["id"]: row.get("parent") for row in log}
+        for rid, parent in parents.items():
+            if parent is None:
+                first_rev = rid
+                break
+        if first_rev is not None:
+            for rid, parent in parents.items():
+                if parent == first_rev:
+                    second_rev = rid
+                    break
+        if first_rev is None or second_rev is None:
+            # The tree did not have the shape this bench builds. Say so by failing the check below
+            # rather than guessing an id: a guessed `second` turns a broken fixture into a bench that
+            # reports a wrong answer from correct code.
+            first_rev = second_rev = None
     check("the bench found both changesets", first_rev is not None and second_rev is not None,
           f"first={first_rev} second={second_rev}")
 
@@ -115,10 +122,25 @@ try:
     check("#200 the ignored revision is named in the document",
           isinstance(ignored, dict) and first_rev in (ignored.get("ignored") or []),
           str(ignored.get("ignored") if ignored else None))
-    check("#200 the ignored line is attributed to the change before it",
-          line1_after == second_rev, f"{line1_after} vs {second_rev}")
+    # Line 1 was written in `first` and the second changeset only rewrote line 2, so ignoring `first`
+    # leaves line 1 with no earlier author at all. This check used to demand `second_rev` here, and
+    # that was wrong: `second_rev` never touched line 1. `git blame --ignore-rev` on the only writer
+    # of a line marks the boundary commit with `^`; gesta reports null, which is the same statement
+    # without the marker. The old check passed most runs only because of the bug it was meant to
+    # catch: the earlier-changeset query compared `created_at <=` alone, so two commits in the same
+    # second let the *later* one count as earlier and line 1 came back blamed on `second_rev`. When
+    # the two commits landed a second apart the comparison failed and so did the bench, roughly one
+    # run in twenty, naming a different pair each time.
+    check("#200 a line the skipped revision solely wrote has no earlier author",
+          line1_after is None, f"got {line1_after}, which did not write that line")
+    check("#200 the ignored revision is not named as the author", line1_after != first_rev,
+          f"the skipped changeset came back as the author: {line1_after}")
     check("#200 the answer really changed", line1_before != line1_after,
           f"{line1_before} == {line1_after}")
+    # Line 2 was rewritten in `second_rev`, so it keeps that attribution whatever is ignored.
+    line2_after = ignored_lines[1]["changeset"] if ignored_lines and len(ignored_lines) > 1 else None
+    check("#200 a line the skipped revision never wrote keeps its author",
+          line2_after == second_rev, f"{line2_after} vs {second_rev}")
 
     # --- every document carries the schema ------------------------------------------------------
     for label, args in [

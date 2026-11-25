@@ -47,6 +47,20 @@ def record(name, ok, detail=""):
             print(f"         {line}")
 
 
+def _all_checks_passed(out):
+    """True when the bench printed a ratio and every check in it passed.
+
+    The json-surface step compares a ratio, not a fixed count: adding a check to the bench must not
+    turn this step red, and a bench that died before printing anything must not pass by printing
+    nothing. Both halves matter, so `ran > 0` is part of the answer.
+    """
+    m = re.search(r"^(\d+)/(\d+) json surface checks pass$", out, re.M)
+    if not m:
+        return False
+    passed, ran = int(m.group(1)), int(m.group(2))
+    return ran > 0 and passed == ran
+
+
 def skip(name, why):
     """A check that did not run.
 
@@ -191,7 +205,11 @@ def main():
         )
         record(
             "the --json surface honours its flags and always parses",
-            r[0] == 0 and "21/21 json surface checks pass" in r[1],
+            # Every check the bench printed passed, and it printed some. Reading the ratio rather
+            # than a fixed "21/21" means adding a check to the bench does not silently turn this
+            # step red, and `ran > 0` means a bench that crashed before printing anything cannot
+            # pass by printing nothing.
+            r[0] == 0 and _all_checks_passed(r[1] or ""),
             (r[1] or "")[-600:],
         )
 
