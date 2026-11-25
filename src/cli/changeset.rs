@@ -283,18 +283,32 @@ pub fn cmd_changeset_list() -> ZResult<()> {
 ///
 /// Matched on a prefix rather than the whole id: a person reading `git log` has the short form, and
 /// asking them to fetch the long one is the reason a lookup gets skipped.
-pub fn cmd_changeset_for_commit(commit: &str) -> ZResult<()> {
-    let (_root, conn) = open_repo()?;
-    let row: Option<(String, String)> = conn
+/// The changeset holding the git commit whose id starts with `prefix`.
+///
+/// Split from the command so a test can call it: `open_repo` reads the working directory, and a test
+/// that had to change directory to exercise a lookup would be testing the test.
+///
+/// The match is an exact prefix, so the input is compared with `substr`, not fed to `LIKE`. A `LIKE`
+/// pattern lets `%` and `_` in the input act as wildcards, and `find --commit %` then answers with an
+/// arbitrary changeset instead of saying nothing matched. Query errors propagate for the same reason:
+/// `.ok()` turned a broken database into "no such commit", which is a different statement.
+pub fn changeset_for_commit(conn: &Connection, prefix: &str) -> ZResult<Option<(String, String)>> {
+    let len = prefix.chars().count() as i64;
+    let row = conn
         .query_row(
             "SELECT id, COALESCE(git_commit, '') FROM changesets
-             WHERE git_commit IS NOT NULL AND git_commit LIKE ?1
-             ORDER BY created_at DESC LIMIT 1",
-            rusqlite::params![format!("{}%", commit)],
+             WHERE git_commit IS NOT NULL AND substr(git_commit, 1, ?1) = ?2
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            rusqlite::params![len, prefix],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .ok();
-    match row {
+        .optional()?;
+    Ok(row)
+}
+
+pub fn cmd_changeset_for_commit(commit: &str) -> ZResult<()> {
+    let (_root, conn) = open_repo()?;
+    match changeset_for_commit(&conn, commit)? {
         Some((id, full)) => println!("{} {}", id, full),
         None => {
             return Err(bad(format!(
@@ -597,5 +611,68 @@ mod commit_gate_tests {
         ] {
             assert!(body.contains(step), "commit_checked must run {step}");
         }
+    }
+}
+
+#[cfg(test)]
+mod find_tests {
+    use super::*;
+
+    fn two_commits() -> Connection {
+        let conn = crate::store::tests::mem_db();
+        conn.execute(
+            "INSERT INTO changesets(id, message, author, created_at, status, branch, git_commit)
+             VALUES('cs1', 'first', 'a', 0, 'committed', 'main', 'aaaabbbbccccdddd1111')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO changesets(id, message, author, created_at, status, branch, git_commit)
+             VALUES('cs2', 'second', 'a', 1, 'committed', 'main', 'bbbbccccddddeeee2222')",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn a_wildcard_in_the_input_matches_nothing_instead_of_everything() {
+        let conn = two_commits();
+        // `LIKE '%%'` matched every row, so the command answered with an arbitrary changeset.
+        assert_eq!(changeset_for_commit(&conn, "%").unwrap(), None);
+        assert_eq!(changeset_for_commit(&conn, "_").unwrap(), None);
+        assert_eq!(changeset_for_commit(&conn, "a%b").unwrap(), None);
+    }
+
+    #[test]
+    fn a_real_prefix_still_finds_its_commit() {
+        let conn = two_commits();
+        let (id, full) = changeset_for_commit(&conn, "aaaabbbb").unwrap().unwrap();
+        assert_eq!(id, "cs1");
+        assert_eq!(full, "aaaabbbbccccdddd1111");
+        assert_eq!(
+            changeset_for_commit(&conn, "aaaabbbbccccdddd1111")
+                .unwrap()
+                .unwrap()
+                .0,
+            "cs1"
+        );
+    }
+
+    #[test]
+    fn a_prefix_that_matches_nothing_is_none_not_a_wildcard_hit() {
+        let conn = two_commits();
+        assert_eq!(changeset_for_commit(&conn, "ffff").unwrap(), None);
+    }
+
+    #[test]
+    fn the_lookup_is_anchored_at_the_start() {
+        let conn = two_commits();
+        // `substr(git_commit, 1, n) = prefix` is anchored at the front, so a middle fragment misses.
+        assert_eq!(
+            changeset_for_commit(&conn, "bbbbcccc").unwrap().unwrap().0,
+            "cs2"
+        );
+        assert_eq!(changeset_for_commit(&conn, "ccccdddd").unwrap(), None);
     }
 }
