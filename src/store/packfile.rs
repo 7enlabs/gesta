@@ -120,6 +120,18 @@ impl Pack {
         let crc_at = names_at + count * 20;
         let offsets_at = crc_at + count * 4;
 
+        // `count` comes out of the index header before anything checks it against the file. The
+        // offsets below are bounds-checked one at a time, so a bogus count fails on lookup - but by
+        // then the map has already tried to reserve room for it, and a four-byte header saying
+        // 4,000,000,000 entries asks for tens of GB before the first lookup can fail. Each entry
+        // costs 20 bytes of name plus an offset, so the file itself bounds the honest count.
+        let max_entries = idx.len() / 20;
+        if count > max_entries {
+            return Err(bad(format!(
+                "index claims {} objects but the file can hold at most {}",
+                count, max_entries
+            )));
+        }
         let mut offsets = HashMap::with_capacity(count);
         for i in 0..count {
             let name_at = names_at + i * 20;
@@ -317,6 +329,24 @@ fn apply_delta(base: &[u8], delta: &[u8]) -> ZResult<Vec<u8>> {
     let (result_size, used) = delta_size(delta, at)?;
     at = used;
 
+    // `result_size` is a varint from the delta header, decoded before a byte of output exists. A
+    // delta cannot honestly emit more than a bounded multiple of its body, so a huge promise is
+    // either corruption or a probe. Without this, `with_capacity` reserves the whole promise up
+    // front and the process dies on the allocation rather than on a reported error.
+    //
+    // The bound is 65536 bytes per body byte: the largest single copy emits 0x10000 bytes and costs
+    // two bytes to encode, so 65536x is the per-byte maximum with room to spare. An earlier version
+    // of this check used 255x and refused a legitimate full copy of a long run - the delta was
+    // larger than the object, which is fine, and the ceiling was simply too tight.
+    let ceiling = delta.len().saturating_mul(65536);
+    if result_size > ceiling {
+        return Err(bad(format!(
+            "delta claims {} bytes of output from a {} byte body",
+            result_size,
+            delta.len()
+        )));
+    }
+
     let mut out = Vec::with_capacity(result_size);
     while at < delta.len() {
         let op = delta[at];
@@ -416,6 +446,61 @@ fn be64(bytes: &[u8], at: usize) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_delta_header_claiming_more_than_its_body_could_produce_is_refused() {
+        // base size 5, then a result size of 1<<34 followed by one byte. The varint is legal, the
+        // promise is not: `with_capacity` used to reserve the whole thing before reading a single
+        // op, so a 10-byte delta could ask for 16 GB.
+        let base = b"abcde";
+        let mut delta = vec![5u8];
+        // 1 << 34 as a varint
+        let mut v: u64 = 1 << 34;
+        while v >= 0x80 {
+            delta.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+        delta.push(v as u8);
+        delta.push(0x00);
+        let err = apply_delta_for_test(base, &delta).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("claims") && msg.contains("byte body"),
+            "the refusal did not name the impossible promise: {msg}"
+        );
+    }
+
+    #[test]
+    fn an_index_claiming_more_objects_than_the_file_could_hold_is_refused() {
+        // A four-byte fanout total saying 4 billion objects, in a file of 1032 bytes. Two things
+        // could reject this: the ceiling added for this bug, or the per-entry bounds check that was
+        // always there ("index names are truncated"). Only the first one stops the allocation, so
+        // the test asserts on the message. An earlier version of this test only asserted `is_err`
+        // and passed with the ceiling removed - it was green for the wrong reason.
+        let dir = std::env::temp_dir().join(format!("gesta-idx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut idx = Vec::new();
+        idx.extend_from_slice(b"\xfftOc");
+        idx.extend_from_slice(&2u32.to_be_bytes());
+        for i in 0..256u32 {
+            let v = if i == 255 { 4_000_000_000u32 } else { 0 };
+            idx.extend_from_slice(&v.to_be_bytes());
+        }
+        let p = dir.join("t.idx");
+        std::fs::write(&p, &idx).unwrap();
+        let pack = dir.join("t.pack");
+        std::fs::write(&pack, b"PACK").unwrap();
+        let msg = match Pack::open(&pack, &p) {
+            Ok(_) => panic!("an index claiming 4e9 objects was accepted"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("claims") && msg.contains("can hold at most"),
+            "rejected for the wrong reason, so the allocation was still attempted: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_delta_copies_and_inserts() {
