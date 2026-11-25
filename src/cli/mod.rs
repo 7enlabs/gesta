@@ -45,6 +45,77 @@ pub use tree::*;
 pub(crate) use jsonutil::{emit, emit_object, envelope};
 pub(crate) use keys::read_hidden;
 
+/// Take a secret from the environment or the terminal, never from an argument.
+///
+/// `remote add --token`, `remote clone --token`, `forge push --token`, and
+/// `backup remote push|pull --passphrase` all took the value as an argument, which puts it in the
+/// process list and in the shell history. The codebase already said the opposite two files over:
+/// `SecretCmd::Set` reads its value from the terminal, and `remote_target` says an environment
+/// passphrase "keeps it out of shell history and out of `ps`". A documented property that the
+/// flags carrying the most sensitive values ignore is worse than no property, because a reader
+/// trusts it.
+///
+/// Order: the named environment variable wins, then the terminal, then - only when neither is
+/// available and the caller explicitly allowed it - the argument, with a warning on stderr. The
+/// argument stays reachable because a non-interactive caller (`bench`, CI) has no terminal, and a
+/// flag that silently disappears is a flag somebody works around with something worse.
+pub(crate) fn secret_not_in_argv(
+    arg: Option<String>,
+    env_var: &str,
+    prompt: &str,
+    allow_arg: bool,
+) -> ZResult<String> {
+    if let Ok(value) = std::env::var(env_var) {
+        if !value.is_empty() {
+            return Ok(value);
+        }
+    }
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    decide_secret_source(arg, env_var, interactive, allow_arg, prompt)
+}
+
+/// The part of `secret_not_in_argv` that can be tested without a terminal.
+///
+/// Split out because `IsTerminal` describes the process it runs in: a test cannot ask the harness to
+/// be interactive and not be, and a branch nobody can exercise is a branch nobody knows works.
+fn decide_secret_source(
+    arg: Option<String>,
+    env_var: &str,
+    interactive: bool,
+    allow_arg: bool,
+    prompt: &str,
+) -> ZResult<String> {
+    if interactive {
+        let value = read_hidden(prompt)?;
+        if value.is_empty() {
+            return Err(bad(format!(
+                "{} is empty, which carries no secret",
+                prompt.trim_end_matches(": ")
+            )));
+        }
+        return Ok(value);
+    }
+    match arg {
+        Some(value) if !value.is_empty() && allow_arg => {
+            eprintln!(
+                "warning: this value arrived in an argument, so it is in the process list and in \
+                 your shell history. Pass it as {} instead; the argument form is kept for \
+                 non-interactive callers.",
+                env_var
+            );
+            Ok(value)
+        }
+        Some(_) => Err(bad(format!(
+            "no terminal to ask on, so pass the value as {} rather than as an argument",
+            env_var
+        ))),
+        None => Err(bad(format!(
+            "no value: set {}, or run this on a terminal and type it",
+            env_var
+        ))),
+    }
+}
+
 use std::fs;
 use std::path::Path;
 
@@ -155,5 +226,61 @@ mod pending_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_argument_is_used_only_when_a_non_interactive_caller_allowed_it() {
+        // The shape `bench` and CI need, kept deliberately narrow: no terminal, the argument, and a
+        // caller that said yes.
+        let got = decide_secret_source(
+            Some("s3cr3t".into()),
+            "GESTA_X_TOKEN",
+            false,
+            true,
+            "token: ",
+        )
+        .expect("an allowed argument must be used");
+        assert_eq!(got, "s3cr3t");
+    }
+
+    #[test]
+    fn an_argument_is_refused_when_the_caller_did_not_allow_it() {
+        // `allow_arg=false` is how a command says "never from argv". The message must name the
+        // environment variable, because the useful answer to a refusal is where to put it instead.
+        let e = decide_secret_source(
+            Some("s3cr3t".into()),
+            "GESTA_X_TOKEN",
+            false,
+            false,
+            "token: ",
+        )
+        .expect_err("a disallowed argument must be refused");
+        let msg = format!("{e}");
+        assert!(msg.contains("GESTA_X_TOKEN"), "{msg}");
+        assert!(msg.contains("rather than as an argument"), "{msg}");
+    }
+
+    #[test]
+    fn no_terminal_and_no_argument_names_the_environment_variable() {
+        let e = decide_secret_source(None, "GESTA_X_TOKEN", false, true, "token: ")
+            .expect_err("nothing to use must be an error");
+        assert!(format!("{e}").contains("GESTA_X_TOKEN"));
+    }
+
+    #[test]
+    fn the_environment_wins_over_the_argument() {
+        // Set the variable the helper reads, then hand it a different argument: a token on the
+        // command line must not override the one the operator put in the environment.
+        let key = "GESTA_TEST_SECRET_SOURCE_TOKEN";
+        // SAFETY: this test owns the variable name; no other test reads or writes it.
+        unsafe { std::env::set_var(key, "from-env") };
+        let got = secret_not_in_argv(Some("from-argv".into()), key, "token: ", true).unwrap();
+        unsafe { std::env::remove_var(key) };
+        assert_eq!(got, "from-env");
     }
 }

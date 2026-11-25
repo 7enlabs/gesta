@@ -1652,10 +1652,16 @@ fn run() -> ZResult<()> {
                 user,
                 json,
             } => {
+                // The token comes from GESTA_FORGE_TOKEN or the terminal. It stays reachable as an
+                // argument only because a non-interactive caller has no terminal, and taking it that
+                // way is warned about: the flag's own documentation says "a token in an argument is a
+                // token in the shell history and in `ps`".
+                let token = cli::secret_not_in_argv(token, "GESTA_FORGE_TOKEN", "token: ", true)
+                    .map_err(|e| e.to_string())?;
                 if all {
-                    cli::cmd_forge_push_all(&url, token.as_deref(), &user, json)
+                    cli::cmd_forge_push_all(&url, Some(&token), &user, json)
                 } else {
-                    cli::cmd_forge_push(&url, &branch, &remote_ref, token.as_deref(), &user, json)
+                    cli::cmd_forge_push(&url, &branch, &remote_ref, Some(&token), &user, json)
                 }
             }
         },
@@ -1665,7 +1671,16 @@ fn run() -> ZResult<()> {
                 url,
                 token,
                 pin,
-            } => cli_remote::cmd_remote_add(&name, &url, token.as_deref(), pin.as_deref()),
+            } => {
+                let token = match token {
+                    Some(_) => Some(
+                        cli::secret_not_in_argv(token, "GESTA_REMOTE_TOKEN", "token: ", true)
+                            .map_err(|e| e.to_string())?,
+                    ),
+                    None => None,
+                };
+                cli_remote::cmd_remote_add(&name, &url, token.as_deref(), pin.as_deref())
+            }
             RemoteCmd::List => cli_remote::cmd_remote_list(),
             RemoteCmd::Token { sub } => match sub {
                 TokenCmd::Add {
@@ -1715,7 +1730,16 @@ fn run() -> ZResult<()> {
                 token,
                 pin,
                 depth,
-            } => cli_remote::cmd_clone(&url, &dir, token.as_deref(), pin.as_deref(), depth),
+            } => {
+                let token = match token {
+                    Some(_) => Some(
+                        cli::secret_not_in_argv(token, "GESTA_REMOTE_TOKEN", "token: ", true)
+                            .map_err(|e| e.to_string())?,
+                    ),
+                    None => None,
+                };
+                cli_remote::cmd_clone(&url, &dir, token.as_deref(), pin.as_deref(), depth)
+            }
         },
         Cmd::Secret { sub } => cli::cmd_secret(sub),
         Cmd::Land {

@@ -180,17 +180,30 @@ fn remote_target(
     })?;
     let (cfg, prefix) = crate::transport::s3::S3Config::from_url(&url)?;
 
-    let pass = match passphrase {
-        Some(p) => p,
-        None => std::env::var("GESTA_BACKUP_PASSPHRASE").map_err(|_| {
-            crate::error::Error::new(
+    // The passphrase came in as `--passphrase`, which is an argument, and an argument is in the
+    // process list and in the shell history. The comment above this function already said an
+    // environment passphrase is the one that stays out of both, so the order is: environment,
+    // terminal, and the argument only when there is no terminal to ask on.
+    let pass = match crate::cli::secret_not_in_argv(
+        passphrase,
+        "GESTA_BACKUP_PASSPHRASE",
+        "backup passphrase: ",
+        true,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            // Name what the seal protects, because a caller who gives up here is one step from
+            // shipping the whole history in the clear.
+            return Err(crate::error::Error::new(
                 crate::error::Code::Usage,
-                "a backup must be sealed, so it needs a passphrase: pass --passphrase or set \
-                 GESTA_BACKUP_PASSPHRASE. An unencrypted copy of the whole history in an object \
-                 store is a disclosure, not a backup."
-                    .to_string(),
+                format!(
+                    "a backup must be sealed, so it needs a passphrase: {}. An unencrypted copy of \
+                     the whole history in an object store is a disclosure, not a backup.",
+                    e
+                ),
             )
-        })?,
+            .into());
+        }
     };
     if pass.is_empty() {
         return Err(crate::error::Error::new(
