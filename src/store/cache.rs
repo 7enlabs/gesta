@@ -260,27 +260,11 @@ fn load_cache(conn: &Connection) -> ZResult<HashMap<String, (i64, i64, String)>>
     Ok(out)
 }
 
-/// Drop cache rows for paths that no longer exist. Keeping them would let a
-/// reintroduced file inherit a stale hash.
-/// Drop cache rows for paths that no longer exist.
+/// Drop cache rows whose paths are absent from the scan results.
 ///
-/// The first version read every cached path back and compared it in memory, which cost a second
-/// full pass over the table on every scan: 2.2 ms of a 28 ms scan on 8000 files, spent to discover
-/// that nothing had been deleted. The cache is about the common case, and the common case is that
-/// no file was removed, so this asks the database whether the count matches before reading a row.
-///
-/// The comparison itself is a temporary table and one DELETE. A path that is live is joined against
-/// `live`, and everything else goes, which is one statement no matter how many rows are stale.
+/// Equal counts do not prove equal membership. Populate a temporary live set and
+/// delete stale rows by membership, including when the two counts are equal.
 fn prune_cache(conn: &Connection, files: &[ScannedFile], binary: &[String]) -> ZResult<()> {
-    let cached: i64 = conn.query_row("SELECT COUNT(*) FROM worktree_cache", [], |r| r.get(0))?;
-    let live_count = (files.len() + binary.len()) as i64;
-    // Equal counts do not prove the sets are equal, but a removal is the only thing that makes them
-    // differ, and a row is written for every path the walk saw. The check below still runs when the
-    // counts differ, and the difference is what it is for.
-    if cached == live_count {
-        return Ok(());
-    }
-
     conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS live_paths(path TEXT PRIMARY KEY);")?;
     conn.execute("DELETE FROM live_paths", [])?;
     {
@@ -334,6 +318,55 @@ mod tests {
     use crate::store::tests::mem_db;
     #[cfg(unix)]
     use crate::store::walk::read_bytes;
+
+    #[test]
+    fn pruning_compares_membership_when_counts_are_equal() {
+        let conn = mem_db();
+        conn.execute_batch(
+            "INSERT INTO worktree_cache(path, mtime, size, hash) VALUES
+             ('stale.txt', 0, 1, 'old'), ('keep.bin', 0, 1, 'binary');",
+        )
+        .unwrap();
+        let files = vec![ScannedFile {
+            rel: "new.txt".into(),
+            hash: "new".into(),
+            content: String::new(),
+            mode: "100644".into(),
+        }];
+        prune_cache(&conn, &files, &["keep.bin".into()]).unwrap();
+        let rows = load_cache(&conn).unwrap();
+        assert!(
+            !rows.contains_key("stale.txt"),
+            "equal counts must not retain a stale row"
+        );
+        assert!(rows.contains_key("keep.bin"));
+        assert_eq!(rows.len(), 1);
+
+        prune_cache(&conn, &[], &[]).unwrap();
+        assert!(load_cache(&conn).unwrap().is_empty());
+        prune_cache(&conn, &[], &[]).unwrap();
+        assert!(load_cache(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_scan_replaces_deleted_paths_without_retaining_cache_rows() {
+        let root = tmpdir("replaced_path");
+        fs::write(root.join("old.txt"), "old\n").unwrap();
+        let conn = mem_db();
+        let rules = IgnoreRules::with_defaults(&[]);
+        let attrs = crate::support::attributes::Rules::default();
+        scan_with_cache(&conn, &root, &rules, &attrs).unwrap();
+        fs::remove_file(root.join("old.txt")).unwrap();
+        fs::write(root.join("new.txt"), "new\n").unwrap();
+        let scan = scan_with_cache(&conn, &root, &rules, &attrs).unwrap();
+        assert_eq!(scan.files.len(), 1);
+        assert_eq!(scan.files[0].rel, "new.txt");
+        let rows = load_cache(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows.contains_key("new.txt"));
+        assert!(!rows.contains_key("old.txt"));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     /// Move a file's mtime into the past so it is outside the racy window.
     fn backdate(p: &std::path::Path, secs: u64) {
