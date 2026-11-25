@@ -157,6 +157,16 @@ pub fn cmd_stash(sub: crate::StashCmd, json: bool) -> ZResult<()> {
     }
 }
 
+/// A label short enough for a one-line message, cut on a character boundary.
+///
+/// The message a person reads names the two ends of the search, and those are branch or tag names,
+/// not hex ids: cutting bytes at 14 splits a multi-byte character and panics on the very input the
+/// command is supposed to accept. Counting characters costs one pass over at most a few dozen bytes
+/// and turns a crash into a label.
+fn short_label(s: &str) -> String {
+    s.chars().take(14).collect()
+}
+
 pub fn cmd_bisect(sub: crate::BisectCmd) -> ZResult<()> {
     use crate::BisectCmd;
     match sub {
@@ -175,8 +185,8 @@ pub fn cmd_bisect(sub: crate::BisectCmd) -> ZResult<()> {
             println!(
                 "bisecting {} candidate(s) between {} and {}",
                 s.candidates.len(),
-                &good[..good.len().min(14)],
-                &bad_point[..bad_point.len().min(14)]
+                short_label(&good),
+                short_label(&bad_point)
             );
             // The first question comes right away, so the caller never has to
             // make a separate "what next" call before testing anything.
@@ -476,5 +486,29 @@ pub fn cmd_notes(sub: crate::NotesCmd) -> ZResult<()> {
                 Err(bad(format!("no note on {changeset}")))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::short_label;
+
+    #[test]
+    fn a_long_revision_name_is_cut_without_panicking() {
+        // `é` is two bytes, so thirteen ASCII bytes followed by it put byte 14 inside that
+        // character. The panic this replaces was a crash on an ordinary branch name, not an invalid
+        // one, and it could happen after the session row was already written.
+        let name = format!("{}\u{e9}", "a".repeat(13));
+        let label = short_label(&name);
+        assert_eq!(label.chars().count(), 14);
+        // The whole character survives: a byte cut would have produced "aaaaaaaaaaaaa" plus a
+        // half-written é, or panicked before producing anything.
+        assert_eq!(label, format!("{}\u{e9}", "a".repeat(13)));
+    }
+
+    #[test]
+    fn a_short_name_is_kept_whole() {
+        assert_eq!(short_label("main"), "main");
+        assert_eq!(short_label(""), "");
     }
 }
