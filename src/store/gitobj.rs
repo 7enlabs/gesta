@@ -310,19 +310,28 @@ impl Repo {
         }
     }
 
-    fn object_path(&self, hash: &str) -> PathBuf {
+    fn object_path(&self, hash: &str) -> ZResult<PathBuf> {
+        // Validate before slicing or joining: names can come from refs in another repository.
+        if hash.len() != self.hash.hex_len() || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(bad(format!(
+                "invalid object name for {}: {:?}",
+                self.hash.as_str(),
+                hash
+            )));
+        }
         // Loose objects are split by the first two characters, which keeps any one directory to
         // a workable number of entries.
-        self.git_dir
+        Ok(self
+            .git_dir
             .join("objects")
             .join(&hash[..2])
-            .join(&hash[2..])
+            .join(&hash[2..]))
     }
 
     /// Write an object and return its name. An object already present is not rewritten.
     pub fn write_object(&self, kind: Kind, body: &[u8]) -> ZResult<String> {
         let hash = self.object_hash(kind, body);
-        let path = self.object_path(&hash);
+        let path = self.object_path(&hash)?;
         if path.exists() {
             return Ok(hash);
         }
@@ -344,7 +353,7 @@ impl Repo {
 
     /// Read an object by name.
     pub fn read_object(&self, hash: &str) -> ZResult<Object> {
-        let path = self.object_path(hash);
+        let path = self.object_path(hash)?;
         if !path.exists() {
             // Everything can be inside a packfile instead. A repository that has been through
             // `git gc` holds no loose objects at all, and refusing it made an import of any real
@@ -709,6 +718,58 @@ fn kind_code(k: &Kind) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_object_names_are_refused_before_filesystem_access() {
+        for hash_kind in [HashKind::Sha1, HashKind::Sha256] {
+            let repo = Repo {
+                git_dir: PathBuf::from("unused-object-name-fixture"),
+                hash: hash_kind,
+            };
+            let width = hash_kind.hex_len();
+            for name in [
+                String::new(),
+                "a".into(),
+                "é".into(),
+                "aé".into(),
+                "a".repeat(width - 1),
+                "a".repeat(width + 1),
+                "g".repeat(width),
+                format!("../{}", "a".repeat(width - 3)),
+                "a/".repeat(width / 2),
+            ] {
+                let err = repo
+                    .read_object(&name)
+                    .expect_err("malformed names must be refused");
+                assert!(
+                    err.to_string().contains("invalid object name"),
+                    "wrong refusal for {name:?}: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn valid_object_names_round_trip_in_both_formats() {
+        let dir =
+            std::env::temp_dir().join(format!("gesta-valid-object-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for hash in [HashKind::Sha1, HashKind::Sha256] {
+            let repo = Repo {
+                git_dir: dir.join(hash.as_str()),
+                hash,
+            };
+            let name = repo
+                .write_object(Kind::Blob, b"object name validation\n")
+                .unwrap();
+            assert_eq!(name.len(), hash.hex_len());
+            assert_eq!(
+                repo.read_object(&name).unwrap().body,
+                b"object name validation\n"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// The SHA-1 of "abc" is published, and a hashing mistake here would name every object
     /// wrongly while looking fine.
