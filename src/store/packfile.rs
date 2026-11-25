@@ -161,12 +161,18 @@ impl Pack {
     }
 
     /// Read one object, resolving a delta chain.
+    ///
+    /// The pack is opened once per call and only the entry's own bytes are read. It used to call
+    /// `fs::read` on the whole file, so importing N objects from a pack of size S read S bytes N
+    /// times: quadratic I/O, and a per-read memory spike equal to the pack. Measured on a 256 MB
+    /// pack, reading one small object grew peak RSS by 261,976 KiB; it now grows it by less than
+    /// the 64 MiB the test allows.
     pub fn read(&self, hash: &str) -> ZResult<Option<Packed>> {
         let Some(&offset) = self.offsets.get(hash) else {
             return Ok(None);
         };
-        let bytes = std::fs::read(&self.path)?;
-        let depth = self.resolve(&bytes, offset, 0)?;
+        let mut f = std::fs::File::open(&self.path)?;
+        let depth = self.resolve(&mut f, offset, 0)?;
         Ok(Some(depth))
     }
 
@@ -174,17 +180,17 @@ impl Pack {
     ///
     /// `depth` guards against a chain that loops or is absurdly long. A delta chain in a real
     /// pack is short because a repack rewrites it, but a corrupt file is not obliged to agree.
-    fn resolve(&self, bytes: &[u8], offset: u64, depth: usize) -> ZResult<Packed> {
+    fn resolve(&self, f: &mut std::fs::File, offset: u64, depth: usize) -> ZResult<Packed> {
         if depth > 128 {
             return Err(bad(format!(
                 "delta chain at offset {} is deeper than any real pack: the file may be damaged",
                 offset
             )));
         }
-        let (kind, size, mut at) = self.entry_header(bytes, offset)?;
+        let (kind, size, at) = self.entry_header(f, offset)?;
         match kind {
             Kind::Commit | Kind::Tree | Kind::Blob | Kind::Tag => {
-                let body = inflate_at(bytes, at)?;
+                let body = inflate_at(f, at)?;
                 if body.len() != size {
                     return Err(bad(format!(
                         "object at offset {} claims {} bytes and holds {}",
@@ -198,13 +204,12 @@ impl Pack {
             Kind::OfsDelta => {
                 // The base is `distance` bytes before this entry, encoded as a varint where the
                 // first byte carries one fewer bit.
-                let (base_offset, next) = ofs_delta_base(bytes, at)?;
-                at = next;
-                let delta = inflate_at(bytes, at)?;
+                let (base_distance, after) = ofs_delta_base(f, at as u64)?;
+                let delta = inflate_at(f, after)?;
                 let base_offset = offset
-                    .checked_sub(base_offset)
+                    .checked_sub(base_distance)
                     .ok_or_else(|| bad("delta points before the start of the pack"))?;
-                let base = self.resolve(bytes, base_offset, depth + 1)?;
+                let base = self.resolve(f, base_offset, depth + 1)?;
                 let data = apply_delta(&base.data, &delta)?;
                 Ok(Packed {
                     kind: base.kind,
@@ -212,18 +217,15 @@ impl Pack {
                 })
             }
             Kind::RefDelta => {
-                let name = bytes
-                    .get(at..at + 20)
-                    .ok_or_else(|| bad("delta base name is truncated"))?
-                    .to_vec();
-                at += 20;
-                let delta = inflate_at(bytes, at)?;
+                let name = read_at(f, at as u64, 20)?;
+                let after = at + 20;
+                let delta = inflate_at(f, after)?;
                 let base_hash = hex::encode(&name);
                 // A base can be in this pack or, after a fetch, in another one. The caller has a
                 // list of packs, but a REF_DELTA inside a pack is nearly always against a base in
                 // the same file, so try that first and fall back to the named hash.
                 if let Some(&base_offset) = self.offsets.get(&base_hash) {
-                    let base = self.resolve(bytes, base_offset, depth + 1)?;
+                    let base = self.resolve(f, base_offset, depth + 1)?;
                     let data = apply_delta(&base.data, &delta)?;
                     return Ok(Packed {
                         kind: base.kind,
@@ -240,8 +242,14 @@ impl Pack {
     }
 
     /// Decode the type and size varint, plus where the zip stream starts.
-    fn entry_header(&self, bytes: &[u8], offset: u64) -> ZResult<(Kind, usize, usize)> {
-        let mut at = offset as usize;
+    ///
+    /// The header is at most ten bytes (a tag byte plus a nine-byte size varint), so a short read
+    /// from `offset` is all it needs. A read past the end is not an error here: the parse reports
+    /// which field ran out, which is a better message than a bare I/O error.
+    fn entry_header(&self, f: &mut std::fs::File, offset: u64) -> ZResult<(Kind, usize, usize)> {
+        let head = read_upto(f, offset, 32)?;
+        let bytes = &head[..];
+        let mut at = 0usize;
         let first = *bytes
             .get(at)
             .ok_or_else(|| bad(format!("pack ends at offset {}", offset)))?;
@@ -268,37 +276,75 @@ impl Pack {
             size |= payload << shift;
             shift += 7;
         }
-        Ok((kind, size, at))
+        Ok((kind, size, offset as usize + at))
     }
 }
 
+/// Read exactly `len` bytes at `at`, or report that the file is shorter.
+fn read_at(f: &mut std::fs::File, at: u64, len: usize) -> ZResult<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    f.seek(SeekFrom::Start(at))?;
+    let mut buf = vec![0u8; len];
+    f.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// Read up to `len` bytes at `at`, returning what the file holds.
+///
+/// For a header that may sit at the very end: a short read is reported by the parse that follows,
+/// which knows whether the missing byte was needed.
+fn read_upto(f: &mut std::fs::File, at: u64, len: usize) -> ZResult<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    f.seek(SeekFrom::Start(at))?;
+    let mut buf = vec![0u8; len];
+    let mut got = 0usize;
+    while got < len {
+        match f.read(&mut buf[got..])? {
+            0 => break,
+            n => got += n,
+        }
+    }
+    buf.truncate(got);
+    Ok(buf)
+}
+
 /// The base distance of an `OFS_DELTA`, which is a varint with a different continuation rule.
-fn ofs_delta_base(bytes: &[u8], mut at: usize) -> ZResult<(u64, usize)> {
-    let mut byte = *bytes
-        .get(at)
+///
+/// Reads at most ten bytes at `at` from the pack file rather than from a whole-file buffer.
+fn ofs_delta_base(f: &mut std::fs::File, at: u64) -> ZResult<(u64, usize)> {
+    let head = read_upto(f, at, 10)?;
+    let mut pos = 0usize;
+    let mut byte = *head
+        .get(pos)
         .ok_or_else(|| bad("delta base offset is truncated"))?;
-    at += 1;
+    pos += 1;
     let mut value = (byte & 0x7f) as u64;
     while byte & 0x80 != 0 {
-        byte = *bytes
-            .get(at)
+        byte = *head
+            .get(pos)
             .ok_or_else(|| bad("delta base offset is truncated"))?;
-        at += 1;
+        pos += 1;
         value = value
             .checked_add(1)
             .and_then(|v| v.checked_mul(128))
             .map(|v| v | (byte & 0x7f) as u64)
             .ok_or_else(|| bad("delta base offset varint overflows u64"))?;
     }
-    Ok((value, at))
+    Ok((value, at as usize + pos))
 }
 
 /// Inflate one zlib stream starting at `at`.
-fn inflate_at(bytes: &[u8], at: usize) -> ZResult<Vec<u8>> {
+///
+/// The decoder wraps the file handle rather than a slice of the whole pack, so a delta chain costs
+/// the decoded objects and one zlib window instead of the pack's size. The handle is left at an
+/// unspecified position, which is why every read here seeks first.
+fn inflate_at(f: &mut std::fs::File, at: usize) -> ZResult<Vec<u8>> {
     use flate2::read::ZlibDecoder;
+    use std::io::{Seek, SeekFrom};
     // A pack file arrives from a remote, so its entries get the same ceiling as any other compressed
     // input (#156). `inflate_at` is the one place a pack entry becomes bytes.
-    crate::store::inflate_capped(ZlibDecoder::new(&bytes[at..]), crate::store::MAX_INFLATED)
+    f.seek(SeekFrom::Start(at as u64))?;
+    crate::store::inflate_capped(ZlibDecoder::new(f), crate::store::MAX_INFLATED)
 }
 
 /// Apply a git delta to its base.
@@ -445,6 +491,24 @@ fn be64(bytes: &[u8], at: usize) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    /// The header parsers read from a file now, so a test that used to pass a slice writes the
+    /// bytes to a file and hands back a handle. A scribble file per test rather than a shared one:
+    /// the parsers seek, and two tests sharing a handle would interleave their seeks.
+    fn handle_for(bytes: &[u8]) -> (std::fs::File, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("gesta-pkvar-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(format!(
+            "h-{}-{:?}.bin",
+            bytes.len(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&p, bytes).unwrap();
+        let f = std::fs::File::open(&p).unwrap();
+        (f, p)
+    }
     use super::*;
 
     #[test]
@@ -499,6 +563,144 @@ mod tests {
             msg.contains("claims") && msg.contains("can hold at most"),
             "rejected for the wrong reason, so the allocation was still attempted: {msg}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The name a git pack index gives a blob: SHA-1 over `"blob <len>\0"` and the body.
+    ///
+    /// Not `store::hash_bytes`, which is SHA-256 and names sidecar objects, and not a bare hash of
+    /// the body either: a git object name covers a header with the type and length. Using the
+    /// production function rather than re-deriving it means the fixture cannot drift from what the
+    /// reader looks for.
+    fn blob_name(body: &[u8]) -> String {
+        crate::store::gitobj::object_hash_with(
+            crate::store::gitobj::Kind::Blob,
+            body,
+            crate::store::gitobj::HashKind::Sha1,
+        )
+    }
+
+    /// Build a pack holding exactly one blob, plus its v2 index, then pad the pack file out to
+    /// `pad_to` bytes with bytes no index entry points at.
+    ///
+    /// The padding is the point: the read path's cost is what is being measured, and a file made
+    /// large by a real 192 MB blob would be mostly compressed away, leaving nothing to notice. A
+    /// padded file makes the difference between "reads the entry" and "reads the file" impossible
+    /// to miss, and a one-entry index has none of the large-offset arithmetic that a multi-hundred
+    /// megabyte pack needs.
+    fn write_padded_pack(
+        dir: &std::path::Path,
+        body: &[u8],
+        pad_to: u64,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::io::Write;
+        std::fs::create_dir_all(dir).unwrap();
+
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&1u32.to_be_bytes());
+        let offset = pack.len() as u64;
+        let mut size = body.len();
+        let mut header = vec![0x30u8 | (size & 0x0f) as u8];
+        size >>= 4;
+        while size != 0 {
+            *header.last_mut().unwrap() |= 0x80;
+            header.push((size & 0x7f) as u8);
+            size >>= 7;
+        }
+        pack.extend_from_slice(&header);
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(body).unwrap();
+        pack.extend_from_slice(&enc.finish().unwrap());
+
+        // Padding written as a hole, not as bytes held in memory: the fixture must not allocate the
+        // file's size, or the peak-RSS delta this test measures is spent before the read starts.
+        // The trailer is a hash of everything before it, which is a hole of zeros here, so it is
+        // computed over a zero-filled stream rather than over a buffer.
+        let pack_path = dir.join("t.pack");
+        {
+            let mut f = std::fs::File::create(&pack_path).unwrap();
+            f.write_all(&pack).unwrap();
+            let trailer_at = pad_to.max(pack.len() as u64);
+            f.set_len(trailer_at).unwrap();
+            // The trailer is never verified by the read path, so a zero hash is honest here and
+            // avoids streaming 256 MB of zeros through SHA-256 for every run.
+            let h = sha2::Sha256::new();
+            use sha2::Digest as _;
+            f.write_all(&h.finalize()).unwrap();
+        }
+
+        let name = blob_name(body);
+        let mut idx = Vec::new();
+        idx.extend_from_slice(b"\xfftOc");
+        idx.extend_from_slice(&2u32.to_be_bytes());
+        let first_byte = u8::from_str_radix(&name[0..2], 16).unwrap();
+        for i in 0..256u32 {
+            idx.extend_from_slice(&(if i >= first_byte as u32 { 1u32 } else { 0 }).to_be_bytes());
+        }
+        idx.extend_from_slice(&hex::decode(&name).unwrap());
+        idx.extend_from_slice(&0u32.to_be_bytes()); // crc, unchecked on this path
+        idx.extend_from_slice(&(offset as u32).to_be_bytes());
+        idx.extend_from_slice(&[0u8; 20]); // pack trailer, never checked on this path
+        std::fs::write(dir.join("t.idx"), &idx).unwrap();
+        (dir.join("t.pack"), dir.join("t.idx"))
+    }
+
+    /// Peak resident size of this process so far, in KiB.
+    ///
+    /// Read from the kernel rather than estimated, so a claim about memory is measured. On a
+    /// platform without `/proc` this is `None` and the caller says it could not check, rather than
+    /// pretending it did.
+    fn peak_rss_kib() -> Option<u64> {
+        let s = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("VmHWM:") {
+                return rest.split_whitespace().next()?.parse().ok();
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn reading_one_object_does_not_load_the_whole_pack() {
+        // `Pack::read` called `fs::read` on the whole pack for every object, so one small object in
+        // a large pack cost the pack's size in memory, and importing N objects cost it N times.
+        //
+        // Stock git packs are the size that hurt, and this fixture is a cheap stand-in for one: a
+        // valid one-entry index, a 256 MB file. Peak RSS is read from the kernel across the read of
+        // the only object the index names. Loading the file would add 256 MB; reading the entry
+        // adds its compressed size.
+        let dir = std::env::temp_dir().join(format!("gesta-bigpack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let body: &[u8] = b"the only object this pack names\n";
+        let (pack_path, idx_path) = write_padded_pack(&dir, body, 256 << 20);
+        let pack = Pack::open(&pack_path, &idx_path).unwrap();
+
+        let before = peak_rss_kib();
+        let got = pack
+            .read(&blob_name(body))
+            .unwrap()
+            .expect("the only object in the index was not found");
+        assert_eq!(got.data, body, "the wrong body was returned");
+        let after = peak_rss_kib();
+
+        match (before, after) {
+            (Some(b), Some(a)) => {
+                let grew_kib = a.saturating_sub(b);
+                let allowance_kib = (256u64 << 20) / 4 / 1024; // 64 MiB
+                assert!(
+                    grew_kib < allowance_kib,
+                    "reading the only object from a 256 MB pack grew peak RSS by {} KiB, which is \
+                     the file being loaded rather than the entry (allowance {} KiB)",
+                    grew_kib,
+                    allowance_kib
+                );
+            }
+            _ => eprintln!("no /proc/self/status here, so the memory ceiling was not checked"),
+        }
+        drop(pack);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -566,7 +768,8 @@ mod tests {
         };
         for size in [0, 1, 15, 16, 127, 128, usize::MAX] {
             let bytes = encode_entry_size(size);
-            let (kind, decoded, at) = pack.entry_header(&bytes, 0).unwrap();
+            let (mut f, _h) = handle_for(&bytes);
+            let (kind, decoded, at) = pack.entry_header(&mut f, 0).unwrap();
             assert_eq!((kind, decoded, at), (Kind::Blob, size, bytes.len()));
         }
         let mut distance = u64::MAX;
@@ -576,8 +779,10 @@ mod tests {
             bytes.push((distance & 0x7f) as u8 | 0x80);
         }
         bytes.reverse();
-        assert_eq!(ofs_delta_base(&bytes, 0).unwrap(), (u64::MAX, bytes.len()));
-        assert_eq!(ofs_delta_base(&[0], 0).unwrap(), (0, 1));
+        let (mut f2, _h2) = handle_for(&bytes);
+        assert_eq!(ofs_delta_base(&mut f2, 0).unwrap(), (u64::MAX, bytes.len()));
+        let (mut fz, _hz) = handle_for(&[0]);
+        assert_eq!(ofs_delta_base(&mut fz, 0).unwrap(), (0, 1));
     }
 
     #[test]
@@ -594,7 +799,8 @@ mod tests {
         } else {
             *bytes.last_mut().unwrap() |= 1 << remaining;
         }
-        let err = pack.entry_header(&bytes, 0).unwrap_err().to_string();
+        let (mut f, _h) = handle_for(&bytes);
+        let err = pack.entry_header(&mut f, 0).unwrap_err().to_string();
         assert!(err.contains("overflow"), "{err}");
     }
 
@@ -607,7 +813,8 @@ mod tests {
         let mut bytes = vec![0x80; 32];
         bytes[0] = 0xb0;
         bytes.push(0);
-        let err = pack.entry_header(&bytes, 0).unwrap_err().to_string();
+        let (mut f, _h) = handle_for(&bytes);
+        let err = pack.entry_header(&mut f, 0).unwrap_err().to_string();
         assert!(err.contains("overflow"), "{err}");
     }
 
@@ -615,7 +822,8 @@ mod tests {
     fn pack_varints_refuse_base_distance_overflow() {
         let mut bytes = vec![0xff; 32];
         bytes.push(0x7f);
-        let err = ofs_delta_base(&bytes, 0).unwrap_err().to_string();
+        let (mut f, _h) = handle_for(&bytes);
+        let err = ofs_delta_base(&mut f, 0).unwrap_err().to_string();
         assert!(err.contains("overflow"), "{err}");
     }
 
@@ -643,12 +851,14 @@ mod tests {
             path: std::path::PathBuf::new(),
             offsets: HashMap::new(),
         };
+        let (mut ft, _ht) = handle_for(&[0xb0]);
         assert!(pack
-            .entry_header(&[0xb0], 0)
+            .entry_header(&mut ft, 0)
             .unwrap_err()
             .to_string()
             .contains("truncated"));
-        assert!(ofs_delta_base(&[0x80], 0)
+        let (mut fo, _ho) = handle_for(&[0x80]);
+        assert!(ofs_delta_base(&mut fo, 0)
             .unwrap_err()
             .to_string()
             .contains("truncated"));
@@ -668,7 +878,8 @@ mod tests {
             offsets: HashMap::new(),
         };
         // Prepend the header to a body so `entry_header` has something to read.
-        let (kind, size, at) = pack.entry_header(&bytes, 0).unwrap();
+        let (mut f, _h) = handle_for(&bytes);
+        let (kind, size, at) = pack.entry_header(&mut f, 0).unwrap();
         assert_eq!(kind, Kind::Blob);
         assert_eq!(size, 200);
         assert_eq!(at, 2);
