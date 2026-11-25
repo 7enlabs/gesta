@@ -73,6 +73,12 @@ A read decompresses one group, which is 50 objects rather than the whole store, 
 bounded on purpose. A repository too small to benefit forms no group at all, so a hundred small files
 do not pay for a mechanism they do not need.
 
+GC removes an unreachable sidecar file before deleting its object row. A missing file is already
+reclaimed; other removal errors stop GC and keep the row for a retry. It also deletes group blobs
+with no remaining members before vacuuming the database. A partially live group retains its dead
+members' bytes until the last live member becomes unreachable; GC does not compact those streams.
+Files left without object rows by an older GC are not swept by this change.
+
 One thing this cost, and it is why the constant is 50: a read is now proportional to its group rather
 than to one object. At 50 objects that is a few hundred kilobytes of decompression for a few kilobytes
 of answer. At 1000 it measured almost no extra saving and a much worse read.

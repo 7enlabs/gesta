@@ -2340,6 +2340,10 @@ pub fn object_count(conn: &Connection) -> ZResult<i64> {
 /// or a shallow snapshot, or is a transitive base of a reachable delta. External git packfiles are
 /// separate from this store; a `git gc` on an export handles them.
 pub fn gc(conn: &Connection) -> ZResult<u64> {
+    // Hold the writer lock from root discovery through deletion so references cannot be added
+    // between the live-set snapshot and removal of an object's external bytes.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let root = db_root(conn);
     let mut reachable: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Commits and their trees.
@@ -2422,14 +2426,26 @@ pub fn gc(conn: &Connection) -> ZResult<u64> {
     }
 
     // Delete every object not in the reachable set.
-    let all: Vec<String> = {
-        let mut stmt = conn.prepare("SELECT hash FROM objects")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        rows.filter_map(|r| r.ok()).collect()
+    let all: Vec<(String, bool)> = {
+        let mut stmt = conn.prepare("SELECT hash, sidecar FROM objects")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
     };
     let mut deleted = 0u64;
-    for hash in all {
+    for (hash, external) in all {
         if !reachable.contains(&hash) {
+            if external {
+                let root = root.as_deref().ok_or_else(|| {
+                    bad("cannot collect a sidecar object without a repository root")
+                })?;
+                // Remove only unreachable bytes. Keep the row if removal fails so a later GC
+                // retries; a missing file is already reclaimed, including after an interrupted GC.
+                match std::fs::remove_file(sidecar::path_for(root, &hash)?) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
             conn.execute(
                 "DELETE FROM objects WHERE hash = ?1",
                 rusqlite::params![&hash],
@@ -2437,6 +2453,15 @@ pub fn gc(conn: &Connection) -> ZResult<u64> {
             deleted += 1;
         }
     }
+
+    // Partial groups retain their compressed stream and offsets; only a group with no remaining
+    // members can be reclaimed without rewriting live objects.
+    conn.execute(
+        "DELETE FROM object_groups WHERE NOT EXISTS
+         (SELECT 1 FROM objects WHERE objects.group_id = object_groups.id)",
+        [],
+    )?;
+    tx.commit()?;
 
     // Vacuum to reclaim space and rebuild indexes.
     conn.execute("VACUUM", [])?;
@@ -2805,6 +2830,113 @@ pub(crate) mod tests {
             checked,
             offenders.join("\n  ")
         );
+    }
+
+    fn gc_disk_repo(label: &str) -> (Connection, PathBuf) {
+        let root = std::env::temp_dir().join(format!("gesta-gc-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".gesta")).unwrap();
+        let conn = open_db(&root).unwrap();
+        init_schema(&conn).unwrap();
+        (conn, root)
+    }
+
+    #[test]
+    fn gc_reclaims_dead_sidecars_and_preserves_live_bytes() {
+        let (conn, root) = gc_disk_repo("sidecars");
+        let live = vec![7; sidecar::INLINE_LIMIT];
+        let dead = vec![9; sidecar::INLINE_LIMIT];
+        let kept = put_object_bytes(&conn, &live).unwrap();
+        let removed = put_object_bytes(&conn, &dead).unwrap();
+        conn.execute(
+            "INSERT INTO snapshot_objects(path, hash) VALUES('live.bin', ?1)",
+            params![kept],
+        )
+        .unwrap();
+        assert_eq!(sidecar::stats(&root), (2, (live.len() + dead.len()) as u64));
+        assert_eq!(gc(&conn).unwrap(), 1);
+        assert!(!sidecar::path_for(&root, &removed).unwrap().exists());
+        assert_eq!(sidecar::stats(&root), (1, live.len() as u64));
+        assert_eq!(get_object_bytes(&conn, &kept).unwrap(), live);
+        assert_eq!(gc(&conn).unwrap(), 0);
+        drop(conn);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gc_accepts_missing_dead_sidecars_but_reports_removal_errors() {
+        let (conn, root) = gc_disk_repo("sidecar-errors");
+        let hash = put_object_bytes(&conn, &vec![3; sidecar::INLINE_LIMIT]).unwrap();
+        let path = sidecar::path_for(&root, &hash).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        // A directory at the object path fails removal on Linux and Windows, even as root.
+        std::fs::create_dir(&path).unwrap();
+        assert!(gc(&conn).is_err());
+        assert_eq!(
+            object_count(&conn).unwrap(),
+            1,
+            "keep the row so cleanup can retry"
+        );
+        std::fs::remove_dir(&path).unwrap();
+        assert_eq!(gc(&conn).unwrap(), 1);
+        assert_eq!(gc(&conn).unwrap(), 0);
+        drop(conn);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gc_waits_for_a_writer_before_deleting_sidecars() {
+        let (conn, root) = gc_disk_repo("writer");
+        let body = vec![5; sidecar::INLINE_LIMIT];
+        let hash = put_object_bytes(&conn, &body).unwrap();
+        let writer = open_db(&root).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        writer
+            .execute(
+                "INSERT INTO snapshot_objects(path, hash) VALUES('pending.bin', ?1)",
+                params![hash],
+            )
+            .unwrap();
+        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        assert!(
+            gc(&conn).is_err(),
+            "GC must not use a stale live set while a writer owns the lock"
+        );
+        assert_eq!(get_object_bytes(&conn, &hash).unwrap(), body);
+        writer.execute_batch("COMMIT").unwrap();
+        assert_eq!(gc(&conn).unwrap(), 0);
+        assert_eq!(get_object_bytes(&conn, &hash).unwrap(), body);
+        drop(writer);
+        drop(conn);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gc_drops_empty_groups_but_preserves_partially_live_groups() {
+        let conn = mem_db();
+        let hashes: Vec<String> = (0..50)
+            .map(|i| {
+                let text: String = (0..100)
+                    .map(|j| format!("group member {i} source line {j}\n"))
+                    .collect();
+                put_object(&conn, &text).unwrap()
+            })
+            .collect();
+        assert_eq!(pack::repack(&conn).unwrap(), (1, 50));
+        let kept = &hashes[0];
+        let bytes = get_object_bytes(&conn, kept).unwrap();
+        conn.execute(
+            "INSERT INTO snapshot_objects(path, hash) VALUES('member.txt', ?1)",
+            params![kept],
+        )
+        .unwrap();
+        assert_eq!(gc(&conn).unwrap(), 49);
+        assert_eq!(pack::group_stats(&conn).unwrap().0, 1);
+        assert_eq!(get_object_bytes(&conn, kept).unwrap(), bytes);
+        conn.execute("DELETE FROM snapshot_objects", []).unwrap();
+        assert_eq!(gc(&conn).unwrap(), 1);
+        assert_eq!(pack::group_stats(&conn).unwrap(), (0, 0, 0));
+        assert_eq!(gc(&conn).unwrap(), 0);
     }
 
     #[test]
