@@ -40,6 +40,12 @@ webpki-roots = { version = "0.26", optional = true }
 # Self-signed certificate generation for `serve --tls self-signed`, so a private
 # network can be encrypted without an external CA.
 rcgen = { version = "0.13", optional = true }
+# Reading the validity window out of a certificate. A pin says which certificate to trust, not
+# for how long, so the expiry still has to be checked. A hand written DER walk was measured
+# working, but it is a parser for a hostile input format with one reviewer and no fuzzing; this
+# has both. It is behind the same feature as the rest of TLS, so a build without TLS does not
+# carry it. The extra crates are ASN.1 machinery and `nom`, which was already in the tree.
+x509-parser = { version = "0.18", optional = true }
 # Signal handling for `serve`. Already in the tree through other crates, so naming it
 # costs no new code; it is declared because the accept loop needs `sigaction` to hear
 # SIGTERM, and a server that ignores SIGTERM leaks a process per run.
@@ -62,7 +68,7 @@ winfsp-sys = "0.12.1"
 
 [features]
 default = ["tls", "regex"]
-tls = ["dep:rustls", "dep:rustls-pki-types", "dep:webpki-roots", "dep:rcgen"]
+tls = ["dep:rustls", "dep:rustls-pki-types", "dep:webpki-roots", "dep:rcgen", "dep:x509-parser"]
 regex = ["dep:regex"]
 
 [profile.release]

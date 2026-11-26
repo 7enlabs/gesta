@@ -257,6 +257,46 @@ pub fn accept(stream: TcpStream, cfg: Arc<ServerConfig>) -> ZResult<TlsStream> {
     Ok(TlsStream::Server(Box::new(StreamOwned::new(conn, stream))))
 }
 
+/// The validity window of a certificate, read from the parsed certificate itself.
+///
+/// A pin says "trust this exact certificate". It never said "trust it forever", so the window
+/// still has to be checked: a certificate that expired was not made valid again by having its
+/// fingerprint written into a config file.
+///
+/// This is deliberately built on `x509-parser` rather than a hand written DER walk. A walk to
+/// `TBSCertificate.validity` is only a few dozen lines and was measured working, but it is a
+/// parser for a hostile input format, and it would ship with one reviewer and no fuzzing. This
+/// crate has had both for years, and its answers carry a published advisory feed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Validity {
+    not_before: i64,
+    not_after: i64,
+}
+
+impl Validity {
+    /// Read the window. `None` means the certificate did not parse, which is a rejection: a pin
+    /// that cannot be checked is not a pin that can be trusted.
+    fn read(der: &[u8]) -> Option<Self> {
+        let (_, cert) = x509_parser::parse_x509_certificate(der).ok()?;
+        let v = cert.validity();
+        Some(Self {
+            not_before: v.not_before.timestamp(),
+            not_after: v.not_after.timestamp(),
+        })
+    }
+
+    /// A certificate is valid from `not_before` up to, but not including, `not_after`. The
+    /// exclusive upper bound matches how `webpki` decides it for a certificate from a public
+    /// root, so the pinned path and the public root path cannot disagree about the instant a
+    /// certificate dies.
+    fn accepts(&self, now: UnixTime) -> bool {
+        // i64, not u64: `UTCTime` years 50..99 are 1950..1999, so a window can legitimately sit
+        // before the Unix epoch. Comparing as unsigned would clamp that to zero.
+        let t = i64::try_from(now.as_secs()).unwrap_or(i64::MAX);
+        self.not_before <= t && t < self.not_after
+    }
+}
+
 /// Accept exactly one certificate, identified by its SHA-256 fingerprint.
 ///
 /// This is trust on first use, made explicit: the operator runs the server once,
@@ -275,19 +315,33 @@ impl ServerCertVerifier for PinnedCert {
         _intermediates: &[CertificateDer<'_>],
         _server_name: &ServerName<'_>,
         _ocsp: &[u8],
-        _now: UnixTime,
+        now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
         use sha2::{Digest, Sha256};
-        let got: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
-        if got == self.fingerprint {
-            Ok(ServerCertVerified::assertion())
-        } else {
-            Err(rustls::Error::General(format!(
+        let der = end_entity.as_ref();
+        let got: [u8; 32] = Sha256::digest(der).into();
+        if got != self.fingerprint {
+            return Err(rustls::Error::General(format!(
                 "certificate fingerprint {} does not match the pinned {}",
                 hex::encode(got),
                 hex::encode(self.fingerprint)
-            )))
+            )));
         }
+        // The fingerprint says which certificate to trust, not for how long.
+        let validity = Validity::read(der).ok_or_else(|| {
+            rustls::Error::General(
+                "the pinned certificate has no readable validity period".to_string(),
+            )
+        })?;
+        if !validity.accepts(now) {
+            return Err(rustls::Error::General(format!(
+                "the pinned certificate is not valid at {}: its window is {} to {}",
+                now.as_secs(),
+                validity.not_before,
+                validity.not_after
+            )));
+        }
+        Ok(ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
@@ -487,6 +541,166 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// The two `Time` encodings are not interchangeable. `UTCTime` carries a two digit year and
+    /// is what a real certificate uses until 2049, `GeneralizedTime` carries four. A reader that
+    /// counts the characters wrong parses neither, and the failure looks like bad input rather
+    /// than a bug, so both are pinned here.
+    #[test]
+    fn both_time_encodings_in_a_certificate_are_read_correctly() {
+        let read = |nb: (i32, u8, u8), na: (i32, u8, u8)| {
+            let mut p = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+            p.not_before = rcgen::date_time_ymd(nb.0, nb.1, nb.2);
+            p.not_after = rcgen::date_time_ymd(na.0, na.1, na.2);
+            let k = rcgen::KeyPair::generate().unwrap();
+            let der = p.self_signed(&k).unwrap().der().to_vec();
+            Validity::read(&der)
+        };
+
+        // Ends in 2035, so the issuer encodes both fields as UTCTime (YYMMDDHHMMSS).
+        let v = read((2020, 1, 1), (2035, 1, 1)).expect("a UTCTime certificate did not parse");
+        assert_eq!(v.not_before, 1_577_836_800, "UTCTime not_before"); // 2020-01-01T00:00:00Z
+        assert_eq!(v.not_after, 2_051_222_400, "UTCTime not_after"); // 2035-01-01T00:00:00Z
+
+        // Ends in 2060, so the issuer is forced to switch to GeneralizedTime (YYYYMMDDHHMMSS).
+        let v =
+            read((2050, 1, 1), (2060, 1, 1)).expect("a GeneralizedTime certificate did not parse");
+        assert_eq!(v.not_before, 2_524_608_000, "GeneralizedTime not_before");
+        assert_eq!(v.not_after, 2_840_140_800, "GeneralizedTime not_after");
+
+        // The RFC 5280 pivot. 49 is 2049, 50 is 1950, and getting that backwards moves a
+        // certificate by a century without any other symptom.
+        let v = read((1950, 6, 1), (2049, 12, 31)).expect("a pivot certificate did not parse");
+        assert_eq!(
+            v.not_before, -618_105_600,
+            "1950 must decode as 1950, not 2050"
+        );
+        assert_eq!(
+            v.not_after, 2_524_521_600,
+            "2049 must decode as 2049, not 1949"
+        );
+    }
+
+    /// The upper bound is exclusive, matching how `webpki` decides it for a certificate from a
+    /// public root. A pin and a root must not disagree about the instant a certificate dies.
+    #[test]
+    fn a_certificate_is_dead_at_the_exact_instant_it_expires() {
+        let v = Validity {
+            not_before: 100,
+            not_after: 200,
+        };
+        let at = |s: u64| UnixTime::since_unix_epoch(std::time::Duration::from_secs(s));
+        assert!(
+            v.accepts(at(100)),
+            "the first valid instant must be accepted"
+        );
+        assert!(
+            v.accepts(at(199)),
+            "the last valid instant must be accepted"
+        );
+        assert!(
+            !v.accepts(at(200)),
+            "the expiry instant itself must be rejected"
+        );
+        assert!(
+            !v.accepts(at(99)),
+            "one second before the window must be rejected"
+        );
+        assert!(
+            !v.accepts(at(201)),
+            "one second after the window must be rejected"
+        );
+    }
+
+    /// Junk on the wire must be a rejection, not a panic and not a default window.
+    #[test]
+    fn a_certificate_that_does_not_parse_has_no_validity() {
+        for junk in [
+            &b""[..],
+            &b"\x30"[..],
+            &b"\x30\x03\x30\x01\x00"[..],
+            &[0xff; 16][..],
+            &b"\x30\x80\x00\x00"[..], // indefinite length, which DER forbids
+        ] {
+            assert!(
+                Validity::read(junk).is_none(),
+                "junk parsed as a validity: {junk:?}"
+            );
+        }
+    }
+
+    /// Build a certificate whose validity starts in 1975 and ends in 4096, then present it at
+    /// instants on either side of that window. The certificate itself never changes, so the only
+    /// thing that decides the answer is the `now` the verifier was handed.
+    ///
+    /// Before #163 was fixed, `verify_server_cert` took `_now: UnixTime` and never read it, so
+    /// every one of these calls returned a success.
+    #[test]
+    fn a_pinned_certificate_is_rejected_outside_its_validity_window() {
+        use rustls::client::danger::ServerCertVerifier;
+        use sha2::{Digest, Sha256};
+
+        let der = {
+            let mut p = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+            p.not_before = rcgen::date_time_ymd(1975, 1, 1);
+            p.not_after = rcgen::date_time_ymd(4096, 1, 1);
+            let k = rcgen::KeyPair::generate().unwrap();
+            p.self_signed(&k).unwrap().der().to_vec()
+        };
+        let cert = CertificateDer::from(der.clone());
+        let fingerprint: [u8; 32] = Sha256::digest(&der).into();
+        let verifier = PinnedCert { fingerprint };
+        let name = ServerName::try_from("localhost").unwrap();
+
+        // Midnight UTC on 1 January of each year, as seconds since the epoch.
+        let at = |y: i64| {
+            let days = (y - 1970) * 365 + (y - 1969) / 4 - (y - 1901) / 100 + (y - 1601) / 400;
+            UnixTime::since_unix_epoch(std::time::Duration::from_secs((days * 86400) as u64))
+        };
+
+        // The negative controls. A fingerprint match must not by itself be enough.
+        for (label, now) in [
+            ("before the certificate existed", at(1970)),
+            ("after the certificate expired", at(4100)),
+        ] {
+            let r = verifier.verify_server_cert(&cert, &[], &name, &[], now);
+            assert!(
+                r.is_err(),
+                "a pinned certificate was accepted {label}, at now={}",
+                now.as_secs()
+            );
+        }
+
+        // The positive control: a guard that rejects everything would pass the cases above and
+        // still be broken, so the same certificate has to be accepted inside the window.
+        let ok = verifier.verify_server_cert(&cert, &[], &name, &[], at(2026));
+        assert!(
+            ok.is_ok(),
+            "a pinned certificate was rejected while still valid"
+        );
+    }
+
+    #[test]
+    fn a_pinned_certificate_with_a_wrong_fingerprint_is_still_rejected() {
+        use rustls::client::danger::ServerCertVerifier;
+
+        let der = {
+            let p = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+            let k = rcgen::KeyPair::generate().unwrap();
+            p.self_signed(&k).unwrap().der().to_vec()
+        };
+        let cert = CertificateDer::from(der);
+        let verifier = PinnedCert {
+            fingerprint: [0u8; 32],
+        };
+        let name = ServerName::try_from("localhost").unwrap();
+        let r = verifier.verify_server_cert(&cert, &[], &name, &[], UnixTime::now());
+        let err = r.unwrap_err().to_string();
+        assert!(
+            err.contains("does not match the pinned"),
+            "a wrong fingerprint was rejected for the wrong reason: {err}"
+        );
     }
 
     #[test]
