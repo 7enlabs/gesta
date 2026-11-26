@@ -223,17 +223,31 @@ pub fn step(conn: &Connection, root: &Path, good_answer: bool) -> ZResult<Step> 
 
     // Narrow the range using the answer about the changeset just tested.
     if let Some(cur) = s.current.clone() {
+        // Narrow by ancestry, not by position. The list is a linear extension of the history, and a
+        // side branch has no position that means anything: a merge's second parent can put a
+        // descendant of the tested changeset on either side of it in the list. Position was what
+        // made a wrong answer possible - testing a good side commit drained everything before it,
+        // including the bad main-line changeset the fault landed in, and the search then reported
+        // the remaining side commit as the culprit without ever testing the fault.
+        //
+        // The invariant is `candidates = ancestors(bad) minus ancestors(good)`. An answer keeps it:
+        // a good answer adds the tested changeset's ancestors to the good set, and a bad answer
+        // moves the bad frontier down to the tested changeset. Both prune by reachability, which is
+        // the only relation that means anything on a graph. On a linear history every reachability
+        // cut is the same as the positional one, so the question count does not change.
+        let parents = crate::store::parent_map_for(conn)?;
         if good_answer {
-            // Everything up to and including this one is good.
-            if let Some(pos) = s.candidates.iter().position(|c| c == &cur) {
-                s.candidates.drain(..=pos);
-            }
+            // This changeset and everything it descends from are good.
+            s.candidates
+                .retain(|c| !crate::store::walk_reaches(&parents, &cur, c));
             s.good = cur;
         } else {
-            // Everything from this one on is bad; it is the current best answer.
-            if let Some(pos) = s.candidates.iter().position(|c| c == &cur) {
-                s.candidates.truncate(pos + 1);
-            }
+            // Only what this changeset descends from can still hold the culprit: anything it does
+            // not reach is a different line of history, and a changeset there cannot be the first
+            // bad one on the way to this bad point. The tested changeset stays, because it is now
+            // the best candidate for the answer.
+            s.candidates
+                .retain(|c| crate::store::walk_reaches(&parents, &cur, c));
             s.bad = cur;
         }
     }
@@ -266,8 +280,16 @@ pub fn step(conn: &Connection, root: &Path, good_answer: bool) -> ZResult<Step> 
         )));
     }
 
-    let mid = (s.candidates.len() - 1) / 2;
-    let next = s.candidates[mid].clone();
+    // Never ask about the changeset that was just answered. It stays in the list because, after a
+    // bad answer, it is the leading candidate for the answer, but testing it again would learn
+    // nothing and the search would ask the same question forever.
+    let len = s.candidates.len();
+    let mid = (len - 1) / 2;
+    let next = if len > 1 && Some(s.candidates[mid].clone()) == s.current {
+        s.candidates[(mid + 1) % len].clone()
+    } else {
+        s.candidates[mid].clone()
+    };
     checkout(conn, root, &next)?;
     s.current = Some(next.clone());
     s.steps += 1;
@@ -420,6 +442,88 @@ mod tests {
         assert_eq!(
             on_disk, "1\n",
             "the worktree must be the branch head, not a candidate"
+        );
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A changeset with explicit parents, so a test can build a side branch.
+    fn commit_with(conn: &Connection, id: &str, p1: Option<&str>, p2: Option<&str>, content: &str) {
+        conn.execute(
+            "INSERT INTO changesets(id,message,author,created_at,status,parent,parent2,branch)
+             VALUES(?1,?1,'a',1,'pending',?2,?3,'main')",
+            rusqlite::params![id, p1, p2],
+        )
+        .unwrap();
+        let h = crate::store::put_object(conn, content).unwrap();
+        conn.execute(
+            "INSERT INTO changeset_files(changeset_id,path,old_hash,new_hash)
+             VALUES(?1,'f',NULL,?2)",
+            rusqlite::params![id, h],
+        )
+        .unwrap();
+        crate::repo::commit_one(conn, id).unwrap();
+        // `commit_one` points a changeset at the branch head, which is what a commit made at the
+        // tip does. A fixture that needs a side branch has to say so after that, or every changeset
+        // ends up on the main line and the shape under test never exists.
+        conn.execute(
+            "UPDATE changesets SET parent = ?2, parent2 = ?3 WHERE id = ?1",
+            rusqlite::params![id, p1, p2],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_side_branch_commit_does_not_become_the_answer() {
+        // The shape from the issue, narrowed to three candidates so the search is forced onto the
+        // side branch. `m1` carries the fault and is a merge that pulled in `e2`, and `e2` descends
+        // from `e1`; both side commits are good, because they branched before the fault. `range`
+        // walks the first-parent chain to `[m1]` and then appends the side commits sorted by id,
+        // giving `[m1, e1, e2]`: bad, good, good.
+        //
+        // The binary search assumes the opposite. It takes the middle candidate, `e1`, hears good,
+        // and drops everything up to and including `e1` - which removes `m1`, the only bad commit in
+        // the list. With `[e2]` left it answers `e2`, a good changeset, as the first bad one, and
+        // never tested `m1` at all.
+        //
+        // Badness is decided by ancestry, not by string comparison: "bad" means the fault is this
+        // changeset or one of its ancestors, which is what a real test command implements.
+        let conn = crate::store::tests::mem_db();
+        commit_with(&conn, "base", None, None, "0\n");
+        commit_with(&conn, "e1", Some("base"), None, "e1\n");
+        commit_with(&conn, "e2", Some("e1"), None, "e2\n");
+        commit_with(&conn, "m1", Some("base"), Some("e2"), "1\n"); // the fault, on the main line
+
+        let d = std::env::temp_dir().join(format!("gesta-bisect-side-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+
+        start(&conn, "base", "m1").unwrap();
+        let mut asked: Vec<String> = Vec::new();
+        let answer = loop {
+            let st = load(&conn).unwrap().unwrap();
+            let cur = match st.current.clone() {
+                Some(c) => c,
+                None => match step(&conn, &d, true).unwrap() {
+                    Step::Found(x) => break x,
+                    Step::Test(_) => continue,
+                },
+            };
+            asked.push(cur.clone());
+            let bad = cur == "m1"
+                || crate::store::ancestors(&conn, &cur)
+                    .unwrap()
+                    .iter()
+                    .any(|a| a == "m1");
+            match step(&conn, &d, !bad).unwrap() {
+                Step::Found(x) => break x,
+                Step::Test(_) => continue,
+            }
+        };
+        assert_eq!(
+            answer, "m1",
+            "the answer must be the changeset the fault landed in, not a good side-branch commit; \
+             asked {asked:?}"
         );
 
         let _ = std::fs::remove_dir_all(&d);
