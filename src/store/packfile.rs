@@ -495,8 +495,9 @@ mod tests {
     /// bytes to a file and hands back a handle. A scribble file per test rather than a shared one:
     /// the parsers seek, and two tests sharing a handle would interleave their seeks.
     fn handle_for(bytes: &[u8]) -> (std::fs::File, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("gesta-pkvar-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // The directory was keyed on the pid alone, so every call in one process shared it, and the
+        // file name inside it came from the clock. Both halves now come from one counter.
+        let dir = crate::support::scratch::scratch("gesta-pkvar");
         let p = dir.join(format!(
             "h-{}-{:?}.bin",
             bytes.len(),

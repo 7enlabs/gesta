@@ -751,14 +751,7 @@ pub fn receive_pack_scoped(
         return Ok(out);
     }
 
-    let scratch = std::env::temp_dir().join(format!(
-        "gesta-push-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
+    let scratch = crate::support::scratch::scratch("gesta-push");
     let result = (|| -> ZResult<Vec<u8>> {
         std::fs::create_dir_all(&scratch)?;
         let init = std::process::Command::new("git")

@@ -873,14 +873,7 @@ mod tests {
     /// error, and the assertion below is about memory, not about the exit status.
     fn staging_with_padded_pack(size: u64) -> std::path::PathBuf {
         use std::io::Write;
-        let staging = std::env::temp_dir().join(format!(
-            "gesta-unpack-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let staging = crate::support::scratch::scratch("gesta-unpack");
         let pack_dir = staging.join("objects").join("pack");
         std::fs::create_dir_all(&pack_dir).unwrap();
         let path = pack_dir.join("pack-t.pack");

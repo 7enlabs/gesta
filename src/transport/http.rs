@@ -3111,15 +3111,10 @@ pub fn open_repo_for_serve(root: &Path) -> ZResult<ServedRepository> {
 
     // One export, read twice: the refs a client asks for, and the objects it receives. Two exports
     // to the same temporary path in the same second collided, and the second one read a directory
-    // the first had already removed, which is why the pack had a count and no bodies.
-    let dir = std::env::temp_dir().join(format!(
-        "gesta-serve-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
+    // the first had already removed, which is why the pack had a count and no bodies. The name now
+    // comes from `test_scratch`, which counts instead of asking the clock, so the collision cannot
+    // come back on a host whose clock is coarser than a nanosecond.
+    let dir = crate::support::scratch::scratch("gesta-serve");
     std::fs::create_dir_all(&dir)?;
     let mut refs = Vec::new();
     let mut objects = Vec::new();

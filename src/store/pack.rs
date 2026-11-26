@@ -215,14 +215,7 @@ mod tests {
     use super::*;
 
     fn repo() -> (Connection, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "gesta-pack-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = crate::support::scratch::scratch("gesta-pack");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::create_dir_all(dir.join(".gesta")).ok();
         let conn = crate::store::open_db(&dir).unwrap();

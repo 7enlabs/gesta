@@ -463,14 +463,7 @@ mod tests {
     use super::*;
 
     fn dir() -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "gesta-audit-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let d = super::super::scratch::scratch("gesta-audit");
         std::fs::create_dir_all(d.join(".gesta")).unwrap();
         d
     }

@@ -186,14 +186,7 @@ mod tests {
     use super::*;
 
     fn repo() -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "gesta-keys-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let d = crate::support::scratch::scratch("gesta-keys");
         std::fs::create_dir_all(d.join(crate::ZF_DIR)).unwrap();
         d
     }
