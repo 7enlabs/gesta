@@ -540,6 +540,11 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         let text = std::fs::read_to_string(dir.join("child.txt")).unwrap();
+        // The subject here is the argv `checkout_args` builds, not the runner's line ending policy.
+        // Git writes CRLF where `core.autocrlf` says so, and a Windows runner says so, so comparing
+        // the raw bytes tested the runner and failed on Windows while passing on Linux. Comparing
+        // the text with line endings normalised tests the checkout, which is what this is about.
+        let text = text.replace("\r\n", "\n");
         assert_eq!(
             text, "v1\n",
             "the checkout must land on the pin, not the head"
